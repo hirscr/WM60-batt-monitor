@@ -182,202 +182,254 @@
 </div>
 
 <script>
-const pvEl   = document.getElementById('pv');
-const socEl  = document.getElementById('soc');
-const loadEl = document.getElementById('load');
-const chgEl  = document.getElementById('chg');
-const listEl = document.getElementById('battList');
+  const pvEl = document.getElementById('pv');
+  const socEl = document.getElementById('soc');
+  const loadEl = document.getElementById('load');
+  const chgEl = document.getElementById('chg');
+  const listEl = document.getElementById('battList');
 
-const healthDot = document.getElementById('healthDot');
-const healthText= document.getElementById('healthText');
-const lastFetch = document.getElementById('lastFetch');
+  const healthDot = document.getElementById('healthDot');
+  const healthText = document.getElementById('healthText');
+  const lastFetch = document.getElementById('lastFetch');
 
-function setHealth(ok){
-  healthDot.classList.toggle('ok', ok);
-  healthDot.classList.toggle('bad', !ok);
-  healthText.textContent = ok ? 'Connected' : 'No data';
-  lastFetch.textContent = ' @ ' + new Date().toLocaleTimeString();
-}
-
-function fmt(x, unit){
-  if (x == null || Number.isNaN(x)) return '— ' + unit;
-  return `${x} ${unit}`;
-}
-
-// ---- Battery history buffers for chart ----
-const bhist = { t:[], pv:[], load:[], chg:[], soc:[] };
-
-function battPlotInit(){
-  const layout = {
-    margin:{l:60,r:70,t:30,b:40},
-    xaxis:{type:'date', title:'Time'},
-    yaxis:{title:'Power (W)', rangemode:'tozero', autorange:true},
-    yaxis2:{title:'Total Charge (%)', overlaying:'y', side:'right', range:[0,100]},
-    legend:{orientation:'h', yanchor:'bottom', y:1.06, x:0.02},
-  };
-  Plotly.newPlot('battChart', [
-    {x:[], y:[], name:'PV in (W)',      mode:'lines', yaxis:'y'},
-    {x:[], y:[], name:'Load (W)',       mode:'lines', yaxis:'y'},
-    {x:[], y:[], name:'Charge Rate (W)',mode:'lines', yaxis:'y'},
-    {x:[], y:[], name:'Total Charge (%)',mode:'lines', yaxis:'y2'},
-  ], layout, {responsive:true});
-}
-
-function battPlotUpdate(){
-  Plotly.update('battChart',{
-    x:[bhist.t, bhist.t, bhist.t, bhist.t],
-    y:[bhist.pv, bhist.load, bhist.chg, bhist.soc]
-  });
-}
-
-function battZoomRecent(hours){
-  const end = new Date();
-  const start = new Date(end.getTime() - hours*3600*1000);
-  Plotly.relayout('battChart', {'xaxis.range':[start, end]});
-}
-function battZoomAll(){
-  Plotly.relayout('battChart', {'xaxis.autorange':true});
-}
-
-// Axis controls (left watts)
-document.getElementById('by1apply').onclick = ()=>{
-  const vmin = document.getElementById('by1min').value;
-  const vmax = document.getElementById('by1max').value;
-  const rel = {};
-  if (vmin !== '' && vmax !== '') rel['yaxis.range']=[Number(vmin), Number(vmax)];
-  else if (vmin !== '') rel['yaxis.range']=[Number(vmin), null];
-  else if (vmax !== '') rel['yaxis.range']=[null, Number(vmax)];
-  if (Object.keys(rel).length) Plotly.relayout('battChart', rel);
-};
-document.getElementById('by1default').onclick = ()=>{
-  Plotly.relayout('battChart', {'yaxis.autorange': true});
-  document.getElementById('by1min').value = ''; document.getElementById('by1max').value = '';
-};
-// Axis controls (right %)
-document.getElementById('by2apply').onclick = ()=>{
-  const vmin = document.getElementById('by2min').value;
-  const vmax = document.getElementById('by2max').value;
-  const rel = {};
-  if (vmin !== '' && vmax !== '') rel['yaxis2.range']=[Number(vmin), Number(vmax)];
-  else if (vmin !== '') rel['yaxis2.range']=[Number(vmin), null];
-  else if (vmax !== '') rel['yaxis2.range']=[null, Number(vmax)];
-  if (Object.keys(rel).length) Plotly.relayout('battChart', rel);
-};
-document.getElementById('by2default').onclick = ()=>{
-  Plotly.relayout('battChart', {'yaxis2.range':[0,100]});
-  document.getElementById('by2min').value = '0'; document.getElementById('by2max').value = '100';
-};
-
-
-function renderUnits(units){
-  listEl.innerHTML = '';
-  (units || []).forEach((u, idx)=>{
-    const name = u.sn || `Battery ${idx+1}`;
-    const soc  = typeof u.soc === 'number' ? u.soc : null;
-    const mv   = typeof u.voltage_mv === 'number' ? (u.voltage_mv/100).toFixed(1) : '—';
-    const cur  = (u.current_a != null) ? u.current_a : '—';
-
-    const row = document.createElement('div');
-    row.className = 'batt-row';
-
-    const label = document.createElement('div');
-    label.className = 'bname';
-    label.textContent = name.replace(/^.*_/, 'Battery ');
-    row.appendChild(label);
-
-    const barWrap = document.createElement('div');
-    barWrap.className = 'bar-wrap';
-    const bar = document.createElement('div');
-    bar.className = 'bar';
-    bar.style.width = (soc!=null ? Math.max(0, Math.min(100, soc)) : 0) + '%';
-    const barLabel = document.createElement('div');
-    barLabel.className = 'bar-label';
-    barLabel.textContent = (soc!=null ? soc.toFixed(1) : '—') + ' %';
-    barWrap.appendChild(bar);
-    barWrap.appendChild(barLabel);
-    row.appendChild(barWrap);
-
-    const vBox = document.createElement('div');
-    vBox.className = 'mono';
-    vBox.textContent = mv + ' V';
-    row.appendChild(vBox);
-
-    const iBox = document.createElement('div');
-    iBox.className = 'mono';
-    iBox.textContent = (cur==='—' ? '—' : cur) + ' A';
-    row.appendChild(iBox);
-
-    listEl.appendChild(row);
-  });
-}
-
-// Make the four summary value boxes equal width to the largest content
-function adjustSummaryWidths(){
-  const boxes = [pvEl, socEl, loadEl, chgEl];
-  const probe = document.createElement('span');
-  probe.style.visibility = 'hidden';
-  probe.style.position = 'absolute';
-  probe.style.whiteSpace = 'nowrap';
-  document.body.appendChild(probe);
-
-  let max = 0;
-  for (const el of boxes){
-    probe.textContent = el.textContent || '';
-    max = Math.max(max, probe.getBoundingClientRect().width);
+  function setHealth(ok) {
+    healthDot.classList.toggle('ok', ok);
+    healthDot.classList.toggle('bad', !ok);
+    healthText.textContent = ok ? 'Connected' : 'No data';
+    lastFetch.textContent = ' @ ' + new Date().toLocaleTimeString();
   }
-  document.body.removeChild(probe);
 
-  const target = Math.ceil(max + 20); // add padding buffer
-  boxes.forEach(el => { el.style.width = target + 'px'; });
-}
+  function fmt(x, unit) {
+    if (x == null || Number.isNaN(x)) return '— ' + unit;
+    return `${x} ${unit}`;
+  }
 
-async function refresh(){
-  try{
+  // ---- Battery history buffers for chart ----
+  const bhist = {t: [], pv: [], load: [], chg: [], soc: []};
+
+  function battPlotInit() {
+    const layout = {
+      margin: {l: 60, r: 70, t: 30, b: 40},
+      xaxis: {type: 'date', title: 'Time'},
+      yaxis: {title: 'Power (W)', rangemode: 'tozero', autorange: true},
+      yaxis2: {title: 'Total Charge (%)', overlaying: 'y', side: 'right', range: [0, 100]},
+      legend: {orientation: 'h', yanchor: 'bottom', y: 1.06, x: 0.02},
+    };
+    Plotly.newPlot('battChart', [
+      {x: [], y: [], name: 'PV in (W)', mode: 'lines', yaxis: 'y'},
+      {x: [], y: [], name: 'Load (W)', mode: 'lines', yaxis: 'y'},
+      {x: [], y: [], name: 'Charge Rate (W)', mode: 'lines', yaxis: 'y'},
+      {x: [], y: [], name: 'Total Charge (%)', mode: 'lines', yaxis: 'y2'},
+    ], layout, {responsive: true});
+  }
+
+  function battPlotUpdate() {
+    Plotly.update('battChart', {
+      x: [bhist.t, bhist.t, bhist.t, bhist.t],
+      y: [bhist.pv, bhist.load, bhist.chg, bhist.soc]
+    });
+  }
+
+  function battZoomRecent(hours) {
+    const end = new Date();
+    const start = new Date(end.getTime() - hours * 3600 * 1000);
+    Plotly.relayout('battChart', {'xaxis.range': [start, end]});
+  }
+
+  function battZoomAll() {
+    Plotly.relayout('battChart', {'xaxis.autorange': true});
+  }
+
+  // Axis controls (left watts)
+  document.getElementById('by1apply').onclick = () => {
+    const vmin = document.getElementById('by1min').value;
+    const vmax = document.getElementById('by1max').value;
+    const rel = {};
+    if (vmin !== '' && vmax !== '') rel['yaxis.range'] = [Number(vmin), Number(vmax)];
+    else if (vmin !== '') rel['yaxis.range'] = [Number(vmin), null];
+    else if (vmax !== '') rel['yaxis.range'] = [null, Number(vmax)];
+    if (Object.keys(rel).length) Plotly.relayout('battChart', rel);
+  };
+  document.getElementById('by1default').onclick = () => {
+    Plotly.relayout('battChart', {'yaxis.autorange': true});
+    document.getElementById('by1min').value = '';
+    document.getElementById('by1max').value = '';
+  };
+  // Axis controls (right %)
+  document.getElementById('by2apply').onclick = () => {
+    const vmin = document.getElementById('by2min').value;
+    const vmax = document.getElementById('by2max').value;
+    const rel = {};
+    if (vmin !== '' && vmax !== '') rel['yaxis2.range'] = [Number(vmin), Number(vmax)];
+    else if (vmin !== '') rel['yaxis2.range'] = [Number(vmin), null];
+    else if (vmax !== '') rel['yaxis2.range'] = [null, Number(vmax)];
+    if (Object.keys(rel).length) Plotly.relayout('battChart', rel);
+  };
+  document.getElementById('by2default').onclick = () => {
+    Plotly.relayout('battChart', {'yaxis2.range': [0, 100]});
+    document.getElementById('by2min').value = '0';
+    document.getElementById('by2max').value = '100';
+  };
+
+
+  function renderUnits(units) {
+    listEl.innerHTML = '';
+    (units || []).forEach((u, idx) => {
+      const name = u.sn || `Battery ${idx + 1}`;
+      const soc = typeof u.soc === 'number' ? u.soc : null;
+      const mv = typeof u.voltage_mv === 'number' ? (u.voltage_mv / 100).toFixed(1) : '—';
+      const cur = (u.current_a != null) ? u.current_a : '—';
+
+      const row = document.createElement('div');
+      row.className = 'batt-row';
+
+      const label = document.createElement('div');
+      label.className = 'bname';
+      label.textContent = name.replace(/^.*_/, 'Battery ');
+      row.appendChild(label);
+
+      const barWrap = document.createElement('div');
+      barWrap.className = 'bar-wrap';
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      bar.style.width = (soc != null ? Math.max(0, Math.min(100, soc)) : 0) + '%';
+      const barLabel = document.createElement('div');
+      barLabel.className = 'bar-label';
+      barLabel.textContent = (soc != null ? soc.toFixed(1) : '—') + ' %';
+      barWrap.appendChild(bar);
+      barWrap.appendChild(barLabel);
+      row.appendChild(barWrap);
+
+      const vBox = document.createElement('div');
+      vBox.className = 'mono';
+      vBox.textContent = mv + ' V';
+      row.appendChild(vBox);
+
+      const iBox = document.createElement('div');
+      iBox.className = 'mono';
+      iBox.textContent = (cur === '—' ? '—' : cur) + ' A';
+      row.appendChild(iBox);
+
+      listEl.appendChild(row);
+    });
+  }
+
+  // Make the four summary value boxes equal width to the largest content
+  function adjustSummaryWidths() {
+    const boxes = [pvEl, socEl, loadEl, chgEl];
+    const probe = document.createElement('span');
+    probe.style.visibility = 'hidden';
+    probe.style.position = 'absolute';
+    probe.style.whiteSpace = 'nowrap';
+    document.body.appendChild(probe);
+
+    let max = 0;
+    for (const el of boxes) {
+      probe.textContent = el.textContent || '';
+      max = Math.max(max, probe.getBoundingClientRect().width);
+    }
+    document.body.removeChild(probe);
+
+    const target = Math.ceil(max + 20); // add padding buffer
+    boxes.forEach(el => {
+      el.style.width = target + 'px';
+    });
+  }
+
+  async function loadBatteryHistory() {
+    const r = await fetch('/battery', {cache: 'no-store'});
+    const data = await r.json();
+
+    // prefer full preloaded history; fall back to recent
+    const rows = (data && Array.isArray(data.all)) ? data.all
+            : (data && Array.isArray(data.recent) ? data.recent : []);
+
+    // reset buffers
+    bhist.t.length = 0;
+    bhist.pv.length = 0;
+    bhist.load.length = 0;
+    bhist.chg.length = 0;
+    bhist.soc.length = 0;
+
+    const toNum = (v) => {
+      if (v === null || v === undefined || v === '') return null;
+      const f = Number(v);
+      return Number.isNaN(f) ? null : f;
+    };
+
+    // fill from CSV-backed history
+    for (const row of rows) {
+      const t = row.ts ? new Date(row.ts) : null;
+      if (!t) continue;
+      bhist.t.push(t);
+      bhist.pv.push(toNum(row.pv_power_w) != null ? Math.round(toNum(row.pv_power_w)) : null);
+      bhist.load.push(toNum(row.load_power_w) != null ? Math.round(toNum(row.load_power_w)) : null);
+      const net = (row.battery_net_w != null) ? toNum(row.battery_net_w)
+              : (row.pack_voltage_v != null && row.pack_current_a != null
+                      ? Number(row.pack_voltage_v) * Number(row.pack_current_a)
+                      : null);
+      bhist.chg.push(net != null ? Math.round(net) : null);
+      bhist.soc.push(toNum(row.soc_percent));
+    }
+    // draw once after preload
+    battPlotUpdate();
+  }
+
+
+    // REPLACE the whole refresh() with this:
+    async function refresh(){
+    try{
     const r = await fetch('/battery', {cache:'no-store'});
     const data = await r.json();
     const snap = data && data.latest ? data.latest : null;
     const ok = !!(snap && (snap.soc_percent != null));
     setHealth(ok);
-
     if (!ok) return;
 
-    pvEl.textContent   = fmt(snap.pv_power_w != null ? Math.round(snap.pv_power_w) : null, 'W');
-    socEl.textContent  = fmt(snap.soc_percent, '%');
-    loadEl.textContent = fmt(snap.load_power_w != null ? Math.round(snap.load_power_w) : null, 'W');
-    let chargeW = snap.battery_net_w;
-    if (chargeW == null && snap.pack_voltage_v != null && snap.pack_current_a != null){
-      chargeW = Math.round(snap.pack_voltage_v * snap.pack_current_a);
-    }
+    // update summary
+    pvEl.textContent   = fmt(snap.pv_power_w != null ? Math.round(Number(snap.pv_power_w)) : null, 'W');
+    socEl.textContent  = fmt(Number(snap.soc_percent), '%');
+    loadEl.textContent = fmt(snap.load_power_w != null ? Math.round(Number(snap.load_power_w)) : null, 'W');
+    let chargeW = (snap.battery_net_w != null) ? Number(snap.battery_net_w)
+    : (snap.pack_voltage_v != null && snap.pack_current_a != null
+    ? Number(snap.pack_voltage_v) * Number(snap.pack_current_a)
+    : null);
     chgEl.textContent = fmt(chargeW != null ? Math.round(chargeW) : null, 'W');
 
-    // push into chart history
-    const now = new Date();
-    bhist.t.push(now);
-    bhist.pv.push( (snap.pv_power_w != null) ? Math.round(snap.pv_power_w) : null );
-    bhist.load.push( (snap.load_power_w != null) ? Math.round(snap.load_power_w) : null );
-
-    let chargeW2 = snap.battery_net_w;
-    if (chargeW2 == null && snap.pack_voltage_v != null && snap.pack_current_a != null){
-      chargeW2 = Math.round(snap.pack_voltage_v * snap.pack_current_a);
-    }
-    bhist.chg.push( (chargeW2 != null) ? chargeW2 : null );
+    // push into chart history using SERVER timestamp; avoid duplicates
+    const tStr = snap.ts || null;
+    const t = tStr ? new Date(tStr) : new Date();  // fallback if missing
+    const lastT = bhist.t.length ? bhist.t[bhist.t.length - 1] : null;
+    if (!lastT || (t > lastT)) {
+    bhist.t.push(t);
+    bhist.pv.push( (snap.pv_power_w != null) ? Math.round(Number(snap.pv_power_w)) : null );
+    bhist.load.push( (snap.load_power_w != null) ? Math.round(Number(snap.load_power_w)) : null );
+    const chargeW2 = (snap.battery_net_w != null) ? Number(snap.battery_net_w)
+    : (snap.pack_voltage_v != null && snap.pack_current_a != null
+    ? Number(snap.pack_voltage_v) * Number(snap.pack_current_a)
+    : null);
+    bhist.chg.push( chargeW2 != null ? Math.round(chargeW2) : null );
     bhist.soc.push( (snap.soc_percent != null) ? Number(snap.soc_percent) : null );
 
     battPlotUpdate();
+  }
 
-
-    adjustSummaryWidths();   // <— add this line
+    adjustSummaryWidths();
     renderUnits(snap.units || []);
   }catch(e){
     setHealth(false);
   }
-}
+  }
+
 
 (function init(){
   battPlotInit();
-  refresh();
-  setInterval(refresh, 10000); // 10s
+  // preload full CSV-backed history, then start live updates
+  loadBatteryHistory().then(()=>{
+    refresh();
+    setInterval(refresh, 10000); // 10s
+  });
 })();
-</script>
+  </script>
 </body>
 </html>
