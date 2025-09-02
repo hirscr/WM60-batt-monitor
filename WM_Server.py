@@ -42,7 +42,7 @@ LATCHED_FLOOR_W: Optional[int] = None
 
 # State
 battery_latest = {}   # last good snapshot (normalized)
-battery_history = deque(maxlen=10000)
+battery_history = deque()  # keep all rows ever loaded
 
 
 # ---------- Config ----------
@@ -72,13 +72,33 @@ _latest  = {}                    # last good sample
 # ---------- App/state ----------
 app = Flask(__name__, static_folder=".", static_url_path="")
 client = WhatsMinerClientPlain(MINER_IP, timeout=2.5)
-eg4 = EG4Client(poll_seconds=60)  # uses EG4_USER / EG4_PASS env
+# Ensure EG4 creds exist and pass them explicitly
+if not EG4_USER or not EG4_PASS:
+    raise SystemExit("Set EG4_USER and EG4_PASS in your Run Configuration (Environment variables).")
+print(f"[BOOT] EG4 username detected: {EG4_USER!r} (password not shown)")
+eg4 = EG4Client(username=EG4_USER, password=EG4_PASS, base_url=EG4_BASE, poll_seconds=60)
 eg4.start()
 
-HISTORY: deque = deque(maxlen=HISTORY_MAX)  # each row: {"ts": "...", <SUMMARY fields...>}
+HISTORY: deque = deque()  # keep all rows ever loaded
 latest: Dict[str, Any] = {}
 last_nonzero_limit: Optional[int] = None
 standby_flag = False
+
+def _load_existing_csv(file_path: str, target_deque: deque):
+    """Load existing CSV into memory at startup."""
+    if not os.path.exists(file_path):
+        print(f"[LOAD] no file {file_path}")
+        return
+    try:
+        with open(file_path, "r", newline="") as f:
+            rdr = csv.DictReader(f)
+            rows = list(rdr)
+            for row in rows:
+                # add each row as-is
+                target_deque.append(row)
+        print(f"[LOAD] loaded {len(rows)} rows from {file_path}")
+    except Exception as e:
+        print(f"[LOAD] error reading {file_path}: {e}")
 
 def _now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -248,6 +268,23 @@ def _append_csv_generic(file_path: str, row: dict):
             writer.writeheader()
         writer.writerow(row)
 
+def _load_battery_history_from_csv():
+    """Load all EG4 rows from BATT_LOG_FILE into battery_history on startup."""
+    try:
+        if not os.path.exists(BATT_LOG_FILE):
+            print(f"[LOAD] battery log not found: {BATT_LOG_FILE}")
+            return
+        count = 0
+        with open(BATT_LOG_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("ts"):
+                    battery_history.append(row)
+                    count += 1
+        print(f"[LOAD] battery history loaded: {count} rows from {BATT_LOG_FILE}")
+    except Exception as e:
+        print(f"[LOAD] battery history error: {e}")
+
 def _fresh_batt(max_age_s: int = 90) -> Optional[dict]:
     """Return the latest EG4 snapshot from the running client if fresh; else None."""
     snap = eg4.get_latest() if ("eg4" in globals() and eg4 is not None) else None
@@ -262,6 +299,23 @@ def _fresh_batt(max_age_s: int = 90) -> Optional[dict]:
         # If ts is missing or malformed, treat as stale
         return None
     return snap
+
+def _load_miner_history_from_csv():
+    """Load all miner rows from LOG_FILE into HISTORY on startup."""
+    try:
+        if not os.path.exists(LOG_FILE):
+            print(f"[LOAD] miner log not found: {LOG_FILE}")
+            return
+        count = 0
+        with open(LOG_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("ts"):
+                    HISTORY.append(row)
+                    count += 1
+        print(f"[LOAD] miner history loaded: {count} rows from {LOG_FILE}")
+    except Exception as e:
+        print(f"[LOAD] miner history error: {e}")
 
 def auto_controller():
     """
@@ -438,7 +492,49 @@ def battery_page():
 
 @app.get("/battery")
 def battery_api():
-    return jsonify({"latest": eg4.get_latest(), "recent": eg4.get_history(120)})
+    # Serve from preloaded battery_history so charts have data at startup,
+    # and coerce CSV strings to numbers for charting.
+    latest_snap = eg4.get_latest()
+    all_rows = list(battery_history)  # CSV-preloaded + live
+
+    NUM_KEYS = {
+        "pv_power_w",
+        "load_power_w",
+        "battery_net_w",
+        "soc_percent",
+        "pack_voltage_v",
+        "pack_current_a",
+    }
+
+    def _coerce_num(v):
+        try:
+            if v is None or v == "":
+                return None
+            # allow ints to stay ints if integral
+            f = float(v)
+            return int(f) if f.is_integer() else f
+        except Exception:
+            return v  # leave as-is if not numeric
+
+    def _normalize(row: dict) -> dict:
+        out = dict(row)
+        for k in NUM_KEYS:
+            if k in out:
+                out[k] = _coerce_num(out[k])
+        # ensure ts is a plain string
+        if "ts" in out and out["ts"] is not None:
+            out["ts"] = str(out["ts"])
+        return out
+
+    # Normalize lists
+    all_rows_norm = [_normalize(r) for r in all_rows]
+    recent_rows_norm = all_rows_norm[-360:] if len(all_rows_norm) > 360 else all_rows_norm
+    print(f"[BATTERY API] latest_ok={isinstance(latest_snap, dict)} recent_len={len(recent_rows_norm)} all_len={len(all_rows_norm)}")
+    return jsonify({
+        "latest": latest_snap,
+        "recent": recent_rows_norm,
+        "all": all_rows_norm,
+    })
 
 @app.get("/health")
 def health():
@@ -497,8 +593,119 @@ def download_battery_csv():
     # Serve the EG4 battery CSV file as a download
     return send_from_directory(os.path.dirname(BATT_LOG_FILE), os.path.basename(BATT_LOG_FILE), as_attachment=True)
 
+@app.get("/debug/miner_logs")
+def debug_miner_logs():
+    import glob
+    out = []
+    try:
+        for path in sorted(glob.glob(os.path.join(LOG_DIR, "*.csv"))):
+            try:
+                sz = os.path.getsize(path)
+                # count rows (cheap scan)
+                n = 0
+                with open(path, "r", newline="") as f:
+                    rdr = csv.reader(f)
+                    for _ in rdr:
+                        n += 1
+                # subtract header if present
+                if n > 0:
+                    n_data = n - 1
+                else:
+                    n_data = 0
+                out.append({"file": os.path.basename(path), "size_bytes": sz, "rows_data": n_data})
+            except Exception as e:
+                out.append({"file": os.path.basename(path), "error": str(e)})
+    except Exception as e:
+        return jsonify({"error": str(e), "LOG_DIR": LOG_DIR})
+    return jsonify({"LOG_DIR": LOG_DIR, "files": out, "LOG_FILE": LOG_FILE})
+
+@app.get("/debug/history_counts")
+def debug_history_counts():
+    # Numbers the server currently holds in memory
+    miner_n = len(HISTORY)
+    batt_n = len(battery_history)
+
+    # Peek first/last timestamps if present
+    def peek_ts(seq):
+        try:
+            first = seq[0].get("ts") if seq else None
+            last = seq[-1].get("ts") if seq else None
+            return first, last
+        except Exception:
+            return None, None
+
+    m_first, m_last = peek_ts(list(HISTORY))
+    b_first, b_last = peek_ts(list(battery_history))
+
+    # What /battery would return right now
+    all_rows = list(battery_history)
+    recent_rows = all_rows[-360:] if len(all_rows) > 360 else all_rows
+
+    return jsonify({
+        "miner_history_count": miner_n,
+        "miner_first_ts": m_first,
+        "miner_last_ts": m_last,
+        "battery_history_count": batt_n,
+        "battery_first_ts": b_first,
+        "battery_last_ts": b_last,
+        "battery_recent_count": len(recent_rows),
+        "battery_all_count": len(all_rows)
+    })
+
+@app.get("/debug/miner_sample")
+def debug_miner_sample():
+    import itertools, json, datetime as _dt
+
+    rows = list(HISTORY)
+    n = len(rows)
+
+    def parse_ok(ts):
+        try:
+            # JS Date accepts ISO 8601; this mirrors that
+            _ = _dt.datetime.fromisoformat(str(ts))
+            return True
+        except Exception:
+            return False
+
+    with_ts = sum(1 for r in rows if r.get("ts"))
+    parseable = sum(1 for r in rows if r.get("ts") and parse_ok(r.get("ts")))
+    head = list(itertools.islice(rows, 0, 3))
+    tail = list(itertools.islice(rows, max(0, n-3), n))
+
+    return jsonify({
+        "total_rows": n,
+        "with_ts": with_ts,
+        "parseable_ts": parseable,
+        "head": head,
+        "tail": tail,
+    })
+
 # ---------- Main ----------
 if __name__ == "__main__":
+
+    # Preload historical data so charts have range immediately
+    print(f"[LOAD] paths: LOG_FILE={LOG_FILE}  BATT_LOG_FILE={BATT_LOG_FILE}")
+    _load_miner_history_from_csv()
+    _load_battery_history_from_csv()
+
+    # --- DEBUG: verify CSV preload happens on startup ---
+    print(f"[LOAD] paths: LOG_FILE={LOG_FILE}  BATT_LOG_FILE={BATT_LOG_FILE}")
+    try:
+        print(f"[LOAD] before: HISTORY={len(HISTORY)} battery_history={len(battery_history)}")
+    except Exception:
+        pass
+
+    # If you have _load_existing_csv, use it; otherwise use your per-file loaders
+    try:
+        _load_existing_csv(LOG_FILE, HISTORY)  # <-- use this if present
+        _load_existing_csv(BATT_LOG_FILE, battery_history)
+    except NameError:
+        # fallback to the two loaders you added earlier
+        _load_miner_history_from_csv()
+        _load_battery_history_from_csv()
+
+    print(f"[LOAD] after:  HISTORY={len(HISTORY)} battery_history={len(battery_history)}")
+
     t = threading.Thread(target=poller, daemon=True)
     t.start()
 

@@ -124,6 +124,7 @@
 
     <!-- Zoom buttons row -->
     <div class="zoom-bar">
+      <button onclick="zoomRecent(1/60)">1m</button>
       <button onclick="zoomRecent(1)">1h</button>
       <button onclick="zoomRecent(6)">6h</button>
       <button onclick="zoomRecent(24)">24h</button>
@@ -227,23 +228,29 @@ function updateLeft(row){
 }
 
 function safeDateFromRow(row){
-  try {
-    if (row && row.ts) {
-      const d = new Date(row.ts);
-      if (!isNaN(d)) return d;
-    }
-  } catch(_) {}
-  const now = new Date();
-  row.ts = now.toISOString();
-  return now;
+  // Prefer ISO timestamp if present
+  if (row && row.ts) {
+    const d = new Date(row.ts);
+    if (!isNaN(d)) return d;
+  }
+  // Fall back to separate date + time (e.g., "2025-08-30" + "04:47:24")
+  if (row && row.date && row.time) {
+    // Interpret as local time
+    const d = new Date(`${row.date}T${row.time}`);
+    if (!isNaN(d)) return d;
+  }
+  // Otherwise, skip this row
+  return null;
 }
 
 function pushHistory(row){
   try {
     const d = safeDateFromRow(row);
+    if (!d) return; // skip bad timestamp row
+
     hist.t.push(d);
-    hist.power.push(('Power' in row) ? row['Power'] : null);
-    hist.limit.push(('Power Limit' in row) ? row['Power Limit'] : null);
+    hist.power.push(('Power' in row) ? Number(row['Power']) : null);
+    hist.limit.push(('Power Limit' in row) ? Number(row['Power Limit']) : null);
     hist.fan.push(pickFanRPM(row));
     hist.wmtemp.push(pickWmTemp(row));
     hist.envtemp.push(pickEnvTemp(row));
@@ -320,13 +327,58 @@ document.getElementById('y2default').onclick = ()=>{
 };
 
 // Data fetchers
+async function preloadMinerHistory(){
+  try {
+    const r = await fetch('/history', { cache: 'no-store' });
+    const rows = await r.json();
+
+    // reset buffers
+    hist = { t:[], power:[], limit:[], fan:[], wmtemp:[], envtemp:[] };
+
+    for (const row of rows){
+      pushHistory(row);
+    }
+
+    // draw once with full history
+    plotUpdate();
+    console.log('[MINER preload] loaded rows:', rows.length);
+  } catch(e) {
+    showDebug('preloadMinerHistory error: ' + e);
+  }
+}
 async function loadHistory(){
   try {
     const r = await fetch('/history', {cache:'no-store'});
     const arr = await r.json();
+
+    // reset buffers
     hist = { t:[], power:[], limit:[], fan:[], wmtemp:[], envtemp:[] };
-    for (const row of arr){ pushHistory(row); }
+
+    // fill from server
+    for (const row of arr){
+      pushHistory(row); // skips rows with bad/missing ts
+    }
+
+    // draw once with full history
     plotUpdate();
+
+    // FORCE the x-axis to the full preloaded range (not just recent)
+    const n = hist.t.length;
+    if (n > 0) {
+      const start = hist.t[0];
+      const end   = hist.t[n - 1];
+      Plotly.relayout('chart', {'xaxis.range': [start, end]});
+    } else {
+      // fall back to autorange if nothing plotted
+      Plotly.relayout('chart', {'xaxis.autorange': true});
+    }
+
+    // debug: prove what we plotted
+    console.log('[MINER preload] loaded rows:', Array.isArray(arr) ? arr.length : 'not array',
+                'plotted:', n,
+                'first:', n ? hist.t[0] : null,
+                'last:', n ? hist.t[n-1] : null);
+
     setHealth(arr.length > 0);
   } catch(e) {
     showDebug('loadHistory fetch error: ' + e);
@@ -463,9 +515,10 @@ async function checkVersion(){
 }
 
 // Init
-(function init(){
+(async function init(){
   plotInit();
-  loadHistory().then(refreshStatus);
+  await preloadMinerHistory();
+  await refreshStatus();
   setInterval(refreshStatus, 10000); // 10s
   setInterval(checkVersion, 2000);
 })();
