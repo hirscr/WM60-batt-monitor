@@ -1,0 +1,383 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>EG4 Battery Page</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+  :root { --card-bg:#fafafa; --card-bd:#ddd; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
+  h1 { font-family: "Comic Sans MS","Comic Sans",cursive; margin: 0 0 16px; }
+
+
+  /* Two cards side-by-side, never overlapping */
+/* Stack cards vertically: summary (top) then battery list (bottom) */
+  .row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-bd);
+    border-radius: 12px;
+    padding: 16px;
+  }
+
+  /* Left summary grid */
+  .grid {
+    display: grid;
+    grid-template-columns: 160px 1fr;
+    gap: 12px 12px;
+  }
+  .k { font-weight: 600; color: #111; display:flex; align-items:center; }
+
+  /* Summary value boxes: auto-width to content; JS will unify widths */
+  .v {
+    display: inline-block;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 6px 10px;
+    text-align: right;
+    white-space: nowrap;
+    min-width: 0;   /* allow shrink-to-fit before JS sizing */
+  }
+
+  /* Battery list */
+  .batt-list { margin-top: 4px; }
+  .batt-row {
+    display: grid;
+    grid-template-columns: 140px 1fr 90px 90px;
+    gap: 12px;
+    align-items: center;
+    margin: 10px 0;
+  }
+  .bname { font-weight: 600; }
+
+  /* Bigger SOC bars */
+  .bar-wrap {
+    background: #eee;
+    border: 1px solid #ddd;
+    border-radius: 12px;
+    height: 34px;           /* was ~20-24px */
+    position: relative;
+    overflow: hidden;
+    width: 100%;
+  }
+  .bar-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;        /* larger label */
+    color: #111;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    pointer-events: none;
+  }
+    .bar {
+    height: 100%;
+    background: #8EA8FF;        /* filled color */
+    border-radius: 12px;         /* match wrap */
+    transition: width .3s ease;  /* smooth change */
+  }
+
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    text-align: right;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 6px 8px;
+    white-space: nowrap;
+  }
+
+  /* Status pill */
+  #statusBar { margin-bottom: 10px; display: flex; gap: 10px; align-items: center; }
+  #healthDot { width: 10px; height: 10px; border-radius: 50%; background: #bbb; display: inline-block; }
+  .ok { background:#19c37d !important; }
+  .bad { background:#ff4d4f !important; }
+  a.tab { margin-right: 12px; text-decoration: none; color: #1772FF; }
+
+  /* Responsive: stack cards on narrow screens */
+  @media (max-width: 900px) {
+    .row { grid-template-columns: 1fr; }
+    .grid { grid-template-columns: 150px 1fr; }
+    .batt-row { grid-template-columns: 120px 1fr 80px 80px; }
+  }
+</style>
+</head>
+<body>
+  <div id="statusBar" class="mono">
+    <a class="tab" href="/">← Miner Dashboard</a>
+    <span id="healthDot"></span>
+    <span id="healthText">Initializing…</span>
+    <span id="lastFetch" style="opacity:.7"></span>
+  </div>
+
+  <h1>The EG4 Battery page</h1>
+
+  <div class="row">
+    <div class="card">
+      <div class="grid">
+        <div class="k">PV in</div>          <div class="v" id="pv">— W</div>
+        <div class="k">total Charge</div>   <div class="v" id="soc">— %</div>
+        <div class="k">Load</div>           <div class="v" id="load">— W</div>
+        <div class="k">Charge Rate</div>    <div class="v" id="chg">— W</div>
+      </div>
+      <div style="margin-top: 10px;">
+       <button onclick="window.open('/logs/battery.csv', '_blank')">Download Battery Log</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="batt-list">
+  <div class="batt-row" style="font-weight:600;">
+    <div></div>
+    <div></div>
+    <div>V</div>
+    <div>I</div>
+  </div>
+  <div id="battList"></div>
+</div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px;">
+  <div id="battChart" style="height:460px;"></div>
+
+  <!-- Axis controls, same pattern as miner page -->
+  <div class="axis-panel" style="display:grid;grid-template-columns:80px 140px 140px 120px 120px;gap:8px;align-items:center;margin-top:10px;">
+    <div></div>
+    <div class="hdr" style="font-weight:600">Min</div>
+    <div class="hdr" style="font-weight:600">Max</div>
+    <div class="hdr" style="font-weight:600">Apply</div>
+    <div class="hdr" style="font-weight:600">Default</div>
+
+    <div class="mono">Left y-axis</div>
+    <input id="by1min" type="number" placeholder="0">
+    <input id="by1max" type="number" placeholder="5000">
+    <button id="by1apply">Apply</button>
+    <button id="by1default">Default</button>
+
+    <div class="mono">Right y-axis</div>
+    <input id="by2min" type="number" value="0">
+    <input id="by2max" type="number" value="100">
+    <button id="by2apply">Apply</button>
+    <button id="by2default">Default</button>
+  </div>
+
+  <div class="zoom-bar" style="display:flex;gap:8px;margin-top:8px;">
+    <button onclick="battZoomRecent(1)">1h</button>
+    <button onclick="battZoomRecent(6)">6h</button>
+    <button onclick="battZoomRecent(24)">24h</button>
+    <button onclick="battZoomRecent(24*7)">1w</button>
+    <button onclick="battZoomRecent(24*30)">1Mo</button>
+    <button onclick="battZoomAll()">All</button>
+  </div>
+</div>
+
+<script>
+const pvEl   = document.getElementById('pv');
+const socEl  = document.getElementById('soc');
+const loadEl = document.getElementById('load');
+const chgEl  = document.getElementById('chg');
+const listEl = document.getElementById('battList');
+
+const healthDot = document.getElementById('healthDot');
+const healthText= document.getElementById('healthText');
+const lastFetch = document.getElementById('lastFetch');
+
+function setHealth(ok){
+  healthDot.classList.toggle('ok', ok);
+  healthDot.classList.toggle('bad', !ok);
+  healthText.textContent = ok ? 'Connected' : 'No data';
+  lastFetch.textContent = ' @ ' + new Date().toLocaleTimeString();
+}
+
+function fmt(x, unit){
+  if (x == null || Number.isNaN(x)) return '— ' + unit;
+  return `${x} ${unit}`;
+}
+
+// ---- Battery history buffers for chart ----
+const bhist = { t:[], pv:[], load:[], chg:[], soc:[] };
+
+function battPlotInit(){
+  const layout = {
+    margin:{l:60,r:70,t:30,b:40},
+    xaxis:{type:'date', title:'Time'},
+    yaxis:{title:'Power (W)', rangemode:'tozero', autorange:true},
+    yaxis2:{title:'Total Charge (%)', overlaying:'y', side:'right', range:[0,100]},
+    legend:{orientation:'h', yanchor:'bottom', y:1.06, x:0.02},
+  };
+  Plotly.newPlot('battChart', [
+    {x:[], y:[], name:'PV in (W)',      mode:'lines', yaxis:'y'},
+    {x:[], y:[], name:'Load (W)',       mode:'lines', yaxis:'y'},
+    {x:[], y:[], name:'Charge Rate (W)',mode:'lines', yaxis:'y'},
+    {x:[], y:[], name:'Total Charge (%)',mode:'lines', yaxis:'y2'},
+  ], layout, {responsive:true});
+}
+
+function battPlotUpdate(){
+  Plotly.update('battChart',{
+    x:[bhist.t, bhist.t, bhist.t, bhist.t],
+    y:[bhist.pv, bhist.load, bhist.chg, bhist.soc]
+  });
+}
+
+function battZoomRecent(hours){
+  const end = new Date();
+  const start = new Date(end.getTime() - hours*3600*1000);
+  Plotly.relayout('battChart', {'xaxis.range':[start, end]});
+}
+function battZoomAll(){
+  Plotly.relayout('battChart', {'xaxis.autorange':true});
+}
+
+// Axis controls (left watts)
+document.getElementById('by1apply').onclick = ()=>{
+  const vmin = document.getElementById('by1min').value;
+  const vmax = document.getElementById('by1max').value;
+  const rel = {};
+  if (vmin !== '' && vmax !== '') rel['yaxis.range']=[Number(vmin), Number(vmax)];
+  else if (vmin !== '') rel['yaxis.range']=[Number(vmin), null];
+  else if (vmax !== '') rel['yaxis.range']=[null, Number(vmax)];
+  if (Object.keys(rel).length) Plotly.relayout('battChart', rel);
+};
+document.getElementById('by1default').onclick = ()=>{
+  Plotly.relayout('battChart', {'yaxis.autorange': true});
+  document.getElementById('by1min').value = ''; document.getElementById('by1max').value = '';
+};
+// Axis controls (right %)
+document.getElementById('by2apply').onclick = ()=>{
+  const vmin = document.getElementById('by2min').value;
+  const vmax = document.getElementById('by2max').value;
+  const rel = {};
+  if (vmin !== '' && vmax !== '') rel['yaxis2.range']=[Number(vmin), Number(vmax)];
+  else if (vmin !== '') rel['yaxis2.range']=[Number(vmin), null];
+  else if (vmax !== '') rel['yaxis2.range']=[null, Number(vmax)];
+  if (Object.keys(rel).length) Plotly.relayout('battChart', rel);
+};
+document.getElementById('by2default').onclick = ()=>{
+  Plotly.relayout('battChart', {'yaxis2.range':[0,100]});
+  document.getElementById('by2min').value = '0'; document.getElementById('by2max').value = '100';
+};
+
+
+function renderUnits(units){
+  listEl.innerHTML = '';
+  (units || []).forEach((u, idx)=>{
+    const name = u.sn || `Battery ${idx+1}`;
+    const soc  = typeof u.soc === 'number' ? u.soc : null;
+    const mv   = typeof u.voltage_mv === 'number' ? (u.voltage_mv/100).toFixed(1) : '—';
+    const cur  = (u.current_a != null) ? u.current_a : '—';
+
+    const row = document.createElement('div');
+    row.className = 'batt-row';
+
+    const label = document.createElement('div');
+    label.className = 'bname';
+    label.textContent = name.replace(/^.*_/, 'Battery ');
+    row.appendChild(label);
+
+    const barWrap = document.createElement('div');
+    barWrap.className = 'bar-wrap';
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    bar.style.width = (soc!=null ? Math.max(0, Math.min(100, soc)) : 0) + '%';
+    const barLabel = document.createElement('div');
+    barLabel.className = 'bar-label';
+    barLabel.textContent = (soc!=null ? soc.toFixed(1) : '—') + ' %';
+    barWrap.appendChild(bar);
+    barWrap.appendChild(barLabel);
+    row.appendChild(barWrap);
+
+    const vBox = document.createElement('div');
+    vBox.className = 'mono';
+    vBox.textContent = mv + ' V';
+    row.appendChild(vBox);
+
+    const iBox = document.createElement('div');
+    iBox.className = 'mono';
+    iBox.textContent = (cur==='—' ? '—' : cur) + ' A';
+    row.appendChild(iBox);
+
+    listEl.appendChild(row);
+  });
+}
+
+// Make the four summary value boxes equal width to the largest content
+function adjustSummaryWidths(){
+  const boxes = [pvEl, socEl, loadEl, chgEl];
+  const probe = document.createElement('span');
+  probe.style.visibility = 'hidden';
+  probe.style.position = 'absolute';
+  probe.style.whiteSpace = 'nowrap';
+  document.body.appendChild(probe);
+
+  let max = 0;
+  for (const el of boxes){
+    probe.textContent = el.textContent || '';
+    max = Math.max(max, probe.getBoundingClientRect().width);
+  }
+  document.body.removeChild(probe);
+
+  const target = Math.ceil(max + 20); // add padding buffer
+  boxes.forEach(el => { el.style.width = target + 'px'; });
+}
+
+async function refresh(){
+  try{
+    const r = await fetch('/battery', {cache:'no-store'});
+    const data = await r.json();
+    const snap = data && data.latest ? data.latest : null;
+    const ok = !!(snap && (snap.soc_percent != null));
+    setHealth(ok);
+
+    if (!ok) return;
+
+    pvEl.textContent   = fmt(snap.pv_power_w != null ? Math.round(snap.pv_power_w) : null, 'W');
+    socEl.textContent  = fmt(snap.soc_percent, '%');
+    loadEl.textContent = fmt(snap.load_power_w != null ? Math.round(snap.load_power_w) : null, 'W');
+    let chargeW = snap.battery_net_w;
+    if (chargeW == null && snap.pack_voltage_v != null && snap.pack_current_a != null){
+      chargeW = Math.round(snap.pack_voltage_v * snap.pack_current_a);
+    }
+    chgEl.textContent = fmt(chargeW != null ? Math.round(chargeW) : null, 'W');
+
+    // push into chart history
+    const now = new Date();
+    bhist.t.push(now);
+    bhist.pv.push( (snap.pv_power_w != null) ? Math.round(snap.pv_power_w) : null );
+    bhist.load.push( (snap.load_power_w != null) ? Math.round(snap.load_power_w) : null );
+
+    let chargeW2 = snap.battery_net_w;
+    if (chargeW2 == null && snap.pack_voltage_v != null && snap.pack_current_a != null){
+      chargeW2 = Math.round(snap.pack_voltage_v * snap.pack_current_a);
+    }
+    bhist.chg.push( (chargeW2 != null) ? chargeW2 : null );
+    bhist.soc.push( (snap.soc_percent != null) ? Number(snap.soc_percent) : null );
+
+    battPlotUpdate();
+
+
+    adjustSummaryWidths();   // <— add this line
+    renderUnits(snap.units || []);
+  }catch(e){
+    setHealth(false);
+  }
+}
+
+(function init(){
+  battPlotInit();
+  refresh();
+  setInterval(refresh, 10000); // 10s
+})();
+</script>
+</body>
+</html>

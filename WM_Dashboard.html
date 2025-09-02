@@ -1,0 +1,474 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WM60s Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 14px; }
+    h1 { font-family: "Comic Sans MS","Comic Sans",cursive; margin: 0 0 12px; }
+    .row { display: grid; grid-template-columns: 360px 1fr; gap: 16px; }
+    .card { background: #fafafa; border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    .grid { display: grid; grid-template-columns: 140px 1fr; row-gap: 8px; column-gap: 10px; }
+    .label { color: #1772FF; cursor: pointer; user-select: none; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    #feed { height: 280px; overflow-y: auto; background:#fff; border:1px solid #eee; padding:8px; }
+    .switch { position:relative; display:inline-block; width:58px; height:30px; vertical-align:middle; margin-left: 8px;}
+    .switch input { display:none; }
+    .slider { position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:#ccc; transition:.2s; border-radius:30px;}
+    .slider:before { position:absolute; content:""; height:24px; width:24px; left:3px; bottom:3px; background:white; transition:.2s; border-radius:50%;}
+    input:checked + .slider { background:#1772FF; }
+    input:checked + .slider:before { transform: translateX(28px); }
+    button.pending { background:#FFD24D; border-color:#E0B000; color:#222; cursor:progress; }
+    input[disabled] { background:#eee; }
+    #chart { height: 480px; }
+
+    /* Axis control panel per mockup */
+    .axis-panel {
+      display:grid;
+      grid-template-columns: 120px 60px 60px 80px 80px;
+      gap: 8px;
+      align-items:center;
+      margin-top: 10px;
+    }
+    .axis-panel .hdr { font-weight: 600; text-align: left; }
+    .axis-panel input { width: 100%; }
+    .zoom-bar { display:flex; gap: 8px; margin-top: 8px; }
+    .zoom-bar button, .axis-panel button, button { padding: 6px 10px; }
+
+    /* Debug/status */
+    #statusBar { margin-bottom: 10px; display:flex; gap:10px; align-items:center; }
+    #healthDot { width:10px; height:10px; border-radius:50%; background:#bbb; display:inline-block; }
+    #debug { display:none; white-space:pre-wrap; background:#fff4f4; border:1px solid #f0bcbc; color:#8a0000; padding:8px; border-radius:8px; margin:10px 0; }
+    .ok { background:#19c37d !important; }
+    .bad { background:#ff4d4f !important; }
+  </style>
+</head>
+<body>
+  <div id="statusBar" class="mono">
+    <a class="tab" href="/battery_page">Battery Page →</a>
+    <span id="healthDot"></span>
+    <span id="healthText">Initializing…</span>
+    <span id="lastFetch" style="opacity:.7"></span>
+  </div>
+  <div id="debug" class="mono"></div>
+
+  <h1>The Robert Special WM60s Dashboard</h1>
+
+  <div class="card" style="margin-bottom:12px;">
+  Miner power
+  <label class="switch">
+    <input type="checkbox" id="powerToggle"><span class="slider"></span>
+  </label>
+  <span class="mono" style="font-size:12px; opacity:.85">Toggle to Standby (0W) / Resume (last limit)</span>
+
+  <!-- NEW: Auto Control -->
+  <div style="margin-top:8px;">
+    Auto control
+    <label class="switch">
+      <input type="checkbox" id="autoToggle"><span class="slider"></span>
+    </label>
+    <span class="mono" style="font-size:12px; opacity:.85">Map battery SOC → power limit</span>
+  </div>
+    <div style="margin-top: 10px;">
+  <button onclick="window.open('/logs/miner.csv', '_blank')">Download Miner Log</button>
+</div>
+</div>
+
+  <div class="row">
+    <div class="card">
+      <div class="grid">
+        <div>Date &amp; Time</div><div class="mono" id="dt">—</div>
+
+        <div class="label" id="limitLabel" title="Click to set limit">Power Limit</div>
+        <div>
+          <input id="limitInput" class="mono" type="number" min="0" step="50" value="3000"> W
+          <button id="applyBtn">Apply</button>
+        </div>
+
+        <div>Power</div><div class="mono"><span id="power">—</span> W</div>
+        <div>Env Temp</div><div class="mono"><span id="envtemp">—</span> C</div>
+        <div>WM Temp</div><div class="mono"><span id="wmtemp">—</span> C</div>
+        <div>Fan Speed</div><div class="mono"><span id="fan">—</span> RPM</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div id="feed" class="mono"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <div id="chart"></div>
+
+    <!-- Axis controls laid out like your mockup -->
+    <div class="axis-panel">
+      <div></div>
+      <div class="hdr">Min</div>
+      <div class="hdr">Max</div>
+      <div class="hdr">Apply</div>
+      <div class="hdr">Default</div>
+
+      <div class="mono">Left y-axis</div>
+      <input id="y1min" type="number" placeholder="0">
+      <input id="y1max" type="number" placeholder="4000">
+      <button id="y1apply">Apply</button>
+      <button id="y1default">Default</button>
+
+      <div class="mono">Right y-axis</div>
+      <input id="y2min" type="number" value="0">
+      <input id="y2max" type="number" value="100">
+      <button id="y2apply">Apply</button>
+      <button id="y2default">Default</button>
+    </div>
+
+    <!-- Zoom buttons row -->
+    <div class="zoom-bar">
+      <button onclick="zoomRecent(1)">1h</button>
+      <button onclick="zoomRecent(6)">6h</button>
+      <button onclick="zoomRecent(24)">24h</button>
+      <button onclick="zoomRecent(24*7)">1w</button>
+      <button onclick="zoomRecent(24*30)">1Mo</button>
+      <button onclick="zoomAll()">All</button>
+    </div>
+  </div>
+
+<script>
+const powerEl = document.getElementById('power');
+const fanEl = document.getElementById('fan');
+const wmtempEl = document.getElementById('wmtemp');
+const envtempEl = document.getElementById('envtemp');
+const dtEl = document.getElementById('dt');
+const limitInput = document.getElementById('limitInput');
+const applyBtn = document.getElementById('applyBtn');
+const limitLabel = document.getElementById('limitLabel');
+const powerToggle = document.getElementById('powerToggle');
+const feed = document.getElementById('feed');
+
+const healthDot = document.getElementById('healthDot');
+const healthText = document.getElementById('healthText');
+const lastFetch = document.getElementById('lastFetch');
+const debug = document.getElementById('debug');
+
+const autoToggle = document.getElementById('autoToggle');
+
+function showDebug(msg){
+  debug.style.display = 'block';
+  debug.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+}
+window.addEventListener('error', (e)=> showDebug('JS error: ' + (e.message || e.error)));
+
+function setHealth(ok){
+  healthDot.classList.toggle('ok', ok);
+  healthDot.classList.toggle('bad', !ok);
+  healthText.textContent = ok ? 'Connected' : 'No data';
+  lastFetch.textContent = ' @ ' + new Date().toLocaleTimeString();
+}
+
+function pickFanRPM(row){
+  let best = null;
+  for (const k in row){
+    const n = k.toLowerCase();
+    if (n.includes('fan') || n.includes('rpm')) {
+      const v = parseInt(row[k]);
+      if (!isNaN(v) && v>0) best = best===null ? v : Math.max(best, v);
+    }
+  }
+  return best;
+}
+function pickWmTemp(row){
+  const keys = ["Temperature","Chip Temp Avg","temp"];
+  for (const k of keys){ if (k in row) return parseFloat(row[k]); }
+  return null;
+}
+function pickEnvTemp(row){
+  const keys = ["Env Temperature","Env Temp","Ambient","Ambient Temp"];
+  for (const k of keys){ if (k in row) return parseFloat(row[k]); }
+  return null;
+}
+
+let hist = { t:[], power:[], limit:[], fan:[], wmtemp:[], envtemp:[] };
+let lastVersion = null; // for auto-reload
+
+function addToFeed(row){
+  if (!row || typeof row !== 'object') return;
+  const tsIso = row.ts || new Date().toISOString();
+  const p  = row["Power"] ?? "—";
+  const pl = row["Power Limit"] ?? "—";
+  const fan = pickFanRPM(row) ?? "—";
+  const temp = pickWmTemp(row) ?? "—";
+  const div = document.createElement('div');
+  div.textContent = `${formatTimestamp(tsIso)}    ${p}W    ${pl}W    ${fan}RPM    ${temp}C`;
+  feed.appendChild(div);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function updateLeft(row){
+  if (!row || typeof row !== 'object') return;
+  const tsIso = row.ts || new Date().toISOString();
+
+  const p  = row["Power"];
+  const pl = row["Power Limit"];
+  const fan = pickFanRPM(row);
+  const wm  = pickWmTemp(row);
+  const env = pickEnvTemp(row);
+
+  dtEl.textContent = formatTimestamp(tsIso);
+  powerEl.textContent = (p!=null) ? p : "—";
+  if (pl!=null && !limitInput.disabled) limitInput.value = pl;
+  fanEl.textContent = (fan!=null) ? fan : "—";
+  wmtempEl.textContent = (wm!=null) ? wm.toFixed(1) : "—";
+  envtempEl.textContent = (env!=null) ? env.toFixed(1) : "—";
+
+  if (!powerToggle.dataset.busy){
+    const shouldBeChecked = !!(pl && Number(pl) > 0);
+    if (powerToggle.checked !== shouldBeChecked) powerToggle.checked = shouldBeChecked;
+  }
+}
+
+function safeDateFromRow(row){
+  try {
+    if (row && row.ts) {
+      const d = new Date(row.ts);
+      if (!isNaN(d)) return d;
+    }
+  } catch(_) {}
+  const now = new Date();
+  row.ts = now.toISOString();
+  return now;
+}
+
+function pushHistory(row){
+  try {
+    const d = safeDateFromRow(row);
+    hist.t.push(d);
+    hist.power.push(('Power' in row) ? row['Power'] : null);
+    hist.limit.push(('Power Limit' in row) ? row['Power Limit'] : null);
+    hist.fan.push(pickFanRPM(row));
+    hist.wmtemp.push(pickWmTemp(row));
+    hist.envtemp.push(pickEnvTemp(row));
+  } catch(e) {
+    showDebug('pushHistory error: ' + e);
+  }
+}
+
+function plotInit(){
+  const layout = {
+    margin:{l:60,r:70,t:40,b:40},
+    xaxis:{type:'date', title:'Time'},
+    yaxis:{title:'Power / Fan', rangemode:'tozero', autorange:true},
+    yaxis2:{title:'Temperature (°C)', overlaying:'y', side:'right', range:[0,100]},
+    legend:{orientation:'h', yanchor:'bottom', y:1.06, x:0.02},
+  };
+  Plotly.newPlot('chart', [
+    {x:[], y:[], name:'Power (W)', mode:'lines', yaxis:'y'},
+    {x:[], y:[], name:'Limit (W)', mode:'lines', yaxis:'y'},
+    {x:[], y:[], name:'Fan (RPM)', mode:'lines', yaxis:'y'},
+    {x:[], y:[], name:'WM Temp (°C)', mode:'lines', yaxis:'y2'},
+    {x:[], y:[], name:'Env Temp (°C)', mode:'lines', yaxis:'y2'},
+  ], layout, {responsive:true});
+}
+
+function plotUpdate(){
+  try {
+    Plotly.update('chart', {
+      x: [hist.t, hist.t, hist.t, hist.t, hist.t],
+      y: [hist.power, hist.limit, hist.fan, hist.wmtemp, hist.envtemp]
+    });
+  } catch(e) {
+    showDebug('plotUpdate error: ' + e);
+  }
+}
+
+function zoomRecent(hours){
+  const end = new Date();
+  const start = new Date(end.getTime() - hours*3600*1000);
+  Plotly.relayout('chart', {'xaxis.range':[start, end]});
+}
+function zoomAll(){
+  Plotly.relayout('chart', {'xaxis.autorange':true});
+}
+
+// Axis apply/default handlers (Left)
+document.getElementById('y1apply').onclick = ()=>{
+  const vmin = document.getElementById('y1min').value;
+  const vmax = document.getElementById('y1max').value;
+  const rel = {};
+  if (vmin !== '' && vmax !== '') rel['yaxis.range']=[Number(vmin), Number(vmax)];
+  else if (vmin !== '') rel['yaxis.range']=[Number(vmin), null];
+  else if (vmax !== '') rel['yaxis.range']=[null, Number(vmax)];
+  if (Object.keys(rel).length) Plotly.relayout('chart', rel);
+};
+document.getElementById('y1default').onclick = ()=>{
+  Plotly.relayout('chart', {'yaxis.autorange': true});
+  document.getElementById('y1min').value = ''; document.getElementById('y1max').value = '';
+};
+
+// Axis apply/default handlers (Right)
+document.getElementById('y2apply').onclick = ()=>{
+  const vmin = document.getElementById('y2min').value;
+  const vmax = document.getElementById('y2max').value;
+  const rel = {};
+  if (vmin !== '' && vmax !== '') rel['yaxis2.range']=[Number(vmin), Number(vmax)];
+  else if (vmin !== '') rel['yaxis2.range']=[Number(vmin), null];
+  else if (vmax !== '') rel['yaxis2.range']=[null, Number(vmax)];
+  if (Object.keys(rel).length) Plotly.relayout('chart', rel);
+};
+document.getElementById('y2default').onclick = ()=>{
+  Plotly.relayout('chart', {'yaxis2.range':[0,100]});
+  document.getElementById('y2min').value = '0'; document.getElementById('y2max').value = '100';
+};
+
+// Data fetchers
+async function loadHistory(){
+  try {
+    const r = await fetch('/history', {cache:'no-store'});
+    const arr = await r.json();
+    hist = { t:[], power:[], limit:[], fan:[], wmtemp:[], envtemp:[] };
+    for (const row of arr){ pushHistory(row); }
+    plotUpdate();
+    setHealth(arr.length > 0);
+  } catch(e) {
+    showDebug('loadHistory fetch error: ' + e);
+    setHealth(false);
+  }
+}
+async function refreshStatus(){
+  try {
+    const r = await fetch('/status', {cache:'no-store'});
+    const data = await r.json();
+    const ok = !!(data && data.latest && Object.keys(data.latest).length);
+    setHealth(ok);
+    if (ok){
+      updateLeft(data.latest);
+      pushHistory(data.latest);
+    }
+    if (data && Array.isArray(data.recent)){
+      feed.innerHTML = '';
+      for (const row of data.recent){ addToFeed(row); }
+    }
+
+    const auto = (data && data.auto) ? data.auto : {enabled:false};
+    if (autoToggle.checked !== !!auto.enabled) autoToggle.checked = !!auto.enabled;
+
+    // Disable manual controls when Auto is on
+    const manualDisabled = !!auto.enabled;
+    applyBtn.disabled = manualDisabled;
+    limitInput.disabled = manualDisabled || limitInput.disabled; // stays disabled while applying
+    plotUpdate();
+  } catch(e) {
+    showDebug('refreshStatus fetch error: ' + e);
+    setHealth(false);
+  }
+}
+
+function formatTimestamp(input){
+  const d = input ? new Date(input) : new Date();
+  const pad = n => n.toString().padStart(2,'0');
+  return `${pad(d.getMonth()+1)}-${pad(d.getDate())}-${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// Limit & power toggle
+async function applyLimit(val){
+  const target = parseInt(val);
+  if (isNaN(target) || target < 0){ alert('Enter a valid non-negative integer'); return; }
+
+  // Lock UI
+  applyBtn.disabled = true;
+  applyBtn.classList.add('pending');
+  limitInput.disabled = true;
+  powerToggle.dataset.busy = "1";   // freeze the switch state while miner reboots
+
+  try {
+    // Fire the change
+    await fetch('/set_limit', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({watts: target})
+    });
+
+    // Poll until the miner reports the new limit (ignore transient 0)
+    const deadline = Date.now() + 180000; // up to 3 minutes
+    let applied = false;
+    while (Date.now() < deadline){
+      await new Promise(r => setTimeout(r, 2000));
+      const r = await fetch('/status', {cache:'no-store'});
+      const data = await r.json();
+      const plVal = (data && data.latest) ? Number(data.latest["Power Limit"]) : NaN;
+      if (!Number.isNaN(plVal) && plVal === Number(target)){
+        applied = true;
+        break;
+      }
+      // keep waiting; during btminer restart it may show 0 for a while
+    }
+    // refresh once at the end
+    await refreshStatus();
+  } catch (e) {
+    // Optional: surface error visibly
+    if (typeof showDebug === 'function') showDebug('applyLimit error: ' + e);
+  } finally {
+    // Unlock UI regardless of success/fail
+    powerToggle.dataset.busy = "";
+    applyBtn.disabled = false;
+    applyBtn.classList.remove('pending');
+    limitInput.disabled = false;
+  }
+}
+
+applyBtn.onclick = () => applyLimit(limitInput.value);
+limitLabel.onclick = () => { const v = prompt('Enter new Power Limit (W):', limitInput.value); if (v !== null) applyLimit(v); };
+limitInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyLimit(limitInput.value); });
+
+powerToggle.onchange = async (e)=>{
+  powerToggle.dataset.busy = "1";
+  try {
+    await fetch(e.target.checked ? '/resume' : '/standby', {method:'POST'});
+  } finally {
+    setTimeout(()=>{ powerToggle.dataset.busy = ""; refreshStatus(); }, 2000);
+  }
+};
+
+autoToggle.onchange = async (e) => {
+  const enabled = e.target.checked;
+  // Freeze manual inputs immediately
+  applyBtn.disabled = enabled;
+  limitInput.disabled = enabled || limitInput.disabled;
+
+  try {
+    await fetch('/autocontrol', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({enabled})
+    });
+  } catch (err) {
+    // revert on failure
+    e.target.checked = !enabled;
+  } finally {
+    // pull fresh status (will also re-disable appropriately)
+    setTimeout(refreshStatus, 500);
+  }
+};
+
+// Auto-reload HTML on change
+async function checkVersion(){
+  try{
+    const r = await fetch('/version', {cache:'no-store'});
+    const v = await r.json();
+    const sig = `${v.mtime}-${v.sha}`;
+    if (window.__lastVersion && sig !== window.__lastVersion) location.reload();
+    window.__lastVersion = sig;
+  }catch(e){
+    showDebug('version check error: ' + e);
+  }
+}
+
+// Init
+(function init(){
+  plotInit();
+  loadHistory().then(refreshStatus);
+  setInterval(refreshStatus, 10000); // 10s
+  setInterval(checkVersion, 2000);
+})();
+</script>
+</body>
+</html>
