@@ -3,8 +3,7 @@
 # Requires: wm_controller.py in the same folder with class WhatsMinerClientPlain
 
 import hashlib
-from typing import Any, Dict, Optional
-import os, threading, time, csv
+import os, csv
 from collections import deque
 from datetime import datetime, timezone
 import math
@@ -12,28 +11,38 @@ import logging
 
 from flask import Flask, jsonify, request, send_from_directory
 
+from typing import Optional
+
 # --- EG4 battery client ---
 from eg4_client import EG4Client
-from wm_controller import WhatsMinerClientPlain  # <- your existing plaintext client
+
+# ---- BTMiner routines
+from pyasic.rpc.btminer import BTMinerRPCAPI
 
 # Config from env
 EG4_USER = os.environ.get("EG4_USER") or os.environ.get("USERNAME")
 EG4_PASS = os.environ.get("EG4_PASS") or os.environ.get("PASSWORD")
 EG4_BASE = os.environ.get("EG4_BASE_URL", "https://monitor.eg4electronics.com")
 
-# Poll cadence for battery page
-BATTERY_POLL_SECONDS = int(os.environ.get("BATTERY_POLL_SECONDS", "10"))
+# Poll cadence
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 
 # --- Auto Control state ---
 AUTO_ENABLED = False
 
 # --- Auto control config (place near other constants/env reads) ---
 AUTO_MIN_INTERVAL_SEC = int(os.environ.get("AUTO_MIN_INTERVAL_SEC", "120"))
-MAX_WATT = int(os.environ.get("MAX_WATT", "3600"))
+BASE_WATTS = int(os.getenv("WM_BASE_WATTS", "3600"))
 MIN_WATT = 0
 AUTO_LOW_CAP_W = int(os.environ.get("AUTO_LOW_CAP_W", "3200"))  # cap before full recharge
-# Ratchet floor: only decreases with SOC; resets to MAX_WATT once SOC == 100%
-AUTO_FLOOR_W = MAX_WATT
+AUTO_TARGET_W: Optional[int] = None
+AUTO_TARGET_PCT: Optional[int] = None
+AUTO_MINER_OFF_DUE_TO_SOC: bool = False
+
+# Ratchet floor: only decreases with SOC; resets to BASE_WATTS once SOC == 100%
+AUTO_FLOOR_W = BASE_WATTS
+COOLDOWN_TARGET_C = 35.0
+COOLDOWN_POLL_S = 5.0  # poll only every 5 seconds, per requirement
 
 # Latched-floor state and last set tracking
 AUTO_LAST_SET_W: Optional[int] = None
@@ -46,11 +55,7 @@ battery_history = deque()  # keep all rows ever loaded
 
 
 # ---------- Config ----------
-MINER_IP = os.environ.get("MINER_IP", "").strip()
-if not MINER_IP:
-    raise SystemExit("Set MINER_IP (e.g., export MINER_IP=192.168.86.47)")
 
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
 HISTORY_MAX = int(os.environ.get("HISTORY_MAX", str(24*60*60 // max(1, POLL_SECONDS))))  # ~24h default
 DEFAULT_LIMIT = int(os.environ.get("DEFAULT_LIMIT", "3000"))  # used for resume if no last nonzero limit
 
@@ -71,7 +76,175 @@ _latest  = {}                    # last good sample
 
 # ---------- App/state ----------
 app = Flask(__name__, static_folder=".", static_url_path="")
-client = WhatsMinerClientPlain(MINER_IP, timeout=2.5)
+
+WM_HOST = os.environ.get("WM_HOST", "").strip()
+WM_PASS = os.environ.get("WM_PASS", "admin")
+if not WM_HOST:
+    raise SystemExit("Set WM_HOST (e.g., export WM_HOST=192.168.86.52)")
+
+# SINGLE shared client
+api = BTMinerRPCAPI(WM_HOST)
+api.pwd = WM_PASS
+
+
+# --- BEGIN Miner control queue integration ---
+import asyncio
+import threading, queue, time
+from typing import Optional, Dict, Any
+
+class MinerController:
+    def __init__(self, api: BTMinerRPCAPI):
+        self.api = api
+        self.q = queue.Queue()
+        # keep "error" a string, not None
+        self.state: dict[str, object] = {
+            "op_state": "idle",
+            "op_kind": None,
+            "last_sent_command": None,
+            "error": "",           # <- string, not None
+            "started_at": None,
+            "request": None,
+        }
+        t = threading.Thread(target=self._worker, daemon=True)
+        t.start()
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        return dict(self.state)
+
+    # enqueue APIs
+    def enqueue_stop(self):
+        self.q.put(("stop", {}))
+
+    def enqueue_resume(self):
+        self.q.put(("resume", {}))
+
+    def enqueue_set_power_limit(self, watts: int):
+        self.q.put(("power_limit", {"watts": int(watts)}))
+
+    def enqueue_set_power_pct(self, percent: int):
+        self.q.put(("power_pct", {"percent": int(percent)}))
+
+    # worker helpers
+    def _verify(self, kind: str, req: Dict[str, Any]) -> bool:
+        try:
+            summary = asyncio.run(self.api.summary())
+            if not isinstance(summary, dict):
+                return False
+            lst = summary.get("SUMMARY") or []
+            s = lst[0] if lst and isinstance(lst[0], dict) else {}
+            if kind == "stop":
+                return s.get("is_mining") is False
+            if kind == "resume":
+                return s.get("is_mining") is True
+            if kind == "power_limit":
+                return str(s.get("Power Limit")) == str(req["watts"])
+            if kind == "power_pct":
+                return True
+        except Exception:
+            return False
+        return True
+
+    def _run_op(self, kind: str, req: Dict[str, Any]):
+        self.state.update({
+            "op_state": "applying",
+            "op_kind": kind,
+            "error": None,
+            "started_at": time.time(),
+            "request": dict(req),
+            "last_sent_command": kind,
+        })
+        try:
+            if kind == "stop":
+                asyncio.run(self.api.power_off())
+            elif kind == "resume":
+                asyncio.run(self.api.power_on())
+            elif kind == "power_limit":
+                asyncio.run(
+                    self.api.send_privileged_command(
+                        "set_power_limit", power_limit=str(req["watts"])
+                    )
+                )
+            elif kind == "power_pct":
+                asyncio.run(self.api.set_power_pct(req["percent"]))
+            else:
+                raise ValueError(f"Unknown op {kind}")
+
+            self.state["op_state"] = "verifying"
+            ok = self._verify(kind, req)
+            if not ok:
+                raise RuntimeError(f"verification failed for {kind}")
+
+            self.state["op_state"] = "idle"
+        except Exception as e:
+            self.state["op_state"] = "error"
+            self.state["error"] = str(e)
+
+    def _worker(self):
+        while True:
+            kind, req = self.q.get()
+            try:
+                self._run_op(kind, req)
+            finally:
+                self.q.task_done()
+
+# instantiate controller
+miner_ctrl = MinerController(api)
+
+# --- BEGIN control endpoints ---
+
+def _json_ok(**kwargs):
+    return jsonify({"ok": True, **kwargs})
+
+def _json_err(msg, code=400):
+    return jsonify({"ok": False, "error": str(msg)}), code
+
+@app.post("/set_power_limit")
+def set_power_limit():
+    """Plaintext path: set Max Power (W). Button should turn yellow until verified."""
+    try:
+        data = request.get_json(force=True) or {}
+        watts = int(data.get("watts"))
+        if watts <= 0:
+            return _json_err("watts must be > 0")
+    except Exception as e:
+        return _json_err(f"invalid payload: {e}")
+    miner_ctrl.enqueue_set_power_limit(watts)
+    return _json_ok(queued=True, op="power_limit", watts=watts)
+
+@app.post("/set_power_pct")
+def set_power_pct():
+    """Ciphertext path via WM_Cipher: set power percent (0..100).
+       Firmware will stop & cool to 35C before applying; our queue polls every 5s.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        percent = int(data.get("percent"))
+        if not 0 <= percent <= 100:
+            return _json_err("percent must be 0..100")
+    except Exception as e:
+        return _json_err(f"invalid payload: {e}")
+    miner_ctrl.enqueue_set_power_pct(percent)
+    return _json_ok(queued=True, op="power_pct", percent=percent)
+
+@app.post("/stop")
+def stop_mining():
+    """Soft stop (hashboards stop)."""
+    miner_ctrl.enqueue_stop()
+    return _json_ok(queued=True, op="stop")
+
+@app.post("/resume")
+def resume_mining():
+    """Soft resume (hashboards start)."""
+    miner_ctrl.enqueue_resume()
+    return _json_ok(queued=True, op="resume")
+
+@app.get("/op_status")
+def op_status():
+    """Lightweight status for the UI to track apply/cooldown/verify phases."""
+    return jsonify(miner_ctrl.status_snapshot())
+
+# --- END control endpoints ---
+
 # Ensure EG4 creds exist and pass them explicitly
 if not EG4_USER or not EG4_PASS:
     raise SystemExit("Set EG4_USER and EG4_PASS in your Run Configuration (Environment variables).")
@@ -127,28 +300,70 @@ def _watts_for_soc(
       - Once power has been reduced below 100%, we latch the lowest power ever set
         and do NOT allow increases above that latched floor until SOC == 100%.
       - When SOC == 100%, allow 100% power again (release the latch).
-      - If SOC is None, hold last_set_w if available; otherwise default to MAX_WATT.
+      - If SOC is None, hold last_set_w if available; otherwise default to BASE_WATTS.
     """
     if soc is None:
-        return last_set_w if last_set_w is not None else MAX_WATT
+        return last_set_w if last_set_w is not None else BASE_WATTS
 
     # Compute decile percent rounded UP, clamp 0..100
     pct = min(100, int(math.ceil(soc / 10.0) * 10))
-    candidate = int(round(MAX_WATT * (pct / 100.0)))
+    candidate = int(round(BASE_WATTS * (pct / 100.0)))
 
     # Apply the latched floor while SOC is below 100%
     if latched_floor_w is not None and soc < 100.0:
         candidate = min(candidate, latched_floor_w)
 
     # Clamp to global bounds
-    return max(MIN_WATT, min(MAX_WATT, candidate))
+    return max(MIN_WATT, min(BASE_WATTS, candidate))
+
+def _extract_hashrate_ths_from_summary(item: Dict[str, Any]) -> Optional[float]:
+    """Derive hashrate in TH/s from a WhatsMiner SUMMARY item."""
+    if not isinstance(item, dict):
+        return None
+
+    # 1) Direct TH/s fields (some firmwares)
+    for k in ("THS 5s", "THS av", "TH/s", "THS"):
+        if k in item:
+            try:
+                v = float(item[k])
+                return v if v >= 0 else None
+            except Exception:
+                pass
+
+    # 2) GH/s fields (most cgminer-style summaries)
+    for k in ("GHS 5s", "GHS av", "GH/s", "GHS"):
+        if k in item:
+            try:
+                v = float(item[k])  # GH/s
+                return v / 1000.0 if v >= 0 else None  # TH/s
+            except Exception:
+                pass
+
+    # 3) MH/s fields (rare on SHA256, but handle just in case)
+    for k in ("MHS 5s", "MHS av", "MH/s", "MHS"):
+        if k in item:
+            try:
+                v = float(item[k])  # MH/s
+                return v / 1_000_000.0 if v >= 0 else None  # TH/s
+            except Exception:
+                pass
+
+    # 4) Fallback: sometimes a flat 'Hashrate' exists (assume TH/s)
+    if "Hashrate" in item:
+        try:
+            v = float(item["Hashrate"])
+            return v if v >= 0 else None
+        except Exception:
+            pass
+
+    return None
 
 def poller():
     """Background: poll summary every POLL_SECONDS, keep latest/history fresh."""
     global latest, last_nonzero_limit
     while True:
         try:
-            reply = client.get_summary()
+            reply = asyncio.run(api.summary())
             item = _extract_summary_item(reply)
             if item:
                 pl = _safe_int(item, "Power Limit")
@@ -157,6 +372,26 @@ def poller():
                 row = {"ts": _now_iso()}
                 for k, v in item.items():
                     row[str(k)] = v
+
+                # Compute Hashrate (TH/s) from SUMMARY and add to the row
+                hr_ths = _extract_hashrate_ths_from_summary(item)
+                row["Hashrate"] = round(hr_ths, 1) if hr_ths is not None else None
+
+                # Compute Efficiency (W/TH) if we have both Power and Hashrate
+                try:
+                    pwr = row.get("Power")
+                    if isinstance(pwr, (int, float)) or (isinstance(pwr, str) and pwr.isdigit()):
+                        pwr_val = float(pwr)
+                    else:
+                        pwr_val = None
+                except Exception:
+                    pwr_val = None
+
+                if pwr_val is not None and hr_ths and hr_ths > 0:
+                    row["Efficiency"] = round(pwr_val / hr_ths, 1)
+                else:
+                    row["Efficiency"] = None
+
                 latest = row
                 HISTORY.append(row)
                 now_ts = time.time()
@@ -221,7 +456,7 @@ def battery_poller():
             # swallow hiccups and keep polling
             pass
 
-        time.sleep(BATTERY_POLL_SECONDS)
+        time.sleep(POLL_SECONDS)
 
 def _html_sig():
     """Return (mtime_sec, sha1) for the dashboard file so the browser can auto-reload when it changes."""
@@ -249,6 +484,7 @@ def _flatten_summary(summary_obj):
     for k, v in s.items():
         row[k] = v
     return row
+
 
 def _append_csv(row):
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -278,7 +514,7 @@ def _load_battery_history_from_csv():
         with open(BATT_LOG_FILE, "r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row.get("ts"):
+                if isinstance(row, dict) and row.get("ts"):
                     battery_history.append(row)
                     count += 1
         print(f"[LOAD] battery history loaded: {count} rows from {BATT_LOG_FILE}")
@@ -308,8 +544,9 @@ def _load_miner_history_from_csv():
             return
         count = 0
         with open(LOG_FILE, "r", newline="") as f:
-            reader = csv.DictReader(f)
+            reader: csv.DictReader[str] = csv.DictReader(f)
             for row in reader:
+                row: dict[str, str]  # <-- tell linter explicitly
                 if row.get("ts"):
                     HISTORY.append(row)
                     count += 1
@@ -327,6 +564,8 @@ def auto_controller():
       - Miner setpoint updates are still rate-limited by AUTO_MIN_INTERVAL_SEC.
     """
     global AUTO_LAST_SET_W, AUTO_LAST_SET_TS, LATCHED_FLOOR_W, AUTO_ENABLED
+    global AUTO_LAST_SET_W, AUTO_LAST_SET_TS, LATCHED_FLOOR_W
+    global AUTO_ENABLED, AUTO_TARGET_W, AUTO_TARGET_PCT, AUTO_MINER_OFF_DUE_TO_SOC
     # --- Tunables for loop cadence (no sleeps; these are *max* cadences) ---
     BATT_REFRESH_S = 10.0   # how often to ask EG4 client for a fresh snapshot
     CTRL_EVAL_S    = 20  # how often to re-evaluate target power
@@ -366,27 +605,72 @@ def auto_controller():
 
         print(f"[AUTO] loop sees AUTO_ENABLED={AUTO_ENABLED}")
 
-        # --- 4) Compute target setpoint (instant response to AUTO_ENABLED) ---
+        # --- 4) Compute / enforce on/off + targets (instant response to AUTO_ENABLED) ---
         if not AUTO_ENABLED:
-            # Auto is off: do not change miner, but keep tracking state
-            # (Leave AUTO_LAST_SET_W as-is. No commands issued.)
             print(f"[AUTO] evaluating soc={soc} AUTO_ENABLED={AUTO_ENABLED}")
             continue
 
-        # Hard cutoff below 20% SOC
-        if soc < 20.0:
-            target_w = 0
-        else:
+        target_w: Optional[int] = None  # <-- ensure defined
+
+        # SOC-driven hard cutoff at 30%: force miner OFF and latch this state.
+        if soc <= 30.0:
+            AUTO_TARGET_W = 0
+            AUTO_TARGET_PCT = 0
+            if not AUTO_MINER_OFF_DUE_TO_SOC:
+                try:
+                    print("[AUTO] SOC ≤ 30% → power_off()")
+                    asyncio.run(api.power_off())
+                    AUTO_MINER_OFF_DUE_TO_SOC = True
+                    AUTO_LAST_SET_TS = time.time()  # reset cadence timer
+                except Exception as e:
+                    import traceback
+                    print(f"[AUTO][ERROR] power_off failed: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+            # Stay off; do not try to set % while off
+            continue
+
+        # If we were off due to SOC, only power back on once full charge reached
+        if AUTO_MINER_OFF_DUE_TO_SOC:
+            if soc >= 100.0:
+                try:
+                    print("[AUTO] SOC 100% → power_on()")
+                    asyncio.run(api.power_on())
+                    AUTO_MINER_OFF_DUE_TO_SOC = False
+
+                    # Immediately target full power after turning on
+                    target_w = BASE_WATTS
+                    AUTO_TARGET_W = target_w
+                    AUTO_TARGET_PCT = 100
+
+                    resp = asyncio.run(api.set_power_pct(100))
+                    print(f"[AUTO] set_power_pct(100) -> {resp}")
+
+                    AUTO_LAST_SET_W = BASE_WATTS
+                    AUTO_LAST_SET_TS = time.time()
+                except Exception as e:
+                    import traceback
+                    print(f"[AUTO][ERROR] power_on/set_power_pct failed: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+            # If not yet 100%, remain OFF and wait
+            continue
+
+        # Normal mapped target (SOC > 30% and not latched-off)
+        if soc < 100.0:
             target_w = _watts_for_soc(
                 soc=soc,
                 last_set_w=AUTO_LAST_SET_W,
                 latched_floor_w=LATCHED_FLOOR_W,
             )
-
-        # On full charge, restore full power and clear the floor latch
-        if soc >= 100.0:
-            target_w = MAX_WATT
+            AUTO_TARGET_W = int(target_w)
+            AUTO_TARGET_PCT = 0 if BASE_WATTS <= 0 else max(
+                0, min(100, int(round((target_w / float(BASE_WATTS)) * 100)))
+            )
+        else:
+            # On full charge, restore full power and clear floor
+            target_w = BASE_WATTS
             LATCHED_FLOOR_W = None
+            AUTO_TARGET_W = BASE_WATTS
+            AUTO_TARGET_PCT = 100
 
         # --- DEBUG: show decision inputs and candidate target ---
         print(f"[AUTO] enabled={AUTO_ENABLED} soc={soc:.1f} "
@@ -394,27 +678,32 @@ def auto_controller():
               f"candidate={target_w}")
 
         # --- 5) Rate-limit outbound commands and avoid tiny nudges ---
+        if target_w is None:
+            # Defensive: shouldn't happen due to continues above, but keep guard.
+            continue
+
         wall_now = time.time()
-        if AUTO_LAST_SET_W is None or (
-                abs(target_w - AUTO_LAST_SET_W) >= MIN_DELTA_W
-                and (wall_now - AUTO_LAST_SET_TS) >= AUTO_MIN_INTERVAL_SEC
+        pct = 0 if BASE_WATTS <= 0 else int(round((target_w / float(BASE_WATTS)) * 100))
+        pct = max(0, min(100, pct))
+
+        if (
+                AUTO_LAST_SET_W is None
+                or (abs(target_w - AUTO_LAST_SET_W) >= MIN_DELTA_W
+                    and (wall_now - AUTO_LAST_SET_TS) >= AUTO_MIN_INTERVAL_SEC)
         ):
             try:
-                # Send the command to the miner
-                client.set_power_limit_w(int(target_w))
+                resp = asyncio.run(api.set_power_pct(pct))
+                print(f"[AUTO] set_power_pct({pct}%) -> {resp}")
                 AUTO_LAST_SET_W = int(target_w)
                 AUTO_LAST_SET_TS = wall_now
-                print(f"[AUTO] SENT target_w={target_w}")
-
-                # Update latched floor when we set < 100%
-                if target_w < MAX_WATT:
+                if target_w < BASE_WATTS:
                     if LATCHED_FLOOR_W is None or target_w < LATCHED_FLOOR_W:
                         LATCHED_FLOOR_W = target_w
-            except Exception:
-                # Ignore transient miner errors; loop continues immediately
-                pass
+            except Exception as e:
+                import traceback
+                print(f"[AUTO][ERROR] set_power_pct({pct}%) failed: {type(e).__name__}: {e}")
+                traceback.print_exc()
         else:
-            # Explain why we didn't send a command this cycle
             print(
                 f"[AUTO] SKIP send: "
                 f"delta={None if AUTO_LAST_SET_W is None else abs(target_w - AUTO_LAST_SET_W)} "
@@ -451,40 +740,102 @@ def set_limit():
     else:
         standby_flag = True
 
-    reply = client.set_power_limit_w(watts)
-    return jsonify({"ok": True, "reply": reply})
+    asyncio.run(api.send_privileged_command("set_power_limit", power_limit=str(watts)))
+    return jsonify({"ok": True, "watts": watts})
 
 @app.post("/standby")
 def to_standby():
-    global standby_flag
-    standby_flag = True
-    reply = client.set_power_limit_w(0)
-    return jsonify({"ok": True, "reply": reply})
+    """Stop hashing via ciphertext (hashboards off)."""
+    miner_ctrl.enqueue_stop()
+    return jsonify({"ok": True, "queued": True, "op": "stop"})
 
 @app.post("/resume")
 def resume():
-    global standby_flag
-    target = last_nonzero_limit or DEFAULT_LIMIT
-    standby_flag = False
-    reply = client.set_power_limit_w(target)
-    return jsonify({"ok": True, "target": target, "reply": reply})
+    """Resume hashing via ciphertext (hashboards on)."""
+    miner_ctrl.enqueue_resume()
+    return jsonify({"ok": True, "queued": True, "op": "resume"})
+
 
 @app.get("/status")
 def status():
-    recent = list(HISTORY)[-50:]  # or _history if that's your var
+    # Make a shallow copy of latest and force string keys (defensive for jsonify)
+    base_latest = latest if isinstance(latest, dict) else {}
+    safe_latest = {str(k): v for k, v in base_latest.items()}
+
+    # Ensure timestamp
+    safe_latest.setdefault("ts", datetime.now(timezone.utc).isoformat())
+
+    # --- Hashrate/Efficiency (no change to your logic) ---
+    hr_ths = None
+    h = safe_latest.get("hashrate")
+    if isinstance(h, dict) and h.get("rate") is not None:
+        try:
+            hr_ths = float(h["rate"])
+        except Exception:
+            hr_ths = None
+    if hr_ths is None and safe_latest.get("Hashrate") is not None:
+        try:
+            hr_ths = float(safe_latest["Hashrate"])
+        except Exception:
+            hr_ths = None
+    safe_latest["Hashrate"] = round(hr_ths, 1) if hr_ths is not None else None
+
+    p = safe_latest.get("Power")
+    if p is not None and hr_ths and hr_ths > 0:
+        try:
+            safe_latest["Efficiency"] = round(float(p) / float(hr_ths), 1)
+        except Exception:
+            safe_latest["Efficiency"] = None
+    else:
+        safe_latest["Efficiency"] = None
+
+    # --- Power Percent: actual Power / Power Limit * 100 ---
+    pct = None
+    try:
+        pwr = safe_latest.get("Power")
+        pl = safe_latest.get("Power Limit")
+        if pwr is not None and pl not in (None, 0):
+            pct = max(0, min(100, int(round(float(pwr) / float(pl) * 100))))
+    except Exception:
+        pct = None
+    safe_latest["Power Percent"] = pct
+
+    # recent: also coerce keys to strings to avoid any None/Non-str keys from older rows
+    recent = [{str(k): v for k, v in row.items()} for row in list(HISTORY)[-50:]]
+
+    # Current % of BASE_WATTS (for display like “now 79%”)
+    curr_pct_base = None
+    try:
+        pwr = safe_latest.get("Power")
+        if pwr is not None and BASE_WATTS > 0:
+            curr_pct_base = max(0, min(100, int(round(float(pwr) / float(BASE_WATTS) * 100))))
+    except Exception:
+        curr_pct_base = None
+
     return jsonify({
-        "latest": latest,
+        "latest": safe_latest,
         "recent": recent,
         "auto": {
             "enabled": AUTO_ENABLED,
             "last_set_w": AUTO_LAST_SET_W,
-            "min_interval_s": AUTO_MIN_INTERVAL_SEC
+            "min_interval_s": AUTO_MIN_INTERVAL_SEC,
+            "target_w": AUTO_TARGET_W,
+            "target_pct": AUTO_TARGET_PCT,
+            "current_pct_base": curr_pct_base
         }
     })
 
 @app.get("/history")
 def api_history():
-    return jsonify(list(HISTORY))
+    rows = list(HISTORY)
+    # Coerce all dict keys to strings so jsonify never compares None vs str
+    safe_rows = []
+    for r in rows:
+        if isinstance(r, dict):
+            safe_rows.append({str(k): v for k, v in r.items()})
+        else:
+            safe_rows.append(r)
+    return jsonify(safe_rows)
 
 @app.get("/battery_page")
 def battery_page():
@@ -579,7 +930,7 @@ def auto_state():
         "last_set_w": AUTO_LAST_SET_W,
         "latched_floor_w": LATCHED_FLOOR_W,
         "soc_percent": soc,
-        "max_watt": MAX_WATT,
+        "max_watt": BASE_WATTS,
         "min_interval_s": AUTO_MIN_INTERVAL_SEC,
     })
 
@@ -654,7 +1005,7 @@ def debug_history_counts():
 
 @app.get("/debug/miner_sample")
 def debug_miner_sample():
-    import itertools, json, datetime as _dt
+    import itertools, datetime as _dt
 
     rows = list(HISTORY)
     n = len(rows)
@@ -712,7 +1063,7 @@ if __name__ == "__main__":
     tb = threading.Thread(target=battery_poller, daemon=True)
     tb.start()
 
-    ta = threading.Thread(target=auto_controller, daemon=True);
+    ta = threading.Thread(target=auto_controller, daemon=True)
     ta.start()
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
