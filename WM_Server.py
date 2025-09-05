@@ -19,6 +19,10 @@ from eg4_client import EG4Client
 # ---- BTMiner routines
 from pyasic.rpc.btminer import BTMinerRPCAPI
 
+# ----- routines to maintain state of server through apower cycle
+from WM_State import StateManager
+state_mgr = StateManager(path="./wm_state.json")  # choose a durable path
+
 # Config from env
 EG4_USER = os.environ.get("EG4_USER") or os.environ.get("USERNAME")
 EG4_PASS = os.environ.get("EG4_PASS") or os.environ.get("PASSWORD")
@@ -26,9 +30,6 @@ EG4_BASE = os.environ.get("EG4_BASE_URL", "https://monitor.eg4electronics.com")
 
 # Poll cadence
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
-
-# --- Auto Control state ---
-AUTO_ENABLED = False
 
 # --- Auto control config (place near other constants/env reads) ---
 AUTO_MIN_INTERVAL_SEC = int(os.environ.get("AUTO_MIN_INTERVAL_SEC", "120"))
@@ -85,6 +86,40 @@ if not WM_HOST:
 # SINGLE shared client
 api = BTMinerRPCAPI(WM_HOST)
 api.pwd = WM_PASS
+
+# Restore saved values on startup
+state = state_mgr.load()
+AUTOCONTROL = state.get("autocontrol", False)
+TARGET_POWER_PCT = state.get("target_power_pct", 0)
+MINER_POWER_STATE = state.get("miner_power_state", "stopped")
+
+# Make the runtime switch match persisted state
+AUTO_ENABLED = bool(AUTOCONTROL)
+
+def restore_runtime():
+    if AUTOCONTROL:
+        if MINER_POWER_STATE == "stopped":
+            # stay stopped
+            pass
+        else:
+            set_autocontrol_target(TARGET_POWER_PCT)
+    else:
+        pass
+
+def set_autocontrol_enabled(enabled: bool):
+    global AUTOCONTROL
+    AUTOCONTROL = enabled
+    state_mgr.save(autocontrol=AUTOCONTROL)
+
+def set_autocontrol_target(pct: int):
+    global TARGET_POWER_PCT
+    TARGET_POWER_PCT = max(0, min(100, int(pct)))
+    state_mgr.save(target_power_pct=TARGET_POWER_PCT)
+
+def set_miner_power_state(state_str: str):
+    global MINER_POWER_STATE
+    MINER_POWER_STATE = state_str
+    state_mgr.save(miner_power_state=MINER_POWER_STATE)
 
 
 # --- BEGIN Miner control queue integration ---
@@ -156,8 +191,10 @@ class MinerController:
         try:
             if kind == "stop":
                 asyncio.run(self.api.power_off())
+                set_miner_power_state("stopped")
             elif kind == "resume":
                 asyncio.run(self.api.power_on())
+                set_miner_power_state("running")
             elif kind == "power_limit":
                 asyncio.run(
                     self.api.send_privileged_command(
@@ -166,6 +203,7 @@ class MinerController:
                 )
             elif kind == "power_pct":
                 asyncio.run(self.api.set_power_pct(req["percent"]))
+                set_autocontrol_target(req["percent"])  # persist target percent
             else:
                 raise ValueError(f"Unknown op {kind}")
 
@@ -228,14 +266,14 @@ def set_power_pct():
 
 @app.post("/stop")
 def stop_mining():
-    """Soft stop (hashboards stop)."""
     miner_ctrl.enqueue_stop()
+    set_miner_power_state("stopped")  # persist
     return _json_ok(queued=True, op="stop")
 
 @app.post("/resume")
 def resume_mining():
-    """Soft resume (hashboards start)."""
     miner_ctrl.enqueue_resume()
+    set_miner_power_state("running")  # persist
     return _json_ok(queued=True, op="resume")
 
 @app.get("/op_status")
@@ -620,6 +658,7 @@ def auto_controller():
                 try:
                     print("[AUTO] SOC ≤ 30% → power_off()")
                     asyncio.run(api.power_off())
+                    set_miner_power_state("stopped")
                     AUTO_MINER_OFF_DUE_TO_SOC = True
                     AUTO_LAST_SET_TS = time.time()  # reset cadence timer
                 except Exception as e:
@@ -635,6 +674,7 @@ def auto_controller():
                 try:
                     print("[AUTO] SOC 100% → power_on()")
                     asyncio.run(api.power_on())
+                    set_miner_power_state("running")
                     AUTO_MINER_OFF_DUE_TO_SOC = False
 
                     # Immediately target full power after turning on
@@ -643,6 +683,7 @@ def auto_controller():
                     AUTO_TARGET_PCT = 100
 
                     resp = asyncio.run(api.set_power_pct(100))
+                    set_autocontrol_target(100)  # persist target percent
                     print(f"[AUTO] set_power_pct(100) -> {resp}")
 
                     AUTO_LAST_SET_W = BASE_WATTS
@@ -693,6 +734,7 @@ def auto_controller():
         ):
             try:
                 resp = asyncio.run(api.set_power_pct(pct))
+                set_autocontrol_target(pct)  # persist target percent
                 print(f"[AUTO] set_power_pct({pct}%) -> {resp}")
                 AUTO_LAST_SET_W = int(target_w)
                 AUTO_LAST_SET_TS = wall_now
@@ -907,15 +949,19 @@ def get_autocontrol():
 
 @app.post("/autocontrol")
 def set_autocontrol():
-    global AUTO_ENABLED, AUTO_LAST_SET_TS  # reset timer so we can act quickly on enable
+    global AUTO_ENABLED, AUTO_LAST_SET_TS
     data = request.get_json(silent=True) or {}
-    enabled = bool(data.get("enabled"))
+    enabled = bool(data.get("enabled", False))
+
+    # persist to wm_state.json
+    set_autocontrol_enabled(enabled)
+
+    # keep the control loop’s live flag in sync
     AUTO_ENABLED = enabled
     if enabled:
-        AUTO_LAST_SET_TS = 0.0  # allow immediate first set
-    print(f"[AUTOCONTROL][POST] requested_body={request.get_json(silent=True)}")
-    print(f"[AUTOCONTROL][POST] new enabled={AUTO_ENABLED}")
-    print(f"[AUTOCONTROL][POST] responding enabled={AUTO_ENABLED}")
+        AUTO_LAST_SET_TS = 0.0  # allow immediate first action
+
+    print(f"[AUTOCONTROL][POST] enabled={AUTO_ENABLED}")
     return jsonify({"ok": True, "enabled": AUTO_ENABLED})
 
 @app.get("/auto_state")
@@ -1048,15 +1094,18 @@ if __name__ == "__main__":
 
     # If you have _load_existing_csv, use it; otherwise use your per-file loaders
     try:
-        _load_existing_csv(LOG_FILE, HISTORY)  # <-- use this if present
+        _load_existing_csv(LOG_FILE, HISTORY)
         _load_existing_csv(BATT_LOG_FILE, battery_history)
     except NameError:
-        # fallback to the two loaders you added earlier
         _load_miner_history_from_csv()
         _load_battery_history_from_csv()
 
     print(f"[LOAD] after:  HISTORY={len(HISTORY)} battery_history={len(battery_history)}")
 
+    # >>> Restore desired runtime BEFORE background threads start <<<
+    restore_runtime()
+
+    # Start background workers
     t = threading.Thread(target=poller, daemon=True)
     t.start()
 
