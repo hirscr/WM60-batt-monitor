@@ -650,6 +650,58 @@ def auto_controller():
 
         target_w: Optional[int] = None  # <-- ensure defined
 
+        # >>> FULL-CHARGE ENSURE-ON <<<
+        # Always ensure the miner is ON at full charge when Auto is enabled.
+        if soc >= 100.0:
+            # Clear any floor and make full power the target
+            LATCHED_FLOOR_W = None
+            target_w = BASE_WATTS
+            AUTO_TARGET_W = BASE_WATTS
+            AUTO_TARGET_PCT = 100
+
+            # If miner is not hashing, explicitly power it on
+            should_power_on = False
+            try:
+                _sum = asyncio.run(api.summary())
+                _s = (_sum.get("SUMMARY") or [{}])[0] if isinstance(_sum, dict) else {}
+                is_mining = bool(_s.get("is_mining"))
+                should_power_on = not is_mining
+            except Exception:
+                # If we can't tell, be conservative and try to power on
+                should_power_on = True
+
+            if should_power_on:
+                try:
+                    print("[AUTO] SOC 100% → ensuring miner power_on()")
+                    asyncio.run(api.power_on())
+                    set_miner_power_state("running")
+                    AUTO_MINER_OFF_DUE_TO_SOC = False
+                except Exception as e:
+                    import traceback
+                    print(f"[AUTO][ERROR] power_on at 100% failed: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+
+            # Push 100% power percent (respecting your rate limiter)
+            wall_now = time.time()
+            if (
+                AUTO_LAST_SET_W is None
+                or (abs(BASE_WATTS - (AUTO_LAST_SET_W or 0)) >= 100
+                    and (wall_now - AUTO_LAST_SET_TS) >= AUTO_MIN_INTERVAL_SEC)
+            ):
+                try:
+                    resp = asyncio.run(api.set_power_pct(100))
+                    set_autocontrol_target(100)  # persist target percent
+                    AUTO_LAST_SET_W = BASE_WATTS
+                    AUTO_LAST_SET_TS = wall_now
+                    print(f"[AUTO] set_power_pct(100) -> {resp}")
+                except Exception as e:
+                    import traceback
+                    print(f"[AUTO][ERROR] set_power_pct(100) failed: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+
+            # Full-charge branch is complete; skip the rest of this loop iteration
+            continue
+
         # SOC-driven hard cutoff at 30%: force miner OFF and latch this state.
         if soc <= 30.0:
             AUTO_TARGET_W = 0
