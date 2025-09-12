@@ -5,9 +5,10 @@
 import hashlib
 import os, csv
 from collections import deque
-from datetime import datetime, timezone
 import math
 import logging
+from datetime import datetime, timezone
+import tzlocal
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -592,6 +593,16 @@ def _load_miner_history_from_csv():
     except Exception as e:
         print(f"[LOAD] miner history error: {e}")
 
+def is_past_sunset():
+    # Example: hardcoded sunset at 19:00 local time, adjust as needed
+
+    local_tz = tzlocal.get_localzone()
+    now = datetime.now(local_tz)
+    sunset_hour = int(os.environ.get("SUNSET_HOUR", "19"))
+    sunset_minute = int(os.environ.get("SUNSET_MINUTE", "0"))
+    sunset = now.replace(hour=sunset_hour, minute=sunset_minute, second=0, microsecond=0)
+    return now > sunset
+
 def auto_controller():
     """
     Non-blocking, time-gated control loop:
@@ -602,11 +613,10 @@ def auto_controller():
       - Miner setpoint updates are still rate-limited by AUTO_MIN_INTERVAL_SEC.
     """
     global AUTO_LAST_SET_W, AUTO_LAST_SET_TS, LATCHED_FLOOR_W, AUTO_ENABLED
-    global AUTO_LAST_SET_W, AUTO_LAST_SET_TS, LATCHED_FLOOR_W
     global AUTO_ENABLED, AUTO_TARGET_W, AUTO_TARGET_PCT, AUTO_MINER_OFF_DUE_TO_SOC
     # --- Tunables for loop cadence (no sleeps; these are *max* cadences) ---
     BATT_REFRESH_S = 10.0   # how often to ask EG4 client for a fresh snapshot
-    CTRL_EVAL_S    = 20  # how often to re-evaluate target power
+    CTRL_EVAL_S    = 10  # how often to re-evaluate target power
 
     MIN_DELTA_W = 100      # ignore tiny changes to prevent churn
 
@@ -621,22 +631,21 @@ def auto_controller():
         now = time.monotonic()
 
         # --- 1) Refresh battery snapshot on schedule (non-blocking) ---
-        if (now - last_batt_poll) >= BATT_REFRESH_S:
-            last_batt_poll = now
-            snap = _fresh_batt(max_age_s=90)
-            if isinstance(snap, dict) and snap:
-                cached_snap = snap  # only replace cache on good data
-
-        # --- 2) If it is not time to re-evaluate control, loop immediately ---
+        # --- 1) If it is not time to re-evaluate control, loop immediately ---
         if (now - last_ctrl_eval) < CTRL_EVAL_S:
             continue
         last_ctrl_eval = now
 
-        # --- 3) If we have no cached battery data, we cannot decide; loop ---
-        if not cached_snap:
-            continue
+        snap = None
 
-        soc = cached_snap.get("soc_percent")
+        if (now - last_batt_poll) >= BATT_REFRESH_S:
+            last_batt_poll = now
+            snap = _fresh_batt(max_age_s=90)
+            if not(isinstance(snap, dict) and snap):
+                continue  # only replace cache on good data
+
+        soc = snap.get("soc_percent")
+
         if not isinstance(soc, (int, float)):
             # malformed data; keep looping, wait for next good cache
             continue
@@ -668,7 +677,8 @@ def auto_controller():
                 should_power_on = not is_mining
             except Exception:
                 # If we can't tell, be conservative and try to power on
-                should_power_on = True
+                should_power_on = False
+                print("[AUTO] Miner not on, Power Full, Charge: unable to verify mining state")
 
             if should_power_on:
                 try:
@@ -683,21 +693,19 @@ def auto_controller():
 
             # Push 100% power percent (respecting your rate limiter)
             wall_now = time.time()
-            if (
-                AUTO_LAST_SET_W is None
-                or (abs(BASE_WATTS - (AUTO_LAST_SET_W or 0)) >= 100
-                    and (wall_now - AUTO_LAST_SET_TS) >= AUTO_MIN_INTERVAL_SEC)
-            ):
-                try:
-                    resp = asyncio.run(api.set_power_pct(100))
-                    set_autocontrol_target(100)  # persist target percent
-                    AUTO_LAST_SET_W = BASE_WATTS
-                    AUTO_LAST_SET_TS = wall_now
-                    print(f"[AUTO] set_power_pct(100) -> {resp}")
-                except Exception as e:
-                    import traceback
-                    print(f"[AUTO][ERROR] set_power_pct(100) failed: {type(e).__name__}: {e}")
-                    traceback.print_exc()
+            # Directly set miner to 100% power and update globals, skipping rate limiting
+            try:
+                asyncio.run(api.power_on())
+                asyncio.run(api.set_power_pct(100))
+                set_miner_power_state("running")
+                set_autocontrol_target(100)
+                AUTO_LAST_SET_W = BASE_WATTS
+                AUTO_LAST_SET_TS = wall_now
+                print("[AUTO] Miner power_on() and set_power_pct(100) applied")
+            except Exception as e:
+                import traceback
+                print(f"[AUTO][ERROR] power_on/set_power_pct(100) failed: {type(e).__name__}: {e}")
+                traceback.print_exc()
 
             # Full-charge branch is complete; skip the rest of this loop iteration
             continue
@@ -706,64 +714,34 @@ def auto_controller():
         if soc <= 30.0:
             AUTO_TARGET_W = 0
             AUTO_TARGET_PCT = 0
-            if not AUTO_MINER_OFF_DUE_TO_SOC:
-                try:
-                    print("[AUTO] SOC ≤ 30% → power_off()")
-                    asyncio.run(api.power_off())
-                    set_miner_power_state("stopped")
-                    AUTO_MINER_OFF_DUE_TO_SOC = True
-                    AUTO_LAST_SET_TS = time.time()  # reset cadence timer
-                except Exception as e:
-                    import traceback
-                    print(f"[AUTO][ERROR] power_off failed: {type(e).__name__}: {e}")
-                    traceback.print_exc()
-            # Stay off; do not try to set % while off
+            print("[AUTO] SOC ≤ 30% → power_off()")
+            asyncio.run(api.power_off())
+            set_miner_power_state("stopped")
+            AUTO_MINER_OFF_DUE_TO_SOC = True
+            AUTO_LAST_SET_TS = time.time()  # reset cadence timer
             continue
 
-        # If we were off due to SOC, only power back on once full charge reached
-        if AUTO_MINER_OFF_DUE_TO_SOC:
-            if soc >= 100.0:
-                try:
-                    print("[AUTO] SOC 100% → power_on()")
-                    asyncio.run(api.power_on())
-                    set_miner_power_state("running")
-                    AUTO_MINER_OFF_DUE_TO_SOC = False
-
-                    # Immediately target full power after turning on
-                    target_w = BASE_WATTS
-                    AUTO_TARGET_W = target_w
-                    AUTO_TARGET_PCT = 100
-
-                    resp = asyncio.run(api.set_power_pct(100))
-                    set_autocontrol_target(100)  # persist target percent
-                    print(f"[AUTO] set_power_pct(100) -> {resp}")
-
-                    AUTO_LAST_SET_W = BASE_WATTS
-                    AUTO_LAST_SET_TS = time.time()
-                except Exception as e:
-                    import traceback
-                    print(f"[AUTO][ERROR] power_on/set_power_pct failed: {type(e).__name__}: {e}")
-                    traceback.print_exc()
-            # If not yet 100%, remain OFF and wait
+# --- New condition: enable autocontrol after sunset if battery > 60% and autocontrol is off --
+        if is_past_sunset() and soc > 60.0 and MINER_POWER_STATE == "stopped":
+            print("[AUTO] Past sunset, battery > 60%, turning miner power ON")
+            asyncio.run(api.power_on())
+            set_miner_power_state("running")
             continue
 
-        # Normal mapped target (SOC > 30% and not latched-off)
-        if soc < 100.0:
-            target_w = _watts_for_soc(
-                soc=soc,
-                last_set_w=AUTO_LAST_SET_W,
-                latched_floor_w=LATCHED_FLOOR_W,
-            )
-            AUTO_TARGET_W = int(target_w)
-            AUTO_TARGET_PCT = 0 if BASE_WATTS <= 0 else max(
-                0, min(100, int(round((target_w / float(BASE_WATTS)) * 100)))
-            )
+        # Only reduce or maintain miner power percent based on SOC decile
+        current_pct = AUTO_TARGET_PCT if AUTO_TARGET_PCT is not None else 100
+        decile_pct = min(100, int(math.ceil(soc / 10.0) * 10))
+
+        if decile_pct < current_pct:
+            # Only reduce power percent if decile is lower than current
+            target_w = int(round(BASE_WATTS * (decile_pct / 100.0)))
+            AUTO_TARGET_W = target_w
+            AUTO_TARGET_PCT = decile_pct
         else:
-            # On full charge, restore full power and clear floor
-            target_w = BASE_WATTS
-            LATCHED_FLOOR_W = None
-            AUTO_TARGET_W = BASE_WATTS
-            AUTO_TARGET_PCT = 100
+            # Keep current target, do not increase
+            target_w = int(round(BASE_WATTS * (current_pct / 100.0)))
+            AUTO_TARGET_W = target_w
+            AUTO_TARGET_PCT = current_pct
 
         # --- DEBUG: show decision inputs and candidate target ---
         print(f"[AUTO] enabled={AUTO_ENABLED} soc={soc:.1f} "
@@ -774,29 +752,23 @@ def auto_controller():
         if target_w is None:
             # Defensive: shouldn't happen due to continues above, but keep guard.
             continue
-
         wall_now = time.time()
         pct = 0 if BASE_WATTS <= 0 else int(round((target_w / float(BASE_WATTS)) * 100))
         pct = max(0, min(100, pct))
 
-        if (
-                AUTO_LAST_SET_W is None
-                or (abs(target_w - AUTO_LAST_SET_W) >= MIN_DELTA_W
-                    and (wall_now - AUTO_LAST_SET_TS) >= AUTO_MIN_INTERVAL_SEC)
-        ):
-            try:
-                resp = asyncio.run(api.set_power_pct(pct))
-                set_autocontrol_target(pct)  # persist target percent
-                print(f"[AUTO] set_power_pct({pct}%) -> {resp}")
-                AUTO_LAST_SET_W = int(target_w)
-                AUTO_LAST_SET_TS = wall_now
-                if target_w < BASE_WATTS:
-                    if LATCHED_FLOOR_W is None or target_w < LATCHED_FLOOR_W:
-                        LATCHED_FLOOR_W = target_w
-            except Exception as e:
-                import traceback
-                print(f"[AUTO][ERROR] set_power_pct({pct}%) failed: {type(e).__name__}: {e}")
-                traceback.print_exc()
+        try:
+            resp = asyncio.run(api.set_power_pct(pct))
+            set_autocontrol_target(pct)  # persist target percent
+            print(f"[AUTO] set_power_pct({pct}%) -> {resp}")
+            AUTO_LAST_SET_W = int(target_w)
+            AUTO_LAST_SET_TS = wall_now
+            if target_w < BASE_WATTS:
+                if LATCHED_FLOOR_W is None or target_w < LATCHED_FLOOR_W:
+                    LATCHED_FLOOR_W = target_w
+        except Exception as e:
+            import traceback
+            print(f"[AUTO][ERROR] set_power_pct({pct}%) failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
         else:
             print(
                 f"[AUTO] SKIP send: "
