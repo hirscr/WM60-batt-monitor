@@ -143,11 +143,27 @@ class EG4Client:
 
     async def _poll_once(self):
         assert self._api is not None
-        # Fetch battery & runtime via async endpoints to avoid nested asyncio.run
+        # Fetch battery & runtime via async endpoints
         batt = await self._api.get_inverter_battery_async()
         runtime = await self._api.get_inverter_runtime_async()
+
+        # If no data, try re-login
+        if not batt or not runtime:
+            try:
+                await self._api.login(ignore_ssl=True)
+                # Retry fetch after re-login
+                batt = await self._api.get_inverter_battery_async()
+                runtime = await self._api.get_inverter_runtime_async()
+                if not batt or not runtime:
+                    self._last_error = "Still no data after re-login"
+                    return
+            except Exception as e:
+                self._last_error = f"Re-login failed: {e}"
+                return
+
         b = _to_plain(batt)
         r = _to_plain(runtime)
+        # Rest of function remains the same...
 
         # Derive PV/Load/Grid/Battery powers from runtime
         pv_candidates = [_num(r.get(k)) for k in ("ppv1","ppv2","ppv3")]
