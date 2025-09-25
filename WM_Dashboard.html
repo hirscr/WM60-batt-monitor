@@ -42,6 +42,21 @@
     #debug { display:none; white-space:pre-wrap; background:#fff4f4; border:1px solid #f0bcbc; color:#8a0000; padding:8px; border-radius:8px; margin:10px 0; }
     .ok { background:#19c37d !important; }
     .bad { background:#ff4d4f !important; }
+
+    /* New: Data loading indicator and controls */
+    .data-info {
+      background: #f0f8ff;
+      border: 1px solid #1772FF;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 11px;
+      margin-bottom: 8px;
+    }
+    .loading-indicator {
+      color: #1772FF;
+      font-weight: 600;
+    }
+    .zoom-bar .active { background: #1772FF; color: white; }
   </style>
 </head>
 <body>
@@ -74,10 +89,6 @@
     <div style="margin-top: 10px;">
   <button onclick="window.open('/logs/miner.csv', '_blank')">Download Miner Log</button>
 </div>
-      <!-- ========================== -->
-  <!-- TOP PANEL — Max Power (W)  -->
-  <!-- IDs MUST MATCH the JS: limitLabel, limitInput, applyBtn -->
-  <!-- ========================== -->
   <!-- TOP PANEL — Max Power inline -->
 <div style="margin-top:18px; display:flex; align-items:center; gap:10px;">
   <label id="limitLabel" class="mono" style="font-weight:700;">Max Power (W)</label>
@@ -129,6 +140,12 @@
   </div>
 
   <div class="card" style="margin-top:12px;">
+    <!-- NEW: Data loading info -->
+    <div id="dataInfo" class="data-info" style="display:none;">
+      <span id="loadingText" class="loading-indicator"></span>
+      <span id="dataStats" style="margin-left: 10px;"></span>
+    </div>
+
     <div id="chart"></div>
 
     <!-- Axis controls laid out like your mockup -->
@@ -152,14 +169,16 @@
       <button id="y2default">Default</button>
     </div>
 
-    <!-- Zoom buttons row -->
+    <!-- Enhanced Zoom buttons row -->
     <div class="zoom-bar">
       <button onclick="zoomRecent(1/60)">1m</button>
-      <button onclick="zoomRecent(1)">1h</button>
-      <button onclick="zoomRecent(6)">6h</button>
-      <button onclick="zoomRecent(24)">24h</button>
-      <button onclick="zoomRecent(24*7)">1w</button>
-      <button onclick="zoomRecent(24*30)">1Mo</button>
+      <button onclick="zoomRecent(1)" data-hours="1">1h</button>
+      <button onclick="zoomRecent(6)" data-hours="6">6h</button>
+      <button onclick="zoomRecent(24)" data-hours="24" class="active">24h</button>
+      <button onclick="zoomRecent(24*3)" data-days="3">3d</button>
+      <button onclick="zoomRecent(24*7)" data-days="7">1w</button>
+      <button onclick="zoomRecent(24*14)" data-days="14">2w</button>
+      <button onclick="zoomRecent(24*30)" data-days="30">1Mo</button>
       <button onclick="zoomAll()">All</button>
     </div>
   </div>
@@ -187,6 +206,14 @@ const effEl = document.getElementById('eff');
 
 const powerPercentHeadline = document.getElementById('powerPercentHeadline');
 
+// NEW: Data loading state management
+let currentLoadedDays = 3;  // Track what we have loaded
+let isLoading = false;      // Prevent concurrent loads
+
+// NEW: UI elements for loading feedback
+const dataInfo = document.getElementById('dataInfo');
+const loadingText = document.getElementById('loadingText');
+const dataStats = document.getElementById('dataStats');
 
 // --- Power % controls (no hint element) ---
 (() => {
@@ -233,6 +260,23 @@ function setHealth(ok){
   healthDot.classList.toggle('bad', !ok);
   healthText.textContent = ok ? 'Connected' : 'No data';
   lastFetch.textContent = ' @ ' + new Date().toLocaleTimeString();
+}
+
+function updateDataInfo(meta) {
+  if (!meta) {
+    dataInfo.style.display = 'none';
+    return;
+  }
+
+  dataInfo.style.display = 'block';
+
+  if (isLoading) {
+    loadingText.textContent = `Loading ${meta.requested_days || 'more'} days...`;
+    dataStats.textContent = '';
+  } else {
+    loadingText.textContent = meta.extended_loading ? '✓ Extended data loaded' : '✓ Data ready';
+    dataStats.textContent = `${meta.returned_rows || 0} rows • ${meta.loaded_days || 0} days loaded`;
+  }
 }
 
 function pickHashrate(row){
@@ -332,12 +376,12 @@ function updateLeft(row){
   if (pl!=null && !limitInput.disabled) limitInput.value = pl;
 
   // NEW: render hashrate and efficiency
- hashrateEl.textContent = (hr!=null && isFinite(hr)) ? hr.toFixed(1) : "—";
-if (p!=null && hr!=null && isFinite(p) && isFinite(hr) && hr > 0) {
-  effEl.textContent = (p / hr).toFixed(1);
-} else {
-  effEl.textContent = "—";
-}
+  hashrateEl.textContent = (hr!=null && isFinite(hr)) ? hr.toFixed(1) : "—";
+  if (p!=null && hr!=null && isFinite(p) && isFinite(hr) && hr > 0) {
+    effEl.textContent = (p / hr).toFixed(1);
+  } else {
+    effEl.textContent = "—";
+  }
 
   fanEl.textContent = (fan!=null) ? fan : "—";
   wmtempEl.textContent = (wm!=null) ? wm.toFixed(1) : "—";
@@ -409,12 +453,27 @@ function plotUpdate(){
   }
 }
 
-function zoomRecent(hours){
+// NEW: Enhanced zoom functions with data loading
+async function zoomRecent(hours) {
+  const days = Math.ceil(hours / 24);
+
+  // Update active button state
+  document.querySelectorAll('.zoom-bar button').forEach(btn => btn.classList.remove('active'));
+  document.querySelector(`[data-hours="${hours}"], [data-days="${days}"]`)?.classList.add('active');
+
+  // Load data if needed
+  if (days > currentLoadedDays) {
+    await loadMinerHistory(days);
+  }
+
   const end = new Date();
   const start = new Date(end.getTime() - hours*3600*1000);
   Plotly.relayout('chart', {'xaxis.range':[start, end]});
 }
+
 function zoomAll(){
+  document.querySelectorAll('.zoom-bar button').forEach(btn => btn.classList.remove('active'));
+  document.querySelector('.zoom-bar button:last-child').classList.add('active');
   Plotly.relayout('chart', {'xaxis.autorange':true});
 }
 
@@ -448,65 +507,58 @@ document.getElementById('y2default').onclick = ()=>{
   document.getElementById('y2min').value = '0'; document.getElementById('y2max').value = '100';
 };
 
-// Data fetchers
-async function preloadMinerHistory(){
-  try {
-    const r = await fetch('/history', { cache: 'no-store' });
-    const rows = await r.json();
+// NEW: Enhanced data loading functions
+async function loadMinerHistory(days = 3) {
+  if (isLoading) return; // Prevent concurrent loads
 
-    // reset buffers
+  try {
+    isLoading = true;
+    updateDataInfo({ requested_days: days });
+
+    console.log(`[LOAD] Requesting ${days} days of miner data`);
+    const r = await fetch(`/history?days=${days}`, { cache: 'no-store' });
+    const response = await r.json();
+
+    // Handle both old format (array) and new format (object with data/meta)
+    const rows = Array.isArray(response) ? response : (response.data || []);
+    const meta = response.meta || {};
+
+    // Reset and populate history
     hist = { t:[], power:[], limit:[], fan:[], wmtemp:[], envtemp:[] };
 
-    for (const row of rows){
-      pushHistory(row);
-    }
-
-    // draw once with full history
-    plotUpdate();
-    console.log('[MINER preload] loaded rows:', rows.length);
-  } catch(e) {
-    showDebug('preloadMinerHistory error: ' + e);
-  }
-}
-async function loadHistory(){
-  try {
-    const r = await fetch('/history', {cache:'no-store'});
-    const arr = await r.json();
-
-    // reset buffers
-    hist = { t:[], power:[], limit:[], fan:[], wmtemp:[], envtemp:[] };
-
-    // fill from server
-    for (const row of arr){
+    for (const row of rows) {
       pushHistory(row); // skips rows with bad/missing ts
     }
 
-    // draw once with full history
+    // Update tracking
+    currentLoadedDays = meta.loaded_days || days;
+
+    // Update chart
     plotUpdate();
 
-    // FORCE the x-axis to the full preloaded range (not just recent)
+    // Update data info
+    updateDataInfo(meta);
+
+    // Set appropriate zoom range
     const n = hist.t.length;
     if (n > 0) {
       const start = hist.t[0];
       const end   = hist.t[n - 1];
       Plotly.relayout('chart', {'xaxis.range': [start, end]});
-    } else {
-      // fall back to autorange if nothing plotted
-      Plotly.relayout('chart', {'xaxis.autorange': true});
     }
 
-    // debug: prove what we plotted
-    console.log('[MINER preload] loaded rows:', Array.isArray(arr) ? arr.length : 'not array',
-                'plotted:', n,
-                'first:', n ? hist.t[0] : null,
-                'last:', n ? hist.t[n-1] : null);
+    console.log(`[LOAD] Loaded ${rows.length} rows, ${n} plotted, ${currentLoadedDays} days in memory`);
+    setHealth(rows.length > 0);
 
-    setHealth(arr.length > 0);
   } catch(e) {
-    showDebug('loadHistory fetch error: ' + e);
+    showDebug('loadMinerHistory error: ' + e);
+    updateDataInfo(null);
     setHealth(false);
+  } finally {
+    isLoading = false;
   }
 }
+
 async function refreshStatus() {
   try {
     const r = await fetch('/status', { cache: 'no-store' });
@@ -562,6 +614,7 @@ async function refreshStatus() {
     setHealth(false);
   }
 }
+
 function formatTimestamp(input){
   const d = input ? new Date(input) : new Date();
   const pad = n => n.toString().padStart(2,'0');
@@ -665,7 +718,7 @@ async function checkVersion(){
 // Init
 (async function init(){
   plotInit();
-  await preloadMinerHistory();
+  await loadMinerHistory(3);  // Load initial 3 days
   await refreshStatus();
   setInterval(refreshStatus, 10000); // 10s
   setInterval(checkVersion, 2000);
