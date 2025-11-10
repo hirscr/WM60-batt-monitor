@@ -7,7 +7,7 @@ import os, csv
 from collections import deque
 import math
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import tzlocal
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -72,6 +72,17 @@ BATT_LOG_FILE = os.path.join(LOG_DIR, "eg4_battery_log.csv")
 
 # Global logging interval (seconds)
 LOG_INTERVAL_SEC = int(os.environ.get("LOG_INTERVAL_SEC", str(3600)))  # default: 1 hour
+LOADED_DAYS_MINER = 3    # Track how many days of miner data are currently loaded
+LOADED_DAYS_BATTERY = 3  # Track how many days of battery data are currently loaded
+
+# Add these state tracking variables near the top with other globals (after the existing globals)
+
+# State tracking for loaded data ranges
+LOADED_DAYS_MINER = 3      # Track how many days of miner data are currently loaded
+LOADED_DAYS_BATTERY = 3    # Track how many days of battery data are currently loaded
+MAX_LOADED_DAYS = 30       # Maximum days we'll load into memory at once
+DEFAULT_DAYS = 3           # Default number of days to load
+
 
 _history = deque(maxlen=10000)   # browser history window
 _latest  = {}                    # last good sample
@@ -283,6 +294,126 @@ def op_status():
     return jsonify(miner_ctrl.status_snapshot())
 
 # --- END control endpoints ---
+
+# --- helper functions ---
+def get_miner_data_stats():
+    """Return statistics about currently loaded miner data."""
+    if not HISTORY:
+        return {"loaded_days": 0, "total_rows": 0, "date_range": None}
+
+    try:
+        # Get first and last timestamps
+        rows = list(HISTORY)
+        first_ts = rows[0].get("ts")
+        last_ts = rows[-1].get("ts")
+
+        if not first_ts or not last_ts:
+            return {"loaded_days": LOADED_DAYS_MINER, "total_rows": len(rows), "date_range": None}
+
+        # Calculate actual date range
+        first_dt = datetime.fromisoformat(first_ts.replace('Z', '+00:00'))
+        last_dt = datetime.fromisoformat(last_ts.replace('Z', '+00:00'))
+        actual_days = (last_dt - first_dt).days + 1
+
+        return {
+            "loaded_days": LOADED_DAYS_MINER,
+            "actual_days": actual_days,
+            "total_rows": len(rows),
+            "date_range": {
+                "start": first_ts,
+                "end": last_ts
+            }
+        }
+    except Exception as e:
+        return {"loaded_days": LOADED_DAYS_MINER, "total_rows": len(HISTORY), "error": str(e)}
+
+
+def get_battery_data_stats():
+    """Return statistics about currently loaded battery data."""
+    if not battery_history:
+        return {"loaded_days": 0, "total_rows": 0, "date_range": None}
+
+    try:
+        # Get first and last timestamps
+        rows = list(battery_history)
+        first_ts = rows[0].get("ts")
+        last_ts = rows[-1].get("ts")
+
+        if not first_ts or not last_ts:
+            return {"loaded_days": LOADED_DAYS_BATTERY, "total_rows": len(rows), "date_range": None}
+
+        # Calculate actual date range
+        first_dt = datetime.fromisoformat(first_ts.replace('Z', '+00:00'))
+        last_dt = datetime.fromisoformat(last_ts.replace('Z', '+00:00'))
+        actual_days = (last_dt - first_dt).days + 1
+
+        return {
+            "loaded_days": LOADED_DAYS_BATTERY,
+            "actual_days": actual_days,
+            "total_rows": len(rows),
+            "date_range": {
+                "start": first_ts,
+                "end": last_ts
+            }
+        }
+    except Exception as e:
+        return {"loaded_days": LOADED_DAYS_BATTERY, "total_rows": len(battery_history), "error": str(e)}
+
+
+def update_miner_loading_state(days_loaded: int):
+    """Update the state tracking for miner data loading."""
+    global LOADED_DAYS_MINER
+    LOADED_DAYS_MINER = days_loaded
+    print(f"[STATE] Miner data state updated: {LOADED_DAYS_MINER} days loaded")
+
+
+def update_battery_loading_state(days_loaded: int):
+    """Update the state tracking for battery data loading."""
+    global LOADED_DAYS_BATTERY
+    LOADED_DAYS_BATTERY = days_loaded
+    print(f"[STATE] Battery data state updated: {LOADED_DAYS_BATTERY} days loaded")
+
+
+def can_serve_days_from_memory(requested_days: int, data_type: str) -> bool:
+    """Check if we have enough data in memory to serve the requested number of days."""
+    if data_type == "miner":
+        return requested_days <= LOADED_DAYS_MINER
+    elif data_type == "battery":
+        return requested_days <= LOADED_DAYS_BATTERY
+    return False
+
+
+def needs_data_extension(requested_days: int, data_type: str) -> bool:
+    """Check if we need to load more data to serve the request."""
+    if data_type == "miner":
+        return requested_days > LOADED_DAYS_MINER
+    elif data_type == "battery":
+        return requested_days > LOADED_DAYS_BATTERY
+    return False
+
+
+def _filter_last_3_days(rows):
+    """Filter rows to keep only the last 3 days of data."""
+    try:
+        now = datetime.now(timezone.utc)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=3)
+
+        filtered = []
+        for row in rows:
+            try:
+                ts = row.get('ts')
+                if ts:
+                    # Handle both ISO format and plain datetime strings
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    if dt >= cutoff:
+                        filtered.append(row)
+            except Exception:
+                continue
+        return filtered
+    except Exception:
+        # If any error occurs, return last 4320 samples (3 days at 1 sample/minute)
+        return rows[-4320:] if len(rows) > 4320 else rows
+
 
 # Ensure EG4 creds exist and pass them explicitly
 if not EG4_USER or not EG4_PASS:
@@ -543,22 +674,64 @@ def _append_csv_generic(file_path: str, row: dict):
             writer.writeheader()
         writer.writerow(row)
 
-def _load_battery_history_from_csv():
-    """Load all EG4 rows from BATT_LOG_FILE into battery_history on startup."""
+
+def _load_battery_history_from_csv(days: int = 3):
+    """Load EG4 rows from BATT_LOG_FILE into battery_history, limited to last N days."""
+    global battery_history
+
     try:
         if not os.path.exists(BATT_LOG_FILE):
             print(f"[LOAD] battery log not found: {BATT_LOG_FILE}")
+            update_battery_loading_state(0)
             return
+
+        # Calculate cutoff timestamp for N days ago
+        now = datetime.now(timezone.utc)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
+
         count = 0
+        loaded_rows = []
+
         with open(BATT_LOG_FILE, "r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if isinstance(row, dict) and row.get("ts"):
-                    battery_history.append(row)
-                    count += 1
-        print(f"[LOAD] battery history loaded: {count} rows from {BATT_LOG_FILE}")
+                if not row.get("ts"):
+                    continue
+
+                try:
+                    # Handle both ISO format and plain datetime strings
+                    ts_str = row["ts"]
+                    if 'T' in ts_str:
+                        # ISO format with timezone
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    else:
+                        # Plain datetime string - assume local timezone
+                        dt = datetime.fromisoformat(ts_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+
+                    # Only keep rows within the cutoff period
+                    if dt >= cutoff:
+                        loaded_rows.append(row)
+                        count += 1
+                except Exception as e:
+                    # Skip rows with unparseable timestamps
+                    print(f"[LOAD] skipping row with bad timestamp: {row.get('ts')} - {e}")
+                    continue
+
+        # Clear existing battery history and load filtered rows
+        battery_history.clear()
+        for row in loaded_rows:
+            battery_history.append(row)
+
+        # Update state tracking
+        update_battery_loading_state(days)
+        print(f"[LOAD] battery history loaded: {count} rows from last {days} days from {BATT_LOG_FILE}")
+
     except Exception as e:
         print(f"[LOAD] battery history error: {e}")
+        update_battery_loading_state(0)
+
 
 def _fresh_batt(max_age_s: int = 90) -> Optional[dict]:
     """Return the latest EG4 snapshot from the running client if fresh; else None."""
@@ -575,23 +748,234 @@ def _fresh_batt(max_age_s: int = 90) -> Optional[dict]:
         return None
     return snap
 
-def _load_miner_history_from_csv():
-    """Load all miner rows from LOG_FILE into HISTORY on startup."""
+
+def _load_miner_history_from_csv(days: int = 3):
+    """Load miner rows from LOG_FILE into HISTORY, limited to last N days."""
+    global HISTORY
+
     try:
         if not os.path.exists(LOG_FILE):
             print(f"[LOAD] miner log not found: {LOG_FILE}")
             return
+
+        # Calculate cutoff timestamp for N days ago
+        now = datetime.now(timezone.utc)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
+
         count = 0
+        loaded_rows = []
+
         with open(LOG_FILE, "r", newline="") as f:
-            reader: csv.DictReader[str] = csv.DictReader(f)
+            reader = csv.DictReader(f)
             for row in reader:
-                row: dict[str, str]  # <-- tell linter explicitly
-                if row.get("ts"):
-                    HISTORY.append(row)
-                    count += 1
-        print(f"[LOAD] miner history loaded: {count} rows from {LOG_FILE}")
+                if not row.get("ts"):
+                    continue
+
+                try:
+                    # Handle both ISO format and plain datetime strings
+                    ts_str = row["ts"]
+                    if 'T' in ts_str:
+                        # ISO format with timezone
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    else:
+                        # Plain datetime string - assume local timezone
+                        dt = datetime.fromisoformat(ts_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+
+                    # Only keep rows within the cutoff period
+                    if dt >= cutoff:
+                        loaded_rows.append(row)
+                        count += 1
+                except Exception as e:
+                    # Skip rows with unparseable timestamps
+                    print(f"[LOAD] skipping row with bad timestamp: {row.get('ts')} - {e}")
+                    continue
+
+        # Clear existing history and load filtered rows
+        HISTORY.clear()
+        for row in loaded_rows:
+            HISTORY.append(row)
+
+        print(f"[LOAD] miner history loaded: {count} rows from last {days} days from {LOG_FILE}")
+
     except Exception as e:
         print(f"[LOAD] miner history error: {e}")
+
+
+def _load_last_n_days(file_path: str, target_deque: deque, days: int = 3):
+    """Load only the last N days of CSV data into memory."""
+    if not os.path.exists(file_path):
+        print(f"[LOAD] no file {file_path}")
+        return
+
+    cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
+
+    try:
+        rows = []
+        with open(file_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    ts = row.get('ts')
+                    if ts:
+                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                        if dt >= cutoff:
+                            rows.append(row)
+                except Exception:
+                    continue
+
+        target_deque.extend(rows)
+        print(f"[LOAD] loaded {len(rows)} rows from last {days} days from {file_path}")
+    except Exception as e:
+        print(f"[LOAD] error reading {file_path}: {e}")
+
+
+def _load_date_range(file_path: str, start_date: datetime, end_date: datetime) -> list:
+    """Load CSV data for a specific date range."""
+    if not os.path.exists(file_path):
+        return []
+
+    rows = []
+    try:
+        with open(file_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    ts = row.get('ts')
+                    if ts:
+                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                        if start_date <= dt <= end_date:
+                            rows.append(row)
+                except Exception:
+                    continue
+        return rows
+    except Exception as e:
+        print(f"[LOAD] error reading {file_path}: {e}")
+        return []
+
+
+def _extend_miner_history_from_csv(days: int):
+    """Extend miner history by loading more days from CSV. Only loads if more days requested than currently loaded."""
+    global HISTORY
+
+    if days <= LOADED_DAYS_MINER:
+        print(f"[EXTEND] Miner: requested {days} days, already have {LOADED_DAYS_MINER} days - no action needed")
+        return
+
+    if days > MAX_LOADED_DAYS:
+        print(f"[EXTEND] Miner: requested {days} days exceeds max {MAX_LOADED_DAYS} - limiting to max")
+        days = MAX_LOADED_DAYS
+
+    try:
+        if not os.path.exists(LOG_FILE):
+            print(f"[EXTEND] miner log not found: {LOG_FILE}")
+            return
+
+        # Calculate cutoff timestamp for N days ago
+        now = datetime.now(timezone.utc)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
+
+        count = 0
+        loaded_rows = []
+
+        with open(LOG_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row.get("ts"):
+                    continue
+
+                try:
+                    # Handle both ISO format and plain datetime strings
+                    ts_str = row["ts"]
+                    if 'T' in ts_str:
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    else:
+                        dt = datetime.fromisoformat(ts_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+
+                    # Only keep rows within the cutoff period
+                    if dt >= cutoff:
+                        loaded_rows.append(row)
+                        count += 1
+                except Exception as e:
+                    print(f"[EXTEND] skipping row with bad timestamp: {row.get('ts')} - {e}")
+                    continue
+
+        # Replace existing history with extended data
+        HISTORY.clear()
+        for row in loaded_rows:
+            HISTORY.append(row)
+
+        # Update state tracking
+        update_miner_loading_state(days)
+        print(f"[EXTEND] miner history extended: {count} rows from last {days} days")
+
+    except Exception as e:
+        print(f"[EXTEND] miner history error: {e}")
+
+
+def _extend_battery_history_from_csv(days: int):
+    """Extend battery history by loading more days from CSV. Only loads if more days requested than currently loaded."""
+    global battery_history
+
+    if days <= LOADED_DAYS_BATTERY:
+        print(f"[EXTEND] Battery: requested {days} days, already have {LOADED_DAYS_BATTERY} days - no action needed")
+        return
+
+    if days > MAX_LOADED_DAYS:
+        print(f"[EXTEND] Battery: requested {days} days exceeds max {MAX_LOADED_DAYS} - limiting to max")
+        days = MAX_LOADED_DAYS
+
+    try:
+        if not os.path.exists(BATT_LOG_FILE):
+            print(f"[EXTEND] battery log not found: {BATT_LOG_FILE}")
+            return
+
+        # Calculate cutoff timestamp for N days ago
+        now = datetime.now(timezone.utc)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
+
+        count = 0
+        loaded_rows = []
+
+        with open(BATT_LOG_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row.get("ts"):
+                    continue
+
+                try:
+                    # Handle both ISO format and plain datetime strings
+                    ts_str = row["ts"]
+                    if 'T' in ts_str:
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    else:
+                        dt = datetime.fromisoformat(ts_str)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+
+                    # Only keep rows within the cutoff period
+                    if dt >= cutoff:
+                        loaded_rows.append(row)
+                        count += 1
+                except Exception as e:
+                    print(f"[EXTEND] skipping row with bad timestamp: {row.get('ts')} - {e}")
+                    continue
+
+        # Replace existing battery history with extended data
+        battery_history.clear()
+        for row in loaded_rows:
+            battery_history.append(row)
+
+        # Update state tracking
+        update_battery_loading_state(days)
+        print(f"[EXTEND] battery history extended: {count} rows from last {days} days")
+
+    except Exception as e:
+        print(f"[EXTEND] battery history error: {e}")
+
 
 def is_past_sunset():
     # Example: hardcoded sunset at 19:00 local time, adjust as needed
@@ -891,9 +1275,45 @@ def status():
         }
     })
 
+
 @app.get("/history")
 def api_history():
-    rows = list(HISTORY)
+    """Get miner history with optional days parameter for extended loading."""
+    # Get requested days from query parameter
+    try:
+        requested_days = int(request.args.get('days', DEFAULT_DAYS))
+        requested_days = max(1, min(MAX_LOADED_DAYS, requested_days))  # Clamp to valid range
+    except (ValueError, TypeError):
+        requested_days = DEFAULT_DAYS
+
+    print(f"[API] /history requested {requested_days} days, currently loaded: {LOADED_DAYS_MINER} days")
+
+    # Check if we need to load more data
+    if needs_data_extension(requested_days, "miner"):
+        print(f"[API] /history extending miner data to {requested_days} days")
+        _extend_miner_history_from_csv(requested_days)
+
+    # Filter to requested days (may be less than loaded if user wants smaller range)
+    if requested_days < LOADED_DAYS_MINER:
+        # Filter to smaller subset
+        now = datetime.now(timezone.utc)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=requested_days)
+
+        filtered_rows = []
+        for row in list(HISTORY):
+            try:
+                ts_str = row.get("ts")
+                if ts_str:
+                    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    if dt >= cutoff:
+                        filtered_rows.append(row)
+            except Exception:
+                continue
+        rows = filtered_rows
+    else:
+        # Use all loaded data
+        rows = list(HISTORY)
+
     # Coerce all dict keys to strings so jsonify never compares None vs str
     safe_rows = []
     for r in rows:
@@ -901,57 +1321,164 @@ def api_history():
             safe_rows.append({str(k): v for k, v in r.items()})
         else:
             safe_rows.append(r)
-    return jsonify(safe_rows)
+
+    return jsonify({
+        "data": safe_rows,
+        "meta": {
+            "requested_days": requested_days,
+            "loaded_days": LOADED_DAYS_MINER,
+            "returned_rows": len(safe_rows),
+            "extended_loading": requested_days > LOADED_DAYS_MINER
+        }
+    })
+
 
 @app.get("/battery_page")
 def battery_page():
     return send_from_directory(".", "EG4_Battery.html")
 
+
 @app.get("/battery")
 def battery_api():
-    # Serve from preloaded battery_history so charts have data at startup,
-    # and coerce CSV strings to numbers for charting.
-    latest_snap = eg4.get_latest()
-    all_rows = list(battery_history)  # CSV-preloaded + live
+    """Get battery data with optional days parameter for extended loading."""
+    # Get requested days from query parameter
+    try:
+        requested_days = int(request.args.get('days', DEFAULT_DAYS))
+        requested_days = max(1, min(MAX_LOADED_DAYS, requested_days))  # Clamp to valid range
+    except (ValueError, TypeError):
+        requested_days = DEFAULT_DAYS
 
+    print(f"[API] /battery requested {requested_days} days, currently loaded: {LOADED_DAYS_BATTERY} days")
+
+    # Check if we need to load more data
+    if needs_data_extension(requested_days, "battery"):
+        print(f"[API] /battery extending battery data to {requested_days} days")
+        _extend_battery_history_from_csv(requested_days)
+
+    # Get latest snapshot from running EG4 client
+    latest_snap = eg4.get_latest()
+
+    # Filter to requested days (may be less than loaded if user wants smaller range)
+    if requested_days < LOADED_DAYS_BATTERY:
+        # Filter to smaller subset
+        now = datetime.now(timezone.utc)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=requested_days)
+
+        filtered_rows = []
+        for row in list(battery_history):
+            try:
+                ts_str = row.get("ts")
+                if ts_str:
+                    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    if dt >= cutoff:
+                        filtered_rows.append(row)
+            except Exception:
+                continue
+        all_rows = filtered_rows
+    else:
+        # Use all loaded data
+        all_rows = list(battery_history)
+
+    # Normalize data (existing logic)
     NUM_KEYS = {
-        "pv_power_w",
-        "load_power_w",
-        "battery_net_w",
-        "soc_percent",
-        "pack_voltage_v",
-        "pack_current_a",
+        "pv_power_w", "load_power_w", "battery_net_w",
+        "soc_percent", "pack_voltage_v", "pack_current_a",
     }
 
     def _coerce_num(v):
         try:
             if v is None or v == "":
                 return None
-            # allow ints to stay ints if integral
             f = float(v)
             return int(f) if f.is_integer() else f
         except Exception:
-            return v  # leave as-is if not numeric
+            return v
 
     def _normalize(row: dict) -> dict:
         out = dict(row)
         for k in NUM_KEYS:
             if k in out:
                 out[k] = _coerce_num(out[k])
-        # ensure ts is a plain string
         if "ts" in out and out["ts"] is not None:
             out["ts"] = str(out["ts"])
         return out
 
-    # Normalize lists
+    # Normalize filtered data
     all_rows_norm = [_normalize(r) for r in all_rows]
-    recent_rows_norm = all_rows_norm[-360:] if len(all_rows_norm) > 360 else all_rows_norm
-    print(f"[BATTERY API] latest_ok={isinstance(latest_snap, dict)} recent_len={len(recent_rows_norm)} all_len={len(all_rows_norm)}")
+    # Keep recent_rows as last hour for detail views
+    recent_rows_norm = all_rows_norm[-60:] if len(all_rows_norm) > 60 else all_rows_norm
+
     return jsonify({
         "latest": latest_snap,
         "recent": recent_rows_norm,
         "all": all_rows_norm,
+        "meta": {
+            "requested_days": requested_days,
+            "loaded_days": LOADED_DAYS_BATTERY,
+            "returned_rows": len(all_rows_norm),
+            "extended_loading": requested_days > LOADED_DAYS_BATTERY
+        }
     })
+
+
+@app.post("/data/extend")
+def extend_data():
+    """Explicitly extend loaded data for miner and/or battery."""
+    data = request.get_json(silent=True) or {}
+
+    results = {}
+
+    # Extend miner data if requested
+    if "miner_days" in data:
+        try:
+            days = int(data["miner_days"])
+            days = max(1, min(MAX_LOADED_DAYS, days))
+
+            if days > LOADED_DAYS_MINER:
+                _extend_miner_history_from_csv(days)
+                results["miner"] = {"success": True, "loaded_days": LOADED_DAYS_MINER, "requested_days": days}
+            else:
+                results["miner"] = {"success": True, "loaded_days": LOADED_DAYS_MINER, "requested_days": days,
+                                    "note": "Already loaded"}
+        except Exception as e:
+            results["miner"] = {"success": False, "error": str(e)}
+
+    # Extend battery data if requested
+    if "battery_days" in data:
+        try:
+            days = int(data["battery_days"])
+            days = max(1, min(MAX_LOADED_DAYS, days))
+
+            if days > LOADED_DAYS_BATTERY:
+                _extend_battery_history_from_csv(days)
+                results["battery"] = {"success": True, "loaded_days": LOADED_DAYS_BATTERY, "requested_days": days}
+            else:
+                results["battery"] = {"success": True, "loaded_days": LOADED_DAYS_BATTERY, "requested_days": days,
+                                      "note": "Already loaded"}
+        except Exception as e:
+            results["battery"] = {"success": False, "error": str(e)}
+
+    if not results:
+        return jsonify({"ok": False, "error": "No miner_days or battery_days specified"}), 400
+
+    return jsonify({"ok": True, "results": results})
+
+
+@app.post("/data/reset")
+def reset_data():
+    """Reset loaded data back to default days (useful for memory management)."""
+    try:
+        _load_miner_history_from_csv(DEFAULT_DAYS)
+        _load_battery_history_from_csv(DEFAULT_DAYS)
+
+        return jsonify({
+            "ok": True,
+            "miner_days": LOADED_DAYS_MINER,
+            "battery_days": LOADED_DAYS_BATTERY,
+            "message": f"Data reset to {DEFAULT_DAYS} days"
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.get("/health")
 def health():
@@ -1099,6 +1626,23 @@ def debug_miner_sample():
         "parseable_ts": parseable,
         "head": head,
         "tail": tail,
+    })
+
+
+# Add a new debug endpoint to show loading state
+@app.get("/debug/loading_state")
+def debug_loading_state():
+    """Debug endpoint to show current data loading state."""
+    miner_stats = get_miner_data_stats()
+    battery_stats = get_battery_data_stats()
+
+    return jsonify({
+        "miner": miner_stats,
+        "battery": battery_stats,
+        "config": {
+            "default_days": DEFAULT_DAYS,
+            "max_loaded_days": MAX_LOADED_DAYS
+        }
     })
 
 # ---------- Main ----------

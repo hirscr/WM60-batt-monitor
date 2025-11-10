@@ -163,16 +163,28 @@ class EG4Client:
 
         b = _to_plain(batt)
         r = _to_plain(runtime)
-        # Rest of function remains the same...
+
+        # Log the full runtime response to see all available fields
+        print(f"[EG4Client] Full runtime response keys: {list(r.keys())}")
+        print(f"[EG4Client] Runtime sample data: {json.dumps({k: r.get(k) for k in list(r.keys())[:20]}, indent=2)}")
 
         # Derive PV/Load/Grid/Battery powers from runtime
         pv_candidates = [_num(r.get(k)) for k in ("ppv1","ppv2","ppv3")]
         pv_vals = [v for v in pv_candidates if v is not None]
         pv_power_w = sum(pv_vals) if pv_vals else _num(r.get("ppv"))
 
-        load_power_w = _num(r.get("pToUser"))
-        if load_power_w is None:
-            load_power_w = _num(r.get("consumptionPower"))
+        # CORRECT WAY: Use EPS (backup) power fields pEpsL1N and pEpsL2N
+        eps_l1 = _num(r.get("pEpsL1N")) or 0.0
+        eps_l2 = _num(r.get("pEpsL2N")) or 0.0
+        load_power_w = eps_l1 + eps_l2
+        print(f"[EG4Client] EPS L1N: {eps_l1:.1f}W, EPS L2N: {eps_l2:.1f}W, Total Backup Power: {load_power_w:.1f}W")
+
+        # Fallback to old fields if EPS fields not available
+        if load_power_w == 0.0:
+            load_power_w = _num(r.get("pToUser"))
+            if load_power_w is None:
+                load_power_w = _num(r.get("consumptionPower"))
+            print(f"[EG4Client] Using fallback pToUser/consumptionPower: {load_power_w}W")
 
         grid_power_w = _num(r.get("pToGrid"))
         ac_couple_w = _num(r.get("acCouplePower"))

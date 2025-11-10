@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">
+  <title>WhatsMiner Controller</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+  <!-- Status Bar -->
+  <div id="statusBar">
+    <div class="status-item">
+      <span class="status-dot" id="minerDot"></span>
+      <span id="minerStatus">Miner: Connecting...</span>
+    </div>
+    <div class="status-item">
+      <span class="status-dot" id="batteryDot"></span>
+      <span id="batteryStatus">Battery: Connecting...</span>
+    </div>
+    <div class="status-item">
+      <span class="status-dot" id="networkDot"></span>
+      <span id="networkStatus">Network: Scanning...</span>
+    </div>
+  </div>
+
+  <!-- Debug Console (Always Visible) -->
+  <div id="debugConsole" class="debug-console">
+    <div class="debug-header">
+      <span>🐛 Debug Console</span>
+      <button onclick="copyDebugConsole()" class="btn-small">📋 Copy</button>
+      <button onclick="clearDebugConsole()" class="btn-small">Clear</button>
+      <button onclick="toggleDebugConsole()" class="btn-small" id="toggleDebugBtn">Collapse</button>
+    </div>
+    <div id="debugContent" class="debug-content"></div>
+  </div>
+
+  <h1>WhatsMiner Controller</h1>
+
+  <!-- Main Content Grid -->
+  <div class="main-grid">
+    <!-- Left: Miner Controls -->
+    <div class="card">
+      <h2>Miner Control</h2>
+      <div class="control-group">
+        <label>
+          <input type="checkbox" id="minerPowerToggle">
+          <span>Power</span>
+        </label>
+      </div>
+      <div class="control-group">
+        <label>
+          <input type="checkbox" id="autoControlToggle">
+          <span>Auto Control</span>
+        </label>
+      </div>
+      <div class="control-group">
+        <label>Power %:</label>
+        <input type="number" id="powerPctInput" min="0" max="100" step="1">
+        <button onclick="applyPowerPct()">Apply</button>
+      </div>
+      <div id="autoModeStatus" style="margin: 10px 0; padding: 8px; background: #f0f0f0; border-radius: 4px; display: none;">
+        <div style="font-weight: bold; margin-bottom: 4px;">
+          Mode: <span id="autoModeText">—</span>
+        </div>
+        <div style="font-size: 0.9em; color: #555;">
+          Status: <span id="autoStatusText">—</span>
+        </div>
+        <div style="font-size: 0.85em; color: #777; margin-top: 4px;">
+          Sunset: <span id="autoSunsetText">—</span> | <span id="autoPastSunsetText">—</span>
+        </div>
+      </div>
+      <div class="status-grid">
+        <div>Hashrate:</div><div id="minerHashrate">— TH/s</div>
+        <div>Power:</div><div id="minerPower">— W</div>
+        <div>Target Power:</div><div id="minerTargetPower">— W</div>
+        <div>Temp:</div><div id="minerTemp">— °C</div>
+        <div>Fan:</div><div id="minerFan">— RPM</div>
+      </div>
+    </div>
+
+    <!-- Right: Battery Status -->
+    <div class="card">
+      <h2>Battery Status</h2>
+      <div class="status-grid">
+        <div>SOC:</div><div id="batterySOC">— %</div>
+        <div>PV In:</div><div id="batteryPV">— W</div>
+        <div>Backup (EPS):</div><div id="batteryLoad">— W</div>
+        <div>Net:</div><div id="batteryNet">— W</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Network Devices -->
+  <div class="card">
+    <h2 id="networkDevicesHeader">Network Devices (scanning 192.168.86.1-254)</h2>
+    <div id="networkDevices">Scanning...</div>
+  </div>
+
+  <!-- Unified Chart -->
+  <div class="card">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+      <h2>System Metrics</h2>
+      <div style="display: flex; gap: 10px; align-items: center;">
+        <span id="autoRefreshIndicator" style="color: #52c41a; font-weight: bold;">● LIVE</span>
+        <button onclick="toggleAutoRefresh()" id="autoRefreshToggle" class="btn-small">Pause Auto-Refresh</button>
+        <button onclick="loadChartData(chartState.currentHours)" class="btn-small">⟳ Refresh Now</button>
+      </div>
+    </div>
+
+    <div class="chart-main-layout">
+      <!-- Left Panel: Controls -->
+      <div class="chart-left-panel">
+        <h3>Data Series:</h3>
+        <label><input type="checkbox" id="toggle_hash_rate" checked><span class="color-indicator" style="background: #eb2f96;"></span> Hash Rate (TH/s)</label>
+        <label><input type="checkbox" id="toggle_miner_power" checked><span class="color-indicator" style="background: #1772FF;"></span> Miner Power (W)</label>
+        <label><input type="checkbox" id="toggle_fan_speed" checked><span class="color-indicator" style="background: #13c2c2;"></span> Fan Speed (RPM)</label>
+        <label><input type="checkbox" id="toggle_env_temp" checked><span class="color-indicator" style="background: #fa8c16;"></span> Environment Temp (°C)</label>
+        <label><input type="checkbox" id="toggle_miner_temp" checked><span class="color-indicator" style="background: #f5222d;"></span> Miner Temp (°C)</label>
+        <label><input type="checkbox" id="toggle_battery_soc" checked><span class="color-indicator" style="background: #a0d911;"></span> Battery SOC (%)</label>
+        <label><input type="checkbox" id="toggle_pv_power" checked><span class="color-indicator" style="background: #52c41a;"></span> PV Power In (W)</label>
+        <label><input type="checkbox" id="toggle_eps_power" checked><span class="color-indicator" style="background: #faad14;"></span> EPS Power (W)</label>
+        <label><input type="checkbox" id="toggle_net_power" checked><span class="color-indicator" style="background: #722ed1;"></span> Net Power (W)</label>
+        <button onclick="allSeriesOff()" class="btn-small" style="margin-top: 12px; width: 100%;">All Off</button>
+
+        <h3 style="margin-top: 24px;">Axis Ranges:</h3>
+        <div class="axis-inputs">
+          <label>
+            Left Max:
+            <input type="number" id="leftAxisMax" value="12000" min="0" step="1000" onchange="updateAxisRanges()">
+          </label>
+          <label>
+            Right Max:
+            <input type="number" id="rightAxisMax" value="100" min="0" step="10" onchange="updateAxisRanges()">
+          </label>
+        </div>
+      </div>
+
+      <!-- Right: The Chart -->
+      <div class="chart-area">
+        <div id="unifiedChart" style="height: 600px;"></div>
+      </div>
+    </div>
+
+    <!-- Time Range Buttons Below Chart -->
+    <div class="time-buttons-row">
+      <button onclick="setTimeRange(1)">1h</button>
+      <button onclick="setTimeRange(6)">6h</button>
+      <button onclick="setTimeRange(24)">24h</button>
+      <button onclick="setTimeRange(72)" class="active" id="defaultTimeBtn">3d</button>
+      <button onclick="setTimeRange(168)">1w</button>
+      <button onclick="setTimeRange(720)">1mo</button>
+      <button onclick="setTimeRange(8760)">1yr</button>
+      <button onclick="setTimeRange('all')">All</button>
+    </div>
+  </div>
+
+  <script src="/static/js/dashboard.js?v=20251109-0300"></script>
+</body>
+</html>

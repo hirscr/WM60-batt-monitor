@@ -1,0 +1,53 @@
+# WhatsMiner Controller Configuration
+# IMPORTANT: This file is committed to git. DO NOT add real passwords here!
+#
+# For local development:
+#   1. Copy this file to config.local.yaml
+#   2. Fill in your actual values in config.local.yaml
+#   3. The app will load config.local.yaml if it exists
+#
+# OR use environment variables (recommended for production):
+#   export WM_HOST="your_miner_ip"
+#   export WM_PASS="your_miner_password"
+#   export EG4_USER="your_eg4_username"
+#   export EG4_PASS="your_eg4_password"
+
+miner:
+  host: "192.168.1.100"  # Change to your miner's IP
+  user: "admin"
+  password: "CHANGE_ME"  # Override with WM_PASS environment variable
+  base_watts: 3600
+  poll_seconds: 10
+
+battery:
+  user: "YOUR_EG4_USERNAME"  # Override with EG4_USER environment variable
+  password: "YOUR_EG4_PASSWORD"  # Override with EG4_PASS environment variable
+  base_url: "https://monitor.eg4electronics.com"
+  poll_seconds: 10
+  session_refresh_hours: 168  # Refresh session every week
+
+autocontrol:
+  enabled: false  # Start disabled, enable via API or UI
+  min_interval_sec: 60  # Check every 60 seconds for away mode
+  mode: "away"  # "away" or "present"
+  away_mode:
+    emergency_soc: 30  # % - shut down below this
+    max_pv_power: 3600  # W - threshold for "strong solar"
+    after_sunset_min_soc: 40  # % - don't start after sunset if below this
+  location:
+    latitude: 40.0  # Your latitude (for sunset calculation)
+    longitude: -74.0  # Your longitude
+    timezone: "America/New_York"  # Your timezone
+  # Deprecated - now using astral library for accurate sunset
+  sunset_hour: 19
+  sunset_minute: 0
+
+data:
+  default_days: 90  # Load 90 days of historical data by default
+  max_days: 365     # Maximum days to load
+  log_interval_sec: 600  # Log every 10 minutes (poll every 10 sec, save every 10 min)
+
+app:
+  port: 8080
+  host: "0.0.0.0"  # Bind to all interfaces (accessible from network)
+  debug: false

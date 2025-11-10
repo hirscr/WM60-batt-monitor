@@ -1,0 +1,25 @@
+# WhatsMiner Controller Requirements
+
+# Web Framework
+Flask==3.0.0
+
+# Miner Control
+pyasic==0.77.0
+
+# Battery API
+eg4_inverter_api
+
+# Configuration
+PyYAML==6.0.1
+
+# Timezone
+tzlocal==5.2
+
+# Sunset Calculation
+astral==3.2
+
+# Password Hashing (for miner authentication)
+passlib==1.7.4
+
+# Optional: Network scanning
+requests==2.31.0
