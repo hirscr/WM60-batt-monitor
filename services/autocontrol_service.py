@@ -274,6 +274,8 @@ class AutoControlService:
             age_str = f"{age:.0f}s" if age is not None else "unknown"
             print(f"[AutoControl] WARNING: Battery telemetry stale ({age_str}) — stopping miner for safety")
             self.current_state_description = f"Battery telemetry stale ({age_str}s) — miner stopped for safety."
+            self.stop_reason = "battery_stale"
+            self.resume_at_soc = None
             self.miner.power_off()
             return
 

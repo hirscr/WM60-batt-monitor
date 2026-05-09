@@ -834,7 +834,11 @@ function updateMinerStopReasonBanner() {
   let bg = '';
   let color = '';
 
-  if (stopReason === 'emergency_soc') {
+  if (stopReason === 'battery_stale') {
+    text = 'Miner paused — battery telemetry stale. Waiting for fresh data.';
+    bg = '#ffe0cc';
+    color = '#7d2b00';
+  } else if (stopReason === 'emergency_soc') {
     const resumeStr = (resumeAtSoc != null) ? resumeAtSoc + '%' : '—';
     text = 'Miner paused — battery below minimum SOC. Resuming at ' + resumeStr + '.';
     bg = '#fff3cd';
