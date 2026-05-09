@@ -28,6 +28,7 @@ from services.miner_service import MinerService
 from services.battery_service import BatteryService
 from services.autocontrol_service import AutoControlService
 from services.network_scanner import NetworkScanner
+from services.braiins_service import BraiinsService
 
 # ========== LOG BUFFER ==========
 class LogBuffer:
@@ -165,6 +166,21 @@ autocontrol_service = AutoControlService(
 
 # Network scanner
 network_scanner = NetworkScanner(subnet="192.168.86")
+
+# Braiins Pool service — disabled if API key missing or config flag false.
+_braiins_api_key = os.getenv("BRAIINS_API_KEY", "").strip()
+_braiins_enabled = settings.braiins.enabled and bool(_braiins_api_key)
+if not _braiins_enabled:
+    if not _braiins_api_key:
+        print("[APP] WARNING: BRAIINS_API_KEY not set — Braiins integration disabled")
+    else:
+        print("[APP] Braiins integration disabled via config flag")
+
+braiins_service = BraiinsService(
+    api_key=_braiins_api_key,
+    poll_seconds=settings.braiins.poll_seconds,
+    freshness_window_sec=settings.braiins.freshness_window_sec,
+)
 
 # ========== API ROUTES ==========
 
@@ -640,6 +656,22 @@ def set_emergency_soc():
 
     return jsonify({"ok": True, "percent": autocontrol_service.get_emergency_soc()})
 
+# --- Braiins Pool Routes ---
+@app.get("/api/braiins/status")
+def braiins_status():
+    """Return cached Braiins Pool snapshot.  Never blocks on network I/O."""
+    if not _braiins_enabled or not braiins_service.is_enabled():
+        return jsonify({"error": "braiins integration disabled"}), 503
+
+    snapshot = braiins_service.get_latest()
+    fresh = braiins_service.is_fresh()
+    age = braiins_service.age_seconds()
+
+    snapshot["is_fresh"] = fresh
+    snapshot["age_seconds"] = round(age, 1) if age is not None else None
+
+    return jsonify(snapshot)
+
 # --- Network Routes ---
 @app.get("/api/network/devices")
 def network_devices():
@@ -712,6 +744,9 @@ if __name__ == "__main__":
     battery_service.start()
     autocontrol_service.start()
     network_scanner.start_background_scan()
+    if _braiins_enabled:
+        print("[APP] Starting Braiins Pool service...")
+        braiins_service.start()
 
     # Configure logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)

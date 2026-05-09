@@ -816,6 +816,10 @@ async function refreshStatus() {
     console.log('[RefreshStatus] Network data received:', netData);
     updateNetworkDevices(netData);
 
+    // Braiins Pool status
+    console.log('[RefreshStatus] Fetching Braiins Pool status...');
+    await refreshBraiinsStatus();
+
   } catch (e) {
     console.error('[RefreshStatus] ERROR:', e);
     addDebugLog('Status refresh error: ' + e.message, 'error');
@@ -980,10 +984,135 @@ function updateBatteryStatus(data) {
   }
 
   // Update UI
-  document.getElementById('batterySOC').textContent = (status.soc_percent || '—') + ' %';
-  document.getElementById('batteryPV').textContent = (status.pv_power_w || '—') + ' W';
-  document.getElementById('batteryLoad').textContent = (status.load_power_w || '—') + ' W';
-  document.getElementById('batteryNet').textContent = (status.battery_net_w || '—') + ' W';
+  document.getElementById('batterySOC').textContent = (status.soc_percent != null ? status.soc_percent : '—') + ' %';
+  document.getElementById('batteryPV').textContent = (status.pv_power_w != null ? status.pv_power_w : '—') + ' W';
+  document.getElementById('batteryLoad').textContent = (status.load_power_w != null ? status.load_power_w : '—') + ' W';
+  document.getElementById('batteryNet').textContent = (status.battery_net_w != null ? status.battery_net_w : '—') + ' W';
+
+  // Extended fields (may not always be present)
+  const voltEl = document.getElementById('batteryVoltage');
+  if (voltEl) voltEl.textContent = (status.pack_voltage_v != null ? status.pack_voltage_v.toFixed(1) : '—') + ' V';
+  const currEl = document.getElementById('batteryCurrent');
+  if (currEl) currEl.textContent = (status.pack_current_a != null ? status.pack_current_a.toFixed(1) : '—') + ' A';
+
+  // Unit SOC detail (collapsed by default)
+  const unitSocEl = document.getElementById('batteryUnitSoc');
+  if (unitSocEl && status.unit_soc) {
+    unitSocEl.textContent = status.unit_soc;
+  }
+}
+
+// Fetch and render Braiins Pool status
+async function refreshBraiinsStatus() {
+  const card = document.getElementById('braiinsCard');
+  if (!card) return;
+
+  try {
+    const res = await fetch('/api/braiins/status', { cache: 'no-store' });
+
+    if (res.status === 503) {
+      // Service disabled — hide the card and let the grid reflow.
+      card.style.display = 'none';
+      return;
+    }
+
+    // Service is enabled — ensure card is visible.
+    card.style.display = '';
+
+    if (!res.ok) {
+      updateBraiinsStatus(null, `dashboard fetch failed (HTTP ${res.status})`);
+      return;
+    }
+
+    const data = await res.json();
+    updateBraiinsStatus(data, null);
+
+  } catch (e) {
+    // Network-level error (e.g., controller itself is unreachable).
+    // Keep whatever was last rendered; just update the status line.
+    updateBraiinsStatus(null, 'dashboard fetch failed');
+    console.warn('[Braiins] Fetch error:', e.message);
+  }
+}
+
+// Helper: format a value or return an em-dash
+function fmtOrDash(val) {
+  if (val === null || val === undefined || Number.isNaN(val)) return '—';
+  return val;
+}
+
+function renderBraiinsStatus(data) {
+  // 5m hashrate
+  const el5m = document.getElementById('braiinsHashrate5m');
+  if (el5m) {
+    const v = data.hashrate_5m_ths;
+    el5m.textContent = (v != null ? v.toFixed(1) + ' TH/s' : '—');
+  }
+
+  // Avg hashrate (1h / 24h stacked)
+  const el1h = document.getElementById('braiinsHashrate1h');
+  const el24h = document.getElementById('braiinsHashrate24h');
+  if (el1h) el1h.textContent = (data.hashrate_1h_ths != null ? '1h: ' + data.hashrate_1h_ths.toFixed(1) + ' TH/s' : '1h: —');
+  if (el24h) el24h.textContent = (data.hashrate_24h_ths != null ? '24h: ' + data.hashrate_24h_ths.toFixed(1) + ' TH/s' : '24h: —');
+
+  // Today BTC / USD
+  const elTodayBtc = document.getElementById('braiinsTodayBtc');
+  const elTodayUsd = document.getElementById('braiinsTodayUsd');
+  if (elTodayBtc) {
+    elTodayBtc.textContent = (data.today_btc != null ? data.today_btc.toFixed(8) + ' BTC' : '—');
+  }
+  if (elTodayUsd) {
+    elTodayUsd.textContent = (data.today_usd != null ? '≈ $' + data.today_usd.toFixed(2) : '');
+  }
+
+  // All-time
+  const elAllTime = document.getElementById('braiinsAllTimeBtc');
+  if (elAllTime) {
+    elAllTime.textContent = (data.all_time_btc != null ? data.all_time_btc.toFixed(8) + ' BTC' : '—');
+  }
+
+  // Balance
+  const elBalance = document.getElementById('braiinsBalanceBtc');
+  if (elBalance) {
+    elBalance.textContent = (data.account_balance_btc != null ? data.account_balance_btc.toFixed(8) + ' BTC' : '—');
+  }
+}
+
+function updateBraiinsStatus(data, dashboardError) {
+  const statusEl = document.getElementById('braiinsStatusText');
+
+  if (dashboardError) {
+    // Can't reach the backend endpoint.
+    if (statusEl) {
+      statusEl.className = 'braiins-status-error';
+      statusEl.textContent = dashboardError;
+    }
+    return;
+  }
+
+  if (!data) return;
+
+  // Render tile values.
+  renderBraiinsStatus(data);
+
+  // Status line.
+  if (!statusEl) return;
+
+  if (data.error) {
+    statusEl.className = 'braiins-status-error';
+    const shortErr = String(data.error).slice(0, 60);
+    statusEl.textContent = 'error — ' + shortErr;
+    statusEl.title = data.error;  // Full text on hover.
+  } else if (data.is_fresh) {
+    statusEl.className = 'braiins-status-live';
+    statusEl.textContent = 'live';
+    statusEl.title = '';
+  } else {
+    const age = data.age_seconds != null ? Math.round(data.age_seconds) + 's' : 'unknown';
+    statusEl.className = 'braiins-status-stale';
+    statusEl.textContent = 'STALE (' + age + ')';
+    statusEl.title = '';
+  }
 }
 
 // Update network devices

@@ -90,14 +90,57 @@
       </div>
     </div>
 
-    <!-- Right: Battery Status -->
+    <!-- Middle: Battery Status (slim) -->
     <div class="card">
-      <h2>Battery Status</h2>
+      <h2>Battery</h2>
       <div class="status-grid">
-        <div>SOC:</div><div id="batterySOC">— %</div>
-        <div>PV In:</div><div id="batteryPV">— W</div>
-        <div>Backup (EPS):</div><div id="batteryLoad">— W</div>
-        <div>Net:</div><div id="batteryNet">— W</div>
+        <div>SOC:</div><div id="batterySOC" style="font-size:1.15em;font-weight:bold;">— %</div>
+        <div>Pack Voltage:</div><div id="batteryVoltage">— V</div>
+        <div>Pack Current:</div><div id="batteryCurrent">— A</div>
+        <div>Load:</div><div id="batteryLoad">— W</div>
+        <div>PV:</div><div id="batteryPV">— W</div>
+        <div>Batt Net:</div><div id="batteryNet">— W</div>
+      </div>
+      <details style="margin-top:10px;font-size:0.82em;color:#777;">
+        <summary style="cursor:pointer;">Unit SOC details</summary>
+        <div id="batteryUnitSoc" style="margin-top:6px;font-family:monospace;line-height:1.6;">—</div>
+      </details>
+    </div>
+
+    <!-- Right: Braiins Pool -->
+    <div class="card" id="braiinsCard">
+      <h2>Braiins Pool</h2>
+      <div class="braiins-tiles">
+        <!-- Tile 1: 5m Hashrate -->
+        <div class="braiins-tile">
+          <div class="braiins-tile-label">5m Hashrate</div>
+          <div class="braiins-tile-value" id="braiinsHashrate5m">—</div>
+        </div>
+        <!-- Tile 2: Avg Hashrate -->
+        <div class="braiins-tile">
+          <div class="braiins-tile-label">Avg Hashrate</div>
+          <div class="braiins-tile-value" id="braiinsHashrate1h">—</div>
+          <div class="braiins-tile-sub" id="braiinsHashrate24h">—</div>
+        </div>
+        <!-- Tile 3: Today -->
+        <div class="braiins-tile">
+          <div class="braiins-tile-label">Today</div>
+          <div class="braiins-tile-value" id="braiinsTodayBtc">—</div>
+          <div class="braiins-tile-sub" id="braiinsTodayUsd">—</div>
+        </div>
+        <!-- Tile 4: All-Time -->
+        <div class="braiins-tile">
+          <div class="braiins-tile-label">All-Time</div>
+          <div class="braiins-tile-value" id="braiinsAllTimeBtc">—</div>
+        </div>
+        <!-- Tile 5: Balance (spans full width) -->
+        <div class="braiins-tile braiins-tile-wide">
+          <div class="braiins-tile-label">Balance</div>
+          <div class="braiins-tile-value" id="braiinsBalanceBtc">—</div>
+        </div>
+      </div>
+      <div class="braiins-status-line">
+        Pool: <span id="braiinsStatusText" class="braiins-status-live">—</span>
       </div>
     </div>
   </div>
@@ -166,6 +209,6 @@
     </div>
   </div>
 
-  <script src="/static/js/dashboard.js?v=20260509-0002"></script>
+  <script src="/static/js/dashboard.js?v=20260509-0003"></script>
 </body>
 </html>

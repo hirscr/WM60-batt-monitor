@@ -56,6 +56,14 @@ class AutoControlConfig:
 
 
 @dataclass
+class BraiinsConfig:
+    """Braiins Pool integration configuration."""
+    enabled: bool = False
+    poll_seconds: int = 60
+    freshness_window_sec: int = 300
+
+
+@dataclass
 class DataConfig:
     """Data loading configuration."""
     default_days: int = 3
@@ -79,6 +87,7 @@ class Settings:
     autocontrol: AutoControlConfig = field(default_factory=AutoControlConfig)
     data: DataConfig = field(default_factory=DataConfig)
     app: AppConfig = field(default_factory=AppConfig)
+    braiins: BraiinsConfig = field(default_factory=BraiinsConfig)
 
     def validate(self):
         """Validate settings and raise if invalid."""
@@ -187,6 +196,15 @@ def load_settings(config_path: Optional[str] = None) -> Settings:
                 port=app.get('port', settings.app.port),
                 host=app.get('host', settings.app.host),
                 debug=app.get('debug', settings.app.debug),
+            )
+
+        # Braiins Pool config
+        if 'braiins' in data:
+            br = data['braiins']
+            settings.braiins = BraiinsConfig(
+                enabled=br.get('enabled', settings.braiins.enabled),
+                poll_seconds=br.get('poll_seconds', settings.braiins.poll_seconds),
+                freshness_window_sec=br.get('freshness_window_sec', settings.braiins.freshness_window_sec),
             )
 
     # Override with environment variables
