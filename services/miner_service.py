@@ -306,6 +306,13 @@ class MinerService:
 
                     row["is_off"] = self._is_off
 
+                    # --- Upfreq Complete (0 = still ramping, 1 = full speed) ---
+                    try:
+                        upfreq_raw = item.get("Upfreq Complete")
+                        row["upfreq_complete"] = int(upfreq_raw) if upfreq_raw is not None else 0
+                    except (TypeError, ValueError):
+                        row["upfreq_complete"] = 0
+
                     # Compute Efficiency (W/TH)
                     pwr = row.get("Power")
                     if isinstance(pwr, (int, float)) or (isinstance(pwr, str) and str(pwr).isdigit()):

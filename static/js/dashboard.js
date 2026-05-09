@@ -14,7 +14,10 @@ const state = {
     history: { t: [], fan: [], env: [], wm: [] }
   },
   errors: [],
-  debugLogs: []  // Keep last 200 log messages
+  debugLogs: [],  // Keep last 200 log messages
+  // Cache for stop-reason banner evaluation
+  lastMinerStatus: null,
+  lastAutocontrolStatus: null
 };
 
 // Debug console functions
@@ -784,6 +787,78 @@ function zoomChart(chartType, hours) {
   }
 }
 
+// Update the stop-reason banner in the Miner Control card.
+// Called after every miner or autocontrol status refresh.
+function updateMinerStopReasonBanner() {
+  const banner = document.getElementById('minerStopReason');
+  if (!banner) return;
+
+  const minerStatus = state.lastMinerStatus;
+  const autoStatus = state.lastAutocontrolStatus;
+
+  if (!minerStatus || !autoStatus) {
+    banner.style.display = 'none';
+    return;
+  }
+
+  // upfreq_complete defaults to 0 (conservative) when missing
+  const upfreqComplete = (minerStatus.upfreq_complete != null) ? minerStatus.upfreq_complete : 0;
+  const stopReason = autoStatus.stop_reason || 'normal';
+  const resumeAtSoc = autoStatus.resume_at_soc;
+
+  // Target power (watts) from autocontrol — used for the hide condition
+  const targetPowerW = autoStatus.target_w;
+  const power5s = minerStatus['Power 5s'];
+
+  // Hide condition: upfreq is complete AND power is within 10% of target
+  const upfreqDone = (upfreqComplete === 1);
+  let powerOnTarget = false;
+  if (upfreqDone && targetPowerW && targetPowerW > 0 && power5s != null) {
+    powerOnTarget = (Math.abs(power5s - targetPowerW) / targetPowerW) <= 0.10;
+  }
+
+  if (upfreqDone && powerOnTarget) {
+    banner.style.display = 'none';
+    return;
+  }
+
+  // Show condition: upfreq not complete OR stop_reason != "normal"
+  const shouldShow = (upfreqComplete === 0) || (stopReason !== 'normal');
+  if (!shouldShow) {
+    banner.style.display = 'none';
+    return;
+  }
+
+  // Determine banner text and color
+  let text = '';
+  let bg = '';
+  let color = '';
+
+  if (stopReason === 'emergency_soc') {
+    const resumeStr = (resumeAtSoc != null) ? resumeAtSoc + '%' : '—';
+    text = 'Miner paused — battery below minimum SOC. Resuming at ' + resumeStr + '.';
+    bg = '#fff3cd';
+    color = '#856404';
+  } else if (stopReason === 'manual_off') {
+    text = 'Miner off (manual).';
+    bg = '#e9ecef';
+    color = '#495057';
+  } else if (stopReason === 'ramping' || upfreqComplete === 0) {
+    text = 'Miner ramping — upfreq not complete. Running at reduced hashrate.';
+    bg = '#cce5ff';
+    color = '#004085';
+  } else {
+    text = 'Miner at reduced output — reason unknown.';
+    bg = '#fff9db';
+    color = '#7d6608';
+  }
+
+  banner.textContent = text;
+  banner.style.background = bg;
+  banner.style.color = color;
+  banner.style.display = 'block';
+}
+
 // Refresh status
 async function refreshStatus() {
   console.log('[RefreshStatus] Starting status refresh...');
@@ -832,6 +907,9 @@ function updateMinerStatus(data) {
   const { status, connection } = data;
   console.log('[UpdateMinerStatus] Status:', status, 'Connection:', connection);
 
+  // Cache for banner evaluation
+  state.lastMinerStatus = status;
+
   addDebugLog(`[Frontend] Received miner update: connected=${connection.connected}`, 'info');
 
   // Connection status
@@ -875,11 +953,16 @@ function updateMinerStatus(data) {
   // Update power toggle
   const powerToggle = document.getElementById('minerPowerToggle');
   powerToggle.checked = status.is_mining !== false;
+
+  updateMinerStopReasonBanner();
 }
 
 // Update auto-control status
 function updateAutoControlStatus(data) {
   console.log('[UpdateAutoControl] Received data:', data);
+
+  // Cache for banner evaluation
+  state.lastAutocontrolStatus = data;
 
   // Emergency SOC
   if (data.emergency_soc !== undefined && data.emergency_soc !== null) {
@@ -954,6 +1037,8 @@ function updateAutoControlStatus(data) {
     if (applyBtn) applyBtn.disabled = false;
     addDebugLog('[AutoControl] Disabled, manual control available', 'info');
   }
+
+  updateMinerStopReasonBanner();
 }
 
 // Update battery status

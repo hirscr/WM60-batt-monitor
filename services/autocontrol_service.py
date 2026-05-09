@@ -96,6 +96,11 @@ class AutoControlService:
         self.target_pct: Optional[int] = None
         self.current_state_description = "Initializing"
 
+        # Stop-reason tracking (surfaced to the dashboard)
+        # Values: "emergency_soc", "manual_off", "ramping", "normal"
+        self.stop_reason: str = "normal"
+        self.resume_at_soc: Optional[int] = None
+
         # Cache today's sunset
         self._cached_sunset_date: Optional[date] = None
         self._cached_sunset_time: Optional[datetime] = None
@@ -302,6 +307,8 @@ class AutoControlService:
             self.target_pct = 0
             self.target_w = 0
             self.current_state_description = f"Emergency shutdown - SOC below {self.emergency_soc}%"
+            self.stop_reason = "emergency_soc"
+            self.resume_at_soc = self.emergency_soc
 
             print(f"[AutoControl] Condition met: Emergency shutdown (SOC < {self.emergency_soc}%)")
             print(f"[AutoControl] Target power: 0% (0W)")
@@ -322,6 +329,8 @@ class AutoControlService:
             self.target_w = self.base_watts
             self.current_state_description = "Full power - battery full with excess solar"
             self.latched_floor_w = None  # Reset latch
+            self.stop_reason = "normal"
+            self.resume_at_soc = None
 
             print(f"[AutoControl] Condition met: Full power opportunity (SOC > 99% AND PV > {self.max_pv_power}W)")
             print(f"[AutoControl] Target power: 100% ({self.base_watts}W)")
@@ -343,6 +352,8 @@ class AutoControlService:
             self.target_pct = 90
             self.target_w = int(self.base_watts * 0.9)
             self.current_state_description = "High SOC conservative - limited solar"
+            self.stop_reason = "normal"
+            self.resume_at_soc = None
 
             print(f"[AutoControl] Condition met: High SOC conservative (SOC > 90% AND PV < {self.max_pv_power}W)")
             print(f"[AutoControl] Target power: 90% ({self.target_w}W)")
@@ -366,6 +377,8 @@ class AutoControlService:
             self.target_pct = tier_pct
             self.target_w = int(self.base_watts * (tier_pct / 100.0))
             self.current_state_description = f"After sunset startup at {tier_pct}%"
+            self.stop_reason = "normal"
+            self.resume_at_soc = None
 
             print(f"[AutoControl] Condition met: After sunset startup")
             print(f"[AutoControl] Time is after sunset AND SOC > {self.after_sunset_min_soc}% AND miner is off")
@@ -386,6 +399,8 @@ class AutoControlService:
         self.target_pct = tier_pct
         self.target_w = int(self.base_watts * (tier_pct / 100.0))
         self.current_state_description = f"Normal discharge at {tier_pct}%"
+        self.stop_reason = "normal"
+        self.resume_at_soc = None
 
         print(f"[AutoControl] Condition met: Normal discharge")
         print(f"[AutoControl] SOC tier: {tier_pct}% for SOC={soc:.1f}%")
@@ -466,6 +481,30 @@ class AutoControlService:
         """Get current auto-control state for debugging and display."""
         sunset_time = self._get_sunset_time()
 
+        # Derive the effective stop_reason for the dashboard.
+        # When autocontrol is disabled, the miner state is purely manual.
+        miner_latest = self.miner.get_status()
+        upfreq_complete = miner_latest.get("upfreq_complete", 0) if miner_latest else 0
+        if upfreq_complete is None:
+            upfreq_complete = 0
+
+        if not self.enabled:
+            effective_stop_reason = "manual_off" if self.miner.is_off else "normal"
+            effective_resume_at_soc = None
+        elif self.stop_reason == "emergency_soc":
+            effective_stop_reason = "emergency_soc"
+            effective_resume_at_soc = self.resume_at_soc
+        elif not self.miner.is_off and upfreq_complete == 0:
+            # Miner is on but still ramping up
+            effective_stop_reason = "ramping"
+            effective_resume_at_soc = None
+        elif not self.miner.is_off and upfreq_complete == 1:
+            effective_stop_reason = "normal"
+            effective_resume_at_soc = None
+        else:
+            effective_stop_reason = self.stop_reason
+            effective_resume_at_soc = self.resume_at_soc
+
         return {
             "enabled": self.enabled,
             "mode": self.mode,
@@ -480,4 +519,6 @@ class AutoControlService:
             "emergency_soc": self.emergency_soc,
             "battery_fresh": self.battery.is_fresh(),
             "battery_age_seconds": self.battery.get_battery_age_seconds(),
+            "stop_reason": effective_stop_reason,
+            "resume_at_soc": effective_resume_at_soc,
         }
