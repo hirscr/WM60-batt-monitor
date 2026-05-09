@@ -263,9 +263,8 @@ class MinerService:
                             psu_reply = self.api.get_psu()
                         else:
                             psu_reply = asyncio.run(self.api.get_psu())
-                        psu_list = psu_reply.get("PSU") or [] if psu_reply else []
-                        psu_item = psu_list[0] if psu_list and isinstance(psu_list[0], dict) else {}
-                        pin_val = psu_item.get("pin")
+                        psu_msg = psu_reply.get("Msg", {}) if isinstance(psu_reply, dict) else {}
+                        pin_val = psu_msg.get("pin") if isinstance(psu_msg, dict) else None
                         if pin_val is not None:
                             power_5s = round(float(pin_val), 0)
                     except Exception as e:

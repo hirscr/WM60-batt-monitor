@@ -90,10 +90,10 @@ document.addEventListener('DOMContentLoaded', () => {
   try {
     console.log('[Dashboard] Step 1: Initializing chart...');
     initUnifiedChart();
-    console.log('[Dashboard] Step 2: Loading chart data (2160 hours / 90 days)...');
+    console.log('[Dashboard] Step 2: Loading chart data (8760 hours / 365 days)...');
 
-    // Load 90 days of data but display only 3 days (72 hours) by default
-    loadChartData(2160).then(() => {
+    // Load 1 year of data but display only 3 days (72 hours) by default
+    loadChartData(8760).then(() => {
       console.log('[Dashboard] Chart data loaded successfully, now filtering to default 3 days (72h)');
       // After loading all data, filter to 3 days to match the default active button
       updateUnifiedChart(72);
@@ -424,7 +424,11 @@ async function setTimeRange(hours) {
   addDebugLog(`[Time Range] Switching to ${hours === 'all' ? 'all data' : hours + ' hours'}`, 'info');
 
   if (hours === 'all') {
-    console.log(`[setTimeRange] Path: ALL - calling updateUnifiedChart('all')`);
+    console.log(`[setTimeRange] Path: ALL`);
+    if (chartState.maxLoadedHours < 8760) {
+      addDebugLog(`[Time Range] Loading full history before showing all...`, 'info');
+      await loadChartData(8760);
+    }
     updateUnifiedChart('all');
     return;
   }
