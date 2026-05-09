@@ -845,9 +845,15 @@ function updateMinerStatus(data) {
     }
   }
 
-  // Update UI
-  document.getElementById('minerHashrate').textContent = (status.Hashrate || '—') + ' TH/s';
-  document.getElementById('minerPower').textContent = (status.Power || '—') + ' W';
+  // Update UI — dual hashrate and power readings
+  const hr5s = status['Hashrate 5s'];
+  const hr5m = status['Hashrate'];
+  const pw5s = status['Power 5s'];
+  const pw5m = status['Power'];
+  document.getElementById('minerHashrate5s').textContent = (hr5s !== null && hr5s !== undefined ? hr5s.toFixed(1) : '—') + ' TH/s';
+  document.getElementById('minerHashrate').textContent = (hr5m !== null && hr5m !== undefined ? Number(hr5m).toFixed(1) : '—') + ' TH/s';
+  document.getElementById('minerPower5s').textContent = (pw5s !== null && pw5s !== undefined ? Math.round(pw5s) : '—') + ' W';
+  document.getElementById('minerPower').textContent = (pw5m !== null && pw5m !== undefined ? Math.round(pw5m) : '—') + ' W';
   document.getElementById('minerTemp').textContent = (pickWMTemp(status) || '—') + ' °C';
 
   // Fan: Show "0 RPM" if fan is off, not "— RPM"
@@ -866,6 +872,27 @@ function updateMinerStatus(data) {
 // Update auto-control status
 function updateAutoControlStatus(data) {
   console.log('[UpdateAutoControl] Received data:', data);
+
+  // Emergency SOC
+  if (data.emergency_soc !== undefined && data.emergency_soc !== null) {
+    document.getElementById('emergencySocInput').value = data.emergency_soc;
+    document.getElementById('emergencySocCurrent').textContent = data.emergency_soc;
+  }
+
+  // Battery freshness indicator
+  const freshnessEl = document.getElementById('batteryFreshnessStatus');
+  if (freshnessEl) {
+    if (data.battery_fresh) {
+      freshnessEl.textContent = 'live';
+      freshnessEl.style.color = '#52c41a';
+    } else if (data.battery_age_seconds !== null && data.battery_age_seconds !== undefined) {
+      freshnessEl.textContent = `STALE (${Math.round(data.battery_age_seconds)}s)`;
+      freshnessEl.style.color = '#f5222d';
+    } else {
+      freshnessEl.textContent = 'no data';
+      freshnessEl.style.color = '#faad14';
+    }
+  }
 
   const { enabled, target_pct, target_w, mode, current_state_description, sunset_time, is_past_sunset } = data;
   const autoToggle = document.getElementById('autoControlToggle');
@@ -1124,6 +1151,35 @@ async function applyPowerPct() {
       applyBtn.disabled = false;
       applyBtn.textContent = 'Apply';
     }
+  }
+}
+
+// Apply emergency SOC threshold
+async function applyEmergencySoc() {
+  const input = document.getElementById('emergencySocInput');
+  const percent = parseInt(input.value);
+
+  if (isNaN(percent) || percent < 5 || percent > 95) {
+    addDebugLog('[EmergencySOC] Invalid value — must be 5-95%', 'error');
+    return;
+  }
+
+  try {
+    addDebugLog(`[EmergencySOC] Setting to ${percent}%...`, 'info');
+    const response = await fetch('/api/autocontrol/emergency_soc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ percent })
+    });
+    const result = await response.json();
+    if (response.ok) {
+      document.getElementById('emergencySocCurrent').textContent = result.percent;
+      addDebugLog(`[EmergencySOC] ✓ Set to ${result.percent}%`, 'success');
+    } else {
+      addDebugLog(`[EmergencySOC] ✗ Error: ${result.error}`, 'error');
+    }
+  } catch (e) {
+    addDebugLog(`[EmergencySOC] Request failed: ${e.message}`, 'error');
   }
 }
 

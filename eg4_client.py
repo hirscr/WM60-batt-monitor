@@ -88,6 +88,17 @@ class EG4Client:
     def last_error(self) -> Optional[str]:
         return self._last_error
 
+    def last_snapshot_ts(self) -> Optional[datetime]:
+        """Return the timestamp of the most recent accepted snapshot, or None if no poll yet."""
+        with self._lock:
+            ts_str = self._latest.get("ts")
+        if not ts_str:
+            return None
+        try:
+            return datetime.fromisoformat(ts_str)
+        except Exception:
+            return None
+
     # ---------- Thread/async internals ----------
     def _thread_main(self):
         self._loop = asyncio.new_event_loop()

@@ -2,8 +2,9 @@ import json, os, tempfile, time
 
 DEFAULT_STATE = {
     "autocontrol": False,           # whether autocontrol is enabled
-    "miner_power_state": "stopped", # "stopped" or "running"
+    "miner_power_state": "stopped", # "stopped", "running", or "pending"
     "target_power_pct": 0,          # e.g., 40 for 40 percent
+    "emergency_soc": None,          # runtime override for emergency SOC %; None means use config value
     "last_updated": 0               # unix time seconds
 }
 

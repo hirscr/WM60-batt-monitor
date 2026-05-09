@@ -186,6 +186,16 @@ class NCMinerAPI:
             traceback.print_exc()
             return {"STATUS": [{"STATUS": "E", "Msg": str(e)}]}
 
+    def miner_status_cmd(self) -> Dict[str, Any]:
+        """Send 'status' command — returns MINING[0].mineroff for authoritative is_off detection."""
+        result = self._send_command("status")
+        return result if result else {}
+
+    def get_psu(self) -> Dict[str, Any]:
+        """Send 'get_psu' command — returns PSU[0].pin for real-time power reading."""
+        result = self._send_command("get_psu")
+        return result if result else {}
+
     def set_power_pct(self, percent: int) -> Dict[str, Any]:
         """Set power percentage (requires password) - TEMPORARY."""
         if not 0 < percent <= 100:

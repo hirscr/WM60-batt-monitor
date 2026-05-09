@@ -59,6 +59,15 @@
         <input type="number" id="powerPctInput" min="0" max="100" step="1">
         <button onclick="applyPowerPct()">Apply</button>
       </div>
+      <div class="control-group" style="margin-top: 8px;">
+        <label>Emergency SOC:</label>
+        <input type="number" id="emergencySocInput" min="5" max="95" step="1" style="width: 60px;">
+        <button onclick="applyEmergencySoc()">Apply</button>
+      </div>
+      <div style="font-size: 0.85em; color: #555; margin: 2px 0 8px 0;">
+        Active: <span id="emergencySocCurrent">—</span>% &nbsp;|&nbsp;
+        Battery: <span id="batteryFreshnessStatus" style="font-weight: bold;">—</span>
+      </div>
       <div id="autoModeStatus" style="margin: 10px 0; padding: 8px; background: #f0f0f0; border-radius: 4px; display: none;">
         <div style="font-weight: bold; margin-bottom: 4px;">
           Mode: <span id="autoModeText">—</span>
@@ -71,8 +80,10 @@
         </div>
       </div>
       <div class="status-grid">
-        <div>Hashrate:</div><div id="minerHashrate">— TH/s</div>
-        <div>Power:</div><div id="minerPower">— W</div>
+        <div>Hashrate (5s):</div><div id="minerHashrate5s">— TH/s</div>
+        <div>Hashrate (5m):</div><div id="minerHashrate">— TH/s</div>
+        <div>Power (5s):</div><div id="minerPower5s">— W</div>
+        <div>Power (5m):</div><div id="minerPower">— W</div>
         <div>Target Power:</div><div id="minerTargetPower">— W</div>
         <div>Temp:</div><div id="minerTemp">— °C</div>
         <div>Fan:</div><div id="minerFan">— RPM</div>
@@ -155,6 +166,6 @@
     </div>
   </div>
 
-  <script src="/static/js/dashboard.js?v=20251109-0300"></script>
+  <script src="/static/js/dashboard.js?v=20260509-0001"></script>
 </body>
 </html>

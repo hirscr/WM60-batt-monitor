@@ -10,6 +10,10 @@ from typing import Optional
 from eg4_client import EG4Client
 from models.device import ConnectionStatus
 
+# If the most recent snapshot is older than this, battery telemetry is stale.
+# Autocontrol must stop the miner when stale.
+FRESHNESS_WINDOW_SEC = 600  # 10 minutes
+
 
 class BatteryService:
     """
@@ -58,6 +62,11 @@ class BatteryService:
         self._thread: Optional[threading.Thread] = None
         self._last_auth_time = 0.0
         self._last_log_ts = 0.0  # Start at 0 so first data point logs immediately
+
+        # Freshness tracking — only advance when the EG4Client snapshot ts changes.
+        # Starts as None so is_fresh() returns False until first real poll succeeds.
+        self._last_snap_ts_str: Optional[str] = None
+        self._last_snap_datetime: Optional[datetime] = None
 
         # Connection status tracking
         self.connection_status = ConnectionStatus(connected=False)
@@ -109,20 +118,36 @@ class BatteryService:
                 print(f"[BatteryService] Available keys: {list(snap.keys()) if snap else 'None'}")
 
                 if snap and snap.get("soc_percent") is not None:
-                    # Connection successful
                     now = time.time()
-                    if not self.connection_status.connected:
-                        self._first_connect_time = now
-                        print("[BatteryService] ✓ Connected to battery API")
+                    snap_ts = snap.get("ts")
+                    if snap_ts and snap_ts != self._last_snap_ts_str:
+                        # Snapshot ts has advanced — this is genuinely fresh data
+                        self._last_snap_ts_str = snap_ts
+                        try:
+                            self._last_snap_datetime = datetime.fromisoformat(snap_ts)
+                        except Exception:
+                            self._last_snap_datetime = datetime.now(timezone.utc)
 
-                    self.connection_status.connected = True
-                    self.connection_status.last_seen = datetime.now(timezone.utc)
-                    if self._first_connect_time:
-                        self.connection_status.uptime_seconds = now - self._first_connect_time
-                    self.connection_status.error = None
+                        if not self.connection_status.connected:
+                            self._first_connect_time = now
+                            print("[BatteryService] ✓ Connected to battery API")
 
-                    self.latest = snap
-                    self.history.append(snap)
+                        self.connection_status.connected = True
+                        self.connection_status.last_seen = datetime.now(timezone.utc)
+                        if self._first_connect_time:
+                            self.connection_status.uptime_seconds = now - self._first_connect_time
+                        self.connection_status.error = None
+
+                        self.latest = snap
+                        self.history.append(snap)
+                    elif snap_ts == self._last_snap_ts_str:
+                        print(f"[BatteryService] Snapshot ts unchanged ({snap_ts}) — EG4Client not advancing, skipping update")
+                    else:
+                        # snap has no ts — accept it but do not update freshness tracking
+                        self.connection_status.connected = True
+                        self.connection_status.last_seen = datetime.now(timezone.utc)
+                        self.latest = snap
+                        self.history.append(snap)
 
                     # CSV logging check (log first data immediately, then every log_interval_sec)
                     if (now - self._last_log_ts) >= self.log_interval_sec:
@@ -209,6 +234,20 @@ class BatteryService:
         except Exception as e:
             print(f"[BatteryService] Session refresh error: {e}")
             return False
+
+    def is_fresh(self) -> bool:
+        """Return True only if the most recent snapshot is within FRESHNESS_WINDOW_SEC of now.
+        Returns False until the first real EG4 poll succeeds."""
+        if self._last_snap_datetime is None:
+            return False
+        age = (datetime.now(timezone.utc) - self._last_snap_datetime).total_seconds()
+        return age <= FRESHNESS_WINDOW_SEC
+
+    def get_battery_age_seconds(self) -> Optional[float]:
+        """Seconds elapsed since the last accepted snapshot, or None if no snapshot yet."""
+        if self._last_snap_datetime is None:
+            return None
+        return (datetime.now(timezone.utc) - self._last_snap_datetime).total_seconds()
 
     def get_status(self) -> dict:
         """Get current battery status."""

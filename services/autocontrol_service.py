@@ -59,8 +59,11 @@ class AutoControlService:
         self.min_interval_sec = min_interval_sec
         self.mode = mode
 
-        # Away mode configuration
-        self.emergency_soc = away_config.get("emergency_soc", 30)
+        # Away mode configuration — emergency_soc may be overridden by persisted runtime value
+        config_emergency_soc = away_config.get("emergency_soc", 30)
+        saved = self.state.load()
+        persisted = saved.get("emergency_soc")
+        self.emergency_soc = int(persisted) if persisted is not None else config_emergency_soc
         self.max_pv_power = away_config.get("max_pv_power", 3600)
         self.after_sunset_min_soc = away_config.get("after_sunset_min_soc", 40)
 
@@ -150,6 +153,18 @@ class AutoControlService:
         self.last_set_ts = 0.0  # Allow immediate re-evaluation
         print(f"[AutoControl] Mode changed to: {mode}")
         return True
+
+    def get_emergency_soc(self) -> int:
+        """Return current emergency SOC threshold (%)."""
+        return self.emergency_soc
+
+    def set_emergency_soc(self, percent: int) -> None:
+        """Update the emergency SOC threshold and persist it to wm_state.json."""
+        if not (5 <= percent <= 95):
+            raise ValueError(f"emergency_soc must be between 5 and 95, got {percent}")
+        self.emergency_soc = percent
+        self.state.save(emergency_soc=percent)
+        print(f"[AutoControl] emergency_soc updated to {percent}%")
 
     def _get_sunset_time(self) -> Optional[datetime]:
         """
@@ -248,14 +263,21 @@ class AutoControlService:
         5. Normal discharge tiers (SOC → power%)
         """
 
+        # SAFETY GATE: If battery telemetry is stale, stop the miner and do nothing else.
+        if not self.battery.is_fresh():
+            age = self.battery.get_battery_age_seconds()
+            age_str = f"{age:.0f}s" if age is not None else "unknown"
+            print(f"[AutoControl] WARNING: Battery telemetry stale ({age_str}) — stopping miner for safety")
+            self.current_state_description = f"Battery telemetry stale ({age_str}s) — miner stopped for safety."
+            self.miner.power_off()
+            return
+
         # Get current state
         battery_snap = self.battery.get_status()
         soc = battery_snap.get("soc_percent")
         pv_power = battery_snap.get("pv_power_w", 0) or 0
 
-        miner_status = self.miner.get_status()
-        miner_power = miner_status.get("Power", 0) or 0
-        is_miner_off = (miner_power == 0) or (miner_power < 100)
+        is_miner_off = self.miner.is_off
 
         if not isinstance(soc, (int, float)):
             print("[AutoControl] No valid SOC data")
@@ -273,7 +295,7 @@ class AutoControlService:
         tz = ZoneInfo(self.timezone_str)
         now = datetime.now(tz)
         print(f"[AutoControl] Current time: {now.strftime('%H:%M:%S')} ({'after' if is_past_sunset else 'before'} sunset)")
-        print(f"[AutoControl] Current state: SOC={soc:.1f}%, PV={pv_power:.0f}W, Miner={'OFF' if is_miner_off else f'{miner_power}W'}")
+        print(f"[AutoControl] Current state: SOC={soc:.1f}%, PV={pv_power:.0f}W, Miner={'OFF' if is_miner_off else 'ON'}")
 
         # PRIORITY 1: Emergency Shutdown
         if soc < self.emergency_soc:
@@ -455,4 +477,7 @@ class AutoControlService:
             "current_state_description": self.current_state_description,
             "sunset_time": sunset_time.strftime('%H:%M:%S') if sunset_time else "Unknown",
             "is_past_sunset": self._is_past_sunset(),
+            "emergency_soc": self.emergency_soc,
+            "battery_fresh": self.battery.is_fresh(),
+            "battery_age_seconds": self.battery.get_battery_age_seconds(),
         }

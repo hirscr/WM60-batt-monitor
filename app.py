@@ -284,26 +284,32 @@ def set_miner_power_pct():
     print(f"[API] Time: {datetime.now().isoformat()}")
     print("="*60)
 
-    miner_service.set_power_pct(percent)
-    state_mgr.save(target_power_pct=percent)
+    # State is only committed after MinerController verification succeeds.
+    # Pass a callback so wm_state.json is updated only on confirmed execution.
+    def _on_verified():
+        state_mgr.save(target_power_pct=percent, miner_power_state="running")
 
-    print(f"[API] ✓ Command enqueued to miner service")
+    miner_service.set_power_pct(percent, on_verified=_on_verified)
+
+    print(f"[API] ✓ Command enqueued to miner service (state pending verification)")
     print("="*60 + "\n")
 
-    return jsonify({"ok": True, "percent": percent, "watts": watts})
+    return jsonify({"ok": True, "percent": percent, "watts": watts, "status": "pending"})
 
 @app.post("/api/miner/power_on")
 def miner_power_on():
     """Turn miner on."""
-    miner_service.power_on()
-    state_mgr.save(miner_power_state="running")
+    def _on_verified():
+        state_mgr.save(miner_power_state="running")
+    miner_service.power_on(on_verified=_on_verified)
     return jsonify({"ok": True})
 
 @app.post("/api/miner/power_off")
 def miner_power_off():
     """Turn miner off."""
-    miner_service.power_off()
-    state_mgr.save(miner_power_state="stopped")
+    def _on_verified():
+        state_mgr.save(miner_power_state="stopped")
+    miner_service.power_off(on_verified=_on_verified)
     return jsonify({"ok": True})
 
 @app.get("/api/miner/op_status")
@@ -444,22 +450,42 @@ def chart_data():
         if all_battery_rows:
             print(f"[ChartAPI] Sample battery timestamp (before): {all_battery_rows[0].get('ts')}")
 
-        # Create timestamp index for miner data with NORMALIZED timestamps
-        miner_by_ts = {}
-        for row in all_miner_rows:
+        # Build timestamp indexes: live rows are preferred over CSV rows at the same ts.
+        # Index CSV first, then overwrite with live rows, logging any collisions.
+        miner_by_ts: dict = {}
+        miner_csv_ts: set = set()
+        for row in miner_rows:
             ts = row.get('ts')
             if ts:
                 normalized_ts = normalize_timestamp(ts)
                 if normalized_ts:
                     miner_by_ts[normalized_ts] = row
-
-        # Create timestamp index for battery data with NORMALIZED timestamps
-        battery_by_ts = {}
-        for row in all_battery_rows:
+                    miner_csv_ts.add(normalized_ts)
+        for row in miner_live:
             ts = row.get('ts')
             if ts:
                 normalized_ts = normalize_timestamp(ts)
                 if normalized_ts:
+                    if normalized_ts in miner_csv_ts:
+                        print(f"[ChartAPI] Live miner row overwrites CSV row at ts={normalized_ts}")
+                    miner_by_ts[normalized_ts] = row
+
+        battery_by_ts: dict = {}
+        battery_csv_ts: set = set()
+        for row in battery_rows:
+            ts = row.get('ts')
+            if ts:
+                normalized_ts = normalize_timestamp(ts)
+                if normalized_ts:
+                    battery_by_ts[normalized_ts] = row
+                    battery_csv_ts.add(normalized_ts)
+        for row in battery_live:
+            ts = row.get('ts')
+            if ts:
+                normalized_ts = normalize_timestamp(ts)
+                if normalized_ts:
+                    if normalized_ts in battery_csv_ts:
+                        print(f"[ChartAPI] Live battery row overwrites CSV row at ts={normalized_ts}")
                     battery_by_ts[normalized_ts] = row
 
         # Log sample normalized timestamps
@@ -592,6 +618,27 @@ def autocontrol_set_mode():
         return jsonify({"ok": True, "mode": mode})
     else:
         return jsonify({"ok": False, "error": "Invalid mode or mode not implemented"}), 400
+
+@app.get("/api/autocontrol/emergency_soc")
+def get_emergency_soc():
+    """Get current emergency SOC threshold."""
+    return jsonify({"percent": autocontrol_service.get_emergency_soc()})
+
+@app.post("/api/autocontrol/emergency_soc")
+def set_emergency_soc():
+    """Set emergency SOC threshold (5-95%). Persisted across restarts."""
+    data = request.get_json() or {}
+    try:
+        percent = int(data.get("percent"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "percent must be an integer"}), 400
+
+    try:
+        autocontrol_service.set_emergency_soc(percent)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify({"ok": True, "percent": autocontrol_service.get_emergency_soc()})
 
 # --- Network Routes ---
 @app.get("/api/network/devices")

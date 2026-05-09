@@ -41,17 +41,17 @@ class MinerController:
     def status_snapshot(self) -> Dict[str, Any]:
         return dict(self.state)
 
-    def enqueue_stop(self):
-        self.q.put(("stop", {}))
+    def enqueue_stop(self, on_verified=None):
+        self.q.put(("stop", {}, on_verified))
 
-    def enqueue_resume(self):
-        self.q.put(("resume", {}))
+    def enqueue_resume(self, on_verified=None):
+        self.q.put(("resume", {}, on_verified))
 
-    def enqueue_set_power_limit(self, watts: int):
-        self.q.put(("power_limit", {"watts": int(watts)}))
+    def enqueue_set_power_limit(self, watts: int, on_verified=None):
+        self.q.put(("power_limit", {"watts": int(watts)}, on_verified))
 
-    def enqueue_set_power_pct(self, percent: int):
-        self.q.put(("power_pct", {"percent": int(percent)}))
+    def enqueue_set_power_pct(self, percent: int, on_verified=None):
+        self.q.put(("power_pct", {"percent": int(percent)}, on_verified))
 
     def _verify(self, kind: str, req: Dict[str, Any]) -> bool:
         try:
@@ -72,7 +72,7 @@ class MinerController:
             return False
         return True
 
-    def _run_op(self, kind: str, req: Dict[str, Any]):
+    def _run_op(self, kind: str, req: Dict[str, Any], on_verified=None):
         self.state.update({
             "op_state": "applying",
             "op_kind": kind,
@@ -121,6 +121,12 @@ class MinerController:
                 raise RuntimeError(f"verification failed for {kind}")
             print(f"[MinerController] ✓ Verification passed for {kind}")
 
+            if on_verified:
+                try:
+                    on_verified()
+                except Exception as cb_err:
+                    print(f"[MinerController] on_verified callback error: {cb_err}")
+
             self.state["op_state"] = "idle"
         except Exception as e:
             self.state["op_state"] = "error"
@@ -128,9 +134,12 @@ class MinerController:
 
     def _worker(self):
         while True:
-            kind, req = self.q.get()
+            item = self.q.get()
+            kind = item[0]
+            req = item[1]
+            on_verified = item[2] if len(item) > 2 else None
             try:
-                self._run_op(kind, req)
+                self._run_op(kind, req, on_verified=on_verified)
             finally:
                 self.q.task_done()
 
@@ -166,6 +175,9 @@ class MinerService:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_log_ts = 0.0  # Start at 0 so first data point logs immediately
+
+        # is_off: True until confirmed hashing. Starts conservative (safe default).
+        self._is_off: bool = True
 
         # Connection status tracking
         self.connection_status = ConnectionStatus(connected=False)
@@ -228,13 +240,76 @@ class MinerService:
                     for k, v in item.items():
                         row[str(k)] = v
 
-                    # Compute Hashrate (TH/s)
-                    hr_ths = self._extract_hashrate_ths(item)
+                    # --- Hashrate 5s (MHS 5s / 1e6) ---
+                    try:
+                        mhs_5s = float(item.get("MHS 5s") or 0)
+                        row["Hashrate 5s"] = round(mhs_5s / 1_000_000.0, 1) if mhs_5s > 0 else None
+                    except (TypeError, ValueError):
+                        row["Hashrate 5s"] = None
+
+                    # --- Hashrate (prefer MHS 5m for chart smoothness; fallback to best available) ---
+                    try:
+                        mhs_5m = float(item.get("MHS 5m") or 0)
+                        hashrate_5m = round(mhs_5m / 1_000_000.0, 1) if mhs_5m > 0 else None
+                    except (TypeError, ValueError):
+                        hashrate_5m = None
+                    hr_ths = hashrate_5m if hashrate_5m is not None else self._extract_hashrate_ths(item)
                     row["Hashrate"] = round(hr_ths, 1) if hr_ths is not None else None
+
+                    # --- Power 5s (real-time PSU pin reading) ---
+                    power_5s = None
+                    try:
+                        if not self.use_async:
+                            psu_reply = self.api.get_psu()
+                        else:
+                            psu_reply = asyncio.run(self.api.get_psu())
+                        psu_list = psu_reply.get("PSU") or [] if psu_reply else []
+                        psu_item = psu_list[0] if psu_list and isinstance(psu_list[0], dict) else {}
+                        pin_val = psu_item.get("pin")
+                        if pin_val is not None:
+                            power_5s = round(float(pin_val), 0)
+                    except Exception as e:
+                        print(f"[MinerService] get_psu failed (non-fatal): {e}")
+                    row["Power 5s"] = power_5s
+
+                    # --- is_off: authoritative composite detection ---
+                    # 1. Try 'status' command for mineroff field (most authoritative)
+                    is_off_from_status = None
+                    try:
+                        if not self.use_async:
+                            status_reply = self.api.miner_status_cmd()
+                        else:
+                            status_reply = asyncio.run(self.api.send_command("status"))
+                        if status_reply:
+                            mining_list = status_reply.get("MINING") or []
+                            mining_info = mining_list[0] if mining_list and isinstance(mining_list[0], dict) else {}
+                            mineroff_val = str(mining_info.get("mineroff", "")).lower()
+                            if mineroff_val == "true":
+                                is_off_from_status = True
+                            elif mineroff_val == "false":
+                                is_off_from_status = False
+                    except Exception as e:
+                        print(f"[MinerService] status command failed (using fallback): {e}")
+
+                    if is_off_from_status is not None:
+                        self._is_off = is_off_from_status
+                    elif item.get("is_mining") is not None:
+                        # pyasic-normalized field
+                        self._is_off = item.get("is_mining") is False
+                    elif self._safe_int(item, "Power Limit") == 0:
+                        self._is_off = True
+                    else:
+                        try:
+                            mhs_5s_check = float(item.get("MHS 5s") or 0)
+                            self._is_off = (mhs_5s_check == 0.0)
+                        except (TypeError, ValueError):
+                            self._is_off = False
+
+                    row["is_off"] = self._is_off
 
                     # Compute Efficiency (W/TH)
                     pwr = row.get("Power")
-                    if isinstance(pwr, (int, float)) or (isinstance(pwr, str) and pwr.isdigit()):
+                    if isinstance(pwr, (int, float)) or (isinstance(pwr, str) and str(pwr).isdigit()):
                         pwr_val = float(pwr)
                     else:
                         pwr_val = None
@@ -257,7 +332,7 @@ class MinerService:
                     hr_display = f"{hr_ths:.1f}" if hr_ths is not None else "—"
                     pwr_display = f"{pwr_val:.0f}" if pwr_val is not None else "—"
                     print(f"[MinerService] Poll successful: {hr_display}TH/s, {pwr_display}W")
-                    print(f"[MinerService] Sending update to UI: {row.get('Hashrate')}TH/s, {row.get('Power')}W")
+                    print(f"[MinerService] Sending update to UI: {row.get('Hashrate')}TH/s, {row.get('Hashrate 5s')}TH/s(5s), {row.get('Power')}W, {row.get('Power 5s')}W(5s), is_off={self._is_off}")
                 else:
                     print(f"[MinerService] No data in summary response")
 
@@ -295,25 +370,30 @@ class MinerService:
         }
 
     # Control methods
-    def set_power_limit(self, watts: int):
+    def set_power_limit(self, watts: int, on_verified=None):
         """Set power limit in watts."""
-        self.controller.enqueue_set_power_limit(watts)
+        self.controller.enqueue_set_power_limit(watts, on_verified=on_verified)
 
-    def set_power_pct(self, percent: int):
+    def set_power_pct(self, percent: int, on_verified=None):
         """Set power percent (0-100)."""
-        self.controller.enqueue_set_power_pct(percent)
+        self.controller.enqueue_set_power_pct(percent, on_verified=on_verified)
 
-    def power_on(self):
+    def power_on(self, on_verified=None):
         """Turn miner on."""
-        self.controller.enqueue_resume()
+        self.controller.enqueue_resume(on_verified=on_verified)
 
-    def power_off(self):
+    def power_off(self, on_verified=None):
         """Turn miner off."""
-        self.controller.enqueue_stop()
+        self.controller.enqueue_stop(on_verified=on_verified)
 
     def get_op_status(self) -> dict:
         """Get operation status."""
         return self.controller.status_snapshot()
+
+    @property
+    def is_off(self) -> bool:
+        """True if miner is confirmed off (conservative: defaults to True until first poll)."""
+        return self._is_off
 
     # Helper methods
     def _now_iso(self):
