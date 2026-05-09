@@ -136,3 +136,81 @@ A systemd drop-in was created at `/etc/systemd/system/whatsminer.service.d/env.c
 
 - **Battery pack_voltage_v / pack_current_a**: these fields ARE present in the battery API response (confirmed in journal: `pack_voltage_v: 53.0, pack_current_a: 43.0`). The frontend renders them, but the `<span>` IDs were added to the HTML only. No backend change needed.
 - **Per-unit battery SOC list**: the `batteryUnitSoc` element is present but the backend `status` dict returns `units` as a Python list of dicts, not a pre-formatted string. The JS checks `status.unit_soc` which will be undefined for now — the `<details>` section will show `—`. A future enhancement could format this server-side or client-side from the `units` array.
+
+---
+
+## Stop-reason indicator shipped on 2026-05-09
+
+### Commits
+
+| SHA | Description |
+|-----|-------------|
+| `e99323f` | feat: add stop-reason indicator to Miner Control dashboard card |
+
+### What was done
+
+**Backend — `services/autocontrol_service.py`**
+- Added `stop_reason` (str) and `resume_at_soc` (Optional[int]) instance variables, initialized to `"normal"` and `None`.
+- Set `stop_reason = "emergency_soc"` and `resume_at_soc = self.emergency_soc` in Priority 1 (emergency shutdown).
+- Set `stop_reason = "normal"` and `resume_at_soc = None` in Priorities 2–5 (all running conditions).
+- Updated `get_state()` to derive the effective stop_reason for the dashboard:
+  - If autocontrol disabled: `"manual_off"` when `miner.is_off`, else `"normal"`.
+  - If autocontrol enabled and emergency_soc: `"emergency_soc"` with `resume_at_soc`.
+  - If autocontrol enabled and miner on but `upfreq_complete == 0`: `"ramping"`.
+  - If autocontrol enabled and miner on and `upfreq_complete == 1`: `"normal"`.
+- Both `stop_reason` and `resume_at_soc` are returned in `/api/autocontrol/status`.
+
+**Backend — `services/miner_service.py`**
+- Extracts `"Upfreq Complete"` from the miner SUMMARY response; stores as `upfreq_complete` (int, 0 or 1, defaults to 0).
+- Automatically exposed via the existing `/api/miner/status` → `status` dict.
+
+**Frontend — `static/index.html`**
+- Added `<div id="minerStopReason">` banner between the autoModeStatus box and the status-grid, hidden by default.
+
+**Frontend — `static/js/dashboard.js`**
+- Added `state.lastMinerStatus` and `state.lastAutocontrolStatus` caches.
+- Added `updateMinerStopReasonBanner()`:
+  - Hide condition: `upfreq_complete == 1` AND `abs(power_5s - target_w) / target_w <= 0.10`.
+  - Show when: `upfreq_complete == 0` OR `stop_reason != "normal"`.
+  - Colors: amber (`emergency_soc`), gray (`manual_off`), blue (`ramping`/upfreq=0), yellow (fallback).
+- Called from `updateMinerStatus()` and `updateAutoControlStatus()`.
+
+### Live values at end of run (2026-05-09 18:24 EDT)
+
+- `upfreq_complete`: `0` (miner stopped — battery telemetry stale, safety stop active)
+- `stop_reason`: `"normal"` (stale-battery path does not set stop_reason — see deferred items)
+- `resume_at_soc`: `null`
+- Service: `active (running)`
+
+### Self-verification results
+
+1. `GET /api/autocontrol/status` — includes `stop_reason` and `resume_at_soc` ✓
+2. `GET /api/miner/status` — includes `upfreq_complete: 0` ✓
+3. `sudo systemctl status whatsminer` — `active (running)` ✓
+4. Battery and miner data updating normally in journal ✓
+5. `grep minerStopReason` in deployed HTML — found at line 82 ✓
+
+### Deferred items
+
+- ~~The stale-battery safety path in `_away_mode_control` does not set `stop_reason`; could add `"battery_stale"` reason if desired.~~ **Shipped 2026-05-09 — see section below.**
+- ~~When autocontrol is enabled but battery is stale (miner stopped by safety gate), `stop_reason` stays at its last value (`"normal"` at startup). The banner will not show in this state unless `upfreq_complete == 0` triggers it — which it does since the miner is off.~~ **Resolved — stop_reason is now explicitly set to `battery_stale`.**
+
+---
+
+## battery_stale stop reason shipped on 2026-05-09
+
+| SHA | Description |
+|-----|-------------|
+| `81f2c03` | feat: set stop_reason=battery_stale when safety gate fires |
+
+**What changed:**
+- `services/autocontrol_service.py`: The battery freshness safety gate in `_away_mode_control` now sets `self.stop_reason = "battery_stale"` and `self.resume_at_soc = None` before calling `power_off()`. The existing priority branches (2–5) already set `stop_reason = "normal"`, so recovery is automatic when telemetry becomes fresh.
+- `static/js/dashboard.js`: Added `battery_stale` case to `updateMinerStopReasonBanner()` — orange/red banner (`bg: #ffe0cc, color: #7d2b00`) with text "Miner paused — battery telemetry stale. Waiting for fresh data."
+
+**Self-verification passed:**
+1. `GET /api/autocontrol/status` — `stop_reason: "battery_stale"` confirmed at startup (before first EG4 poll) ✓
+2. `grep battery_stale /home/hirscr/WM_controller/static/js/dashboard.js` — found at line 837 ✓
+3. `sudo systemctl status whatsminer` — `active (running)` ✓
+4. Battery and miner polling updating normally in journal ✓
+
+**Deferred items:** None.
