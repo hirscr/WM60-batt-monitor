@@ -8,6 +8,8 @@ Supports two encrypted privileged command formats:
 """
 import subprocess
 import json
+import threading
+import time
 from typing import Optional, Dict, Any
 from passlib.hash import md5_crypt
 
@@ -20,6 +22,17 @@ class NCMinerAPI:
         self.port = port
         self.timeout = timeout
         self.pwd = password  # Store password for privileged commands
+        # Serializes all privileged operations. Prevents concurrent get_token calls
+        # from invalidating each other's auth sessions — the firmware resets its
+        # session clock on every get_token, so two overlapping calls cause the first
+        # AES payload to arrive with a stale time value ("enc json load err").
+        self._priv_lock = threading.Lock()
+        # Timestamp of the last get_token nc call (success or failure). Used by
+        # get_token() to enforce a 185s minimum interval between calls. The firmware
+        # resets its 180s privileged session timer on every get_token call, including
+        # "over max connect" failures — so repeated calls within the window extend
+        # the lock indefinitely. Rate-limiting prevents this.
+        self._last_get_token_at: float = 0.0
 
     def _send_command(self, command: str) -> Optional[Dict[str, Any]]:
         """Send command to miner via nc."""
@@ -63,14 +76,14 @@ class NCMinerAPI:
         return result if result else {}
 
     def power_off(self):
-        """Power off miner using AES-encrypted privileged command."""
-        return self.send_aes_privileged_command("power_off", respbefore="true")
+        """Power off miner via AES power_off (no respbefore — that parameter causes enc json load err on this firmware)."""
+        return self.send_aes_privileged_command("power_off")
 
     def power_on(self):
         """Power on miner using AES-encrypted privileged command."""
         return self.send_aes_privileged_command("power_on")
 
-    def _get_token_with_retry(self, max_attempts: int = 3) -> Optional[Dict[str, Any]]:
+    def _get_token_with_retry(self, max_attempts: int = 1) -> Optional[Dict[str, Any]]:
         """
         Fetch authentication token, waiting if the miner reports "over max connect".
 
@@ -88,7 +101,6 @@ class NCMinerAPI:
         Returns:
             Token response dict on success, None if all attempts fail.
         """
-        import time as _time
         SESSION_TIMEOUT_SEC = 185  # Slightly more than observed ~180s firmware timeout
 
         for attempt in range(max_attempts):
@@ -97,7 +109,7 @@ class NCMinerAPI:
                 print(f"[NCMinerAPI] get_token returned None (attempt {attempt+1}/{max_attempts})")
                 if attempt + 1 < max_attempts:
                     print(f"[NCMinerAPI] Sleeping {SESSION_TIMEOUT_SEC}s for session to expire...")
-                    _time.sleep(SESSION_TIMEOUT_SEC)
+                    time.sleep(SESSION_TIMEOUT_SEC)
                 continue
 
             msg = token_response.get("Msg", {})
@@ -110,8 +122,16 @@ class NCMinerAPI:
             # Error case — "over max connect" or other
             err_msg = msg if isinstance(msg, str) else token_response.get("Msg", "unknown")
             if attempt + 1 < max_attempts:
-                print(f"[NCMinerAPI] Token blocked ({err_msg}), sleeping {SESSION_TIMEOUT_SEC}s for session to expire (attempt {attempt+1}/{max_attempts})...")
-                _time.sleep(SESSION_TIMEOUT_SEC)
+                # Local rate-limit returns immediately without making an nc call, so
+                # the firmware timer hasn't been reset. Sleep only the remaining window
+                # time (not the full 185s) so we don't overshoot needlessly.
+                if "local rate limit" in err_msg:
+                    elapsed = time.time() - self._last_get_token_at
+                    sleep_sec = max(1, int(SESSION_TIMEOUT_SEC - elapsed) + 2)
+                else:
+                    sleep_sec = SESSION_TIMEOUT_SEC
+                print(f"[NCMinerAPI] Token blocked ({err_msg}), sleeping {sleep_sec}s for session to expire (attempt {attempt+1}/{max_attempts})...")
+                time.sleep(sleep_sec)
             else:
                 print(f"[NCMinerAPI] ✗ Token blocked ({err_msg}) on final attempt {attempt+1}/{max_attempts}")
 
@@ -119,7 +139,19 @@ class NCMinerAPI:
         return None
 
     def get_token(self) -> Optional[Dict[str, Any]]:
-        """Get authentication token from miner."""
+        """Get authentication token from miner.
+        Rate-limited: at most one nc call per 185s. Each call (success or failure)
+        resets the firmware's 180s privileged-session timer; repeated calls within
+        the window extend the lock indefinitely. Calls within 185s of the last one
+        return a synthetic blocked response immediately — no nc call, no extension.
+        """
+        now = time.time()
+        elapsed = now - self._last_get_token_at
+        if self._last_get_token_at > 0 and elapsed < 185:
+            remaining = int(185 - elapsed)
+            print(f"[NCMinerAPI] get_token rate-limited ({elapsed:.0f}s since last call, ~{remaining}s until allowed)")
+            return {"STATUS": "E", "Msg": "over max connect (local rate limit)"}
+        self._last_get_token_at = now
         return self._send_command("get_token")
 
     def _encrypt_password(self, salt: str) -> str:
@@ -129,13 +161,17 @@ class NCMinerAPI:
         # Use MD5 crypt (same format as pyasic: $1$salt$hash)
         return md5_crypt.using(salt=salt).hash(self.pwd)
 
-    def send_aes_privileged_command(self, command: str, **params) -> Dict[str, Any]:
+    def send_aes_privileged_command(self, command: str, _token_max_attempts: int = 2, **params) -> Dict[str, Any]:
         """
         Send a privileged command using pyasic's AES envelope format.
 
         Required for power_off and power_on on firmware 20240605.01.REL.
         The MD5-crypt inline format (send_privileged_command) returns "invalid data"
         for those commands; the AES envelope is the only accepted format.
+
+        _token_max_attempts: how many times to try get_token before giving up.
+          Use 1 for emergency calls to fail fast instead of sleeping 185s on lock contention.
+          Use 2 (default) for normal calls where waiting one session timeout is acceptable.
 
         The command is:
           1. Get token (get_token) for salt/time/newsalt
@@ -155,10 +191,21 @@ class NCMinerAPI:
             print(f"[NCMinerAPI] ✗ Cannot import pyasic for AES encryption: {e}")
             return {"STATUS": [{"STATUS": "E", "Msg": f"pyasic not available: {e}"}]}
 
+        # Acquire the privileged-op lock to prevent concurrent get_token calls.
+        # Two overlapping calls each reset the firmware's session clock; the first
+        # AES payload then arrives with a stale time value → "enc json load err".
+        # Timeout of 15s: in the worst case a concurrent op holds the lock for ~6s
+        # (nc timeout + crypto). If we can't acquire in 15s, proceed without the
+        # lock (likely means a caller is stuck in a 185s session-wait sleep).
+        _lock_acquired = self._priv_lock.acquire(timeout=15)
+        if not _lock_acquired:
+            print(f"[NCMinerAPI] WARNING: priv_lock timed out — concurrent privileged op is still in progress")
+
         try:
-            # Step 1: Get token (with retry if session is busy)
+            # Step 1: Get token. max_attempts controls retry behavior on lock contention.
+            # For emergency calls use _token_max_attempts=1 to fail fast without sleeping 185s.
             print(f"[NCMinerAPI] Step 1: Getting authentication token...")
-            token_response = self._get_token_with_retry()
+            token_response = self._get_token_with_retry(max_attempts=_token_max_attempts)
 
             if not token_response:
                 return {"STATUS": [{"STATUS": "E", "Msg": "Timed out waiting for auth session"}]}
@@ -198,8 +245,7 @@ class NCMinerAPI:
             print(f"[NCMinerAPI] AES payload built ({len(enc_payload)} bytes)")
 
             # Brief pause to allow get_token connection to close before opening new one
-            import time as _time
-            _time.sleep(0.5)
+            time.sleep(0.5)
 
             # Step 4: Send via nc
             result = subprocess.run(
@@ -236,6 +282,9 @@ class NCMinerAPI:
             import traceback
             traceback.print_exc()
             return {"STATUS": [{"STATUS": "E", "Msg": str(e)}]}
+        finally:
+            if _lock_acquired:
+                self._priv_lock.release()
 
     def send_privileged_command(self, command: str, **params) -> Dict[str, Any]:
         """
@@ -252,6 +301,10 @@ class NCMinerAPI:
             return {"STATUS": [{"STATUS": "E", "Msg": "Password not configured"}]}
 
         print(f"[NCMinerAPI] Sending privileged command: {command}")
+
+        _lock_acquired = self._priv_lock.acquire(timeout=15)
+        if not _lock_acquired:
+            print(f"[NCMinerAPI] WARNING: priv_lock timed out — concurrent privileged op is still in progress")
 
         try:
             # Step 1: Get token (with retry if session is busy)
@@ -346,6 +399,9 @@ class NCMinerAPI:
             import traceback
             traceback.print_exc()
             return {"STATUS": [{"STATUS": "E", "Msg": str(e)}]}
+        finally:
+            if _lock_acquired:
+                self._priv_lock.release()
 
     def miner_status_cmd(self) -> Dict[str, Any]:
         """Send 'status' command — returns MINING[0].mineroff for authoritative is_off detection."""

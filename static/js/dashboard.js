@@ -17,7 +17,11 @@ const state = {
   debugLogs: [],  // Keep last 200 log messages
   // Cache for stop-reason banner evaluation
   lastMinerStatus: null,
-  lastAutocontrolStatus: null
+  lastAutocontrolStatus: null,
+  // Pending power action state for transitional UI (Layer 8)
+  pendingPowerAction: null,    // null | 'shutting_down' | 'powering_up'
+  pendingPowerStart: 0,
+  pendingPowerRetries: 0,
 };
 
 // Debug console functions
@@ -838,6 +842,10 @@ function updateMinerStopReasonBanner() {
     text = 'Miner paused — battery telemetry stale. Waiting for fresh data.';
     bg = '#ffe0cc';
     color = '#7d2b00';
+  } else if (stopReason === 'emergency_unverified') {
+    text = '⚠ EMERGENCY: miner failed to stop below emergency SOC. Retrying.';
+    bg = '#f8d7da';
+    color = '#721c24';
   } else if (stopReason === 'emergency_soc') {
     const resumeStr = (resumeAtSoc != null) ? resumeAtSoc + '%' : '—';
     text = 'Miner paused — battery below minimum SOC. Resuming at ' + resumeStr + '.';
@@ -958,9 +966,52 @@ function updateMinerStatus(data) {
     document.getElementById('minerFan').textContent = fanSpeed + ' RPM';
   }
 
-  // Update power toggle
+  // Update power toggle — use is_off (backend field); is_mining doesn't exist
   const powerToggle = document.getElementById('minerPowerToggle');
-  powerToggle.checked = status.is_mining !== false;
+  if (!state.pendingPowerAction) {
+    powerToggle.checked = status.is_off === false;
+    powerToggle.disabled = false;
+  }
+
+  // Resolve pending power actions based on real miner state
+  if (state.pendingPowerAction === 'shutting_down') {
+    const verifiedOff = status.is_off === true || (status['Power Limit'] == 0 && status['MHS 5s'] == 0);
+    if (verifiedOff) {
+      _clearPendingPower(false);
+    } else {
+      const elapsed = Date.now() - state.pendingPowerStart;
+      if (elapsed > 60000) {
+        if ((state.pendingPowerRetries || 0) < 3) {
+          state.pendingPowerRetries = (state.pendingPowerRetries || 0) + 1;
+          fetch('/api/miner/power_off', { method: 'POST' }).catch(() => {});
+          state.pendingPowerStart = Date.now();
+          _setPendingPowerIndicator('Shutdown failed — retrying', '#dc3545');
+        } else {
+          _clearPendingPower(false, 'Shutdown failed after 3 retries');
+        }
+      }
+    }
+  } else if (state.pendingPowerAction === 'powering_up') {
+    const autoStatus = state.lastAutocontrolStatus || {};
+    const targetW = autoStatus.target_w || 0;
+    const currentPower = parseFloat(status['Power'] || 0);
+    const poweredUp = targetW > 0 ? currentPower >= 0.9 * targetW : status.is_off === false;
+    if (poweredUp) {
+      _clearPendingPower(true);
+    } else {
+      const elapsed = Date.now() - state.pendingPowerStart;
+      if (elapsed > 120000) {
+        if ((state.pendingPowerRetries || 0) < 3) {
+          state.pendingPowerRetries = (state.pendingPowerRetries || 0) + 1;
+          fetch('/api/miner/power_on', { method: 'POST' }).catch(() => {});
+          state.pendingPowerStart = Date.now();
+          _setPendingPowerIndicator('Power-up failed — retrying', '#dc3545');
+        } else {
+          _clearPendingPower(true, 'Power-up failed after 3 retries');
+        }
+      }
+    }
+  }
 
   updateMinerStopReasonBanner();
 }
@@ -1284,15 +1335,53 @@ function updateNetworkDevices(data) {
   }
 }
 
+// Pending power action helpers (Layer 8 transitional UI)
+function _setPendingPowerIndicator(text, color) {
+  let el = document.getElementById('powerActionIndicator');
+  if (!el) {
+    el = document.createElement('span');
+    el.id = 'powerActionIndicator';
+    el.style.cssText = 'margin-left:8px;font-size:0.85em;font-weight:500;';
+    const toggle = document.getElementById('minerPowerToggle');
+    if (toggle && toggle.parentNode) toggle.parentNode.appendChild(el);
+  }
+  el.textContent = text;
+  el.style.color = color || '#6c757d';
+}
+
+function _clearPendingPower(checkedState, errorMsg) {
+  state.pendingPowerAction = null;
+  state.pendingPowerStart = 0;
+  state.pendingPowerRetries = 0;
+  const toggle = document.getElementById('minerPowerToggle');
+  if (toggle) {
+    toggle.checked = checkedState;
+    toggle.disabled = false;
+  }
+  const el = document.getElementById('powerActionIndicator');
+  if (el) {
+    el.textContent = errorMsg || '';
+    el.style.color = errorMsg ? '#dc3545' : '';
+    if (!errorMsg) setTimeout(() => { if (el) el.textContent = ''; }, 2000);
+  }
+}
+
 // Setup event listeners
 function setupEventListeners() {
-  // Power toggle
+  // Power toggle with transitional UI (Layer 8)
   document.getElementById('minerPowerToggle').addEventListener('change', async (e) => {
-    const endpoint = e.target.checked ? '/api/miner/power_on' : '/api/miner/power_off';
+    const intendOn = e.target.checked;
+    const endpoint = intendOn ? '/api/miner/power_on' : '/api/miner/power_off';
+    state.pendingPowerAction = intendOn ? 'powering_up' : 'shutting_down';
+    state.pendingPowerStart = Date.now();
+    state.pendingPowerRetries = 0;
+    e.target.disabled = true;
+    _setPendingPowerIndicator(intendOn ? 'Powering up…' : 'Shutting down…', '#6c757d');
     try {
       await fetch(endpoint, { method: 'POST' });
     } catch (err) {
       addError('Power toggle error: ' + err.message);
+      _clearPendingPower(!intendOn);
     }
   });
 

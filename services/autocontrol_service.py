@@ -97,13 +97,25 @@ class AutoControlService:
         self.current_state_description = "Initializing"
 
         # Stop-reason tracking (surfaced to the dashboard)
-        # Values: "emergency_soc", "manual_off", "ramping", "normal"
+        # Values: "emergency_soc", "emergency_unverified", "manual_off", "ramping", "normal"
         self.stop_reason: str = "normal"
         self.resume_at_soc: Optional[int] = None
+
+        # Emergency latch state — persisted so it survives service restart
+        self.emergency_active: bool = bool(saved_state.get("emergency_active", False))
+        self.emergency_verified_off: bool = False
+        self.emergency_attempts_this_latch: int = 0
 
         # Cache today's sunset
         self._cached_sunset_date: Optional[date] = None
         self._cached_sunset_time: Optional[datetime] = None
+
+        # Grace period after any privileged command. Prevents autocontrol from
+        # re-issuing power_on during the ~60-90s firmware chip recalibration that
+        # follows adjust_power_limit, during which Power Limit and MHS 5s both
+        # read 0 (making is_off appear True even though the miner is reconfiguring).
+        _POST_CMD_GRACE_SEC = 120
+        self._post_cmd_grace_sec: int = _POST_CMD_GRACE_SEC
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -292,6 +304,13 @@ class AutoControlService:
             print("[AutoControl] No valid SOC data")
             return
 
+        # EMERGENCY LATCH: if already latched in emergency, only run the stop loop.
+        # All normal priority branches are short-circuited until SOC >= 90% and
+        # the miner has been confirmed off at least once this latch period.
+        if self.emergency_active:
+            self._run_emergency_latch_tick(soc)
+            return
+
         # Get sunset info
         sunset_time = self._get_sunset_time()
         is_past_sunset = self._is_past_sunset()
@@ -306,25 +325,9 @@ class AutoControlService:
         print(f"[AutoControl] Current time: {now.strftime('%H:%M:%S')} ({'after' if is_past_sunset else 'before'} sunset)")
         print(f"[AutoControl] Current state: SOC={soc:.1f}%, PV={pv_power:.0f}W, Miner={'OFF' if is_miner_off else 'ON'}")
 
-        # PRIORITY 1: Emergency Shutdown
+        # PRIORITY 1: Emergency Shutdown (trips the emergency latch)
         if soc < self.emergency_soc:
-            self.target_pct = 0
-            self.target_w = 0
-            self.current_state_description = f"Emergency shutdown - SOC below {self.emergency_soc}%"
-            self.stop_reason = "emergency_soc"
-            self.resume_at_soc = self.emergency_soc
-
-            print(f"[AutoControl] Condition met: Emergency shutdown (SOC < {self.emergency_soc}%)")
-            print(f"[AutoControl] Target power: 0% (0W)")
-            print(f"[AutoControl] Sending power off command...")
-
-            self.miner.power_off()
-            self.state.save(miner_power_state="stopped", target_power_pct=0)
-            self.last_set_ts = time.time()
-
-            print(f"[AutoControl] ✓ Miner powered off")
-            print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
-            print(f"{'='*60}\n")
+            self._trip_emergency(soc)
             return
 
         # PRIORITY 2: Full Power (SOC > 99% AND PV > max_pv_power)
@@ -345,8 +348,15 @@ class AutoControlService:
             # The next tick will re-evaluate; once is_off=False, we fall through to
             # the rate-limited power adjustment below.
             if is_miner_off:
+                if self._in_post_cmd_grace_period():
+                    elapsed = int(time.time() - self.last_set_ts)
+                    print(f"[AutoControl] Post-command grace period ({elapsed}s of {self._post_cmd_grace_sec}s) — miner may be recalibrating, skipping power_on")
+                    print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+                    print(f"{'='*60}\n")
+                    return
                 print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
                 self.miner.power_on()
+                self.last_set_ts = time.time()
                 self.state.save(miner_power_state="running")
                 time.sleep(2)  # Brief delay for power-on
                 print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
@@ -372,8 +382,15 @@ class AutoControlService:
             # Ensure miner is on. If we have to power it on, do ONLY that this tick
             # (see PRIORITY 2 comment for rationale).
             if is_miner_off:
+                if self._in_post_cmd_grace_period():
+                    elapsed = int(time.time() - self.last_set_ts)
+                    print(f"[AutoControl] Post-command grace period ({elapsed}s of {self._post_cmd_grace_sec}s) — miner may be recalibrating, skipping power_on")
+                    print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+                    print(f"{'='*60}\n")
+                    return
                 print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
                 self.miner.power_on()
+                self.last_set_ts = time.time()
                 self.state.save(miner_power_state="running")
                 time.sleep(2)
                 print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
@@ -398,10 +415,17 @@ class AutoControlService:
             print(f"[AutoControl] Condition met: After sunset startup")
             print(f"[AutoControl] Time is after sunset AND SOC > {self.after_sunset_min_soc}% AND miner is off")
             print(f"[AutoControl] Target power: {tier_pct}% ({self.target_w}W) based on SOC tier")
-            print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
 
             # One privileged op per tick when miner is off — see PRIORITY 2 comment.
+            if self._in_post_cmd_grace_period():
+                elapsed = int(time.time() - self.last_set_ts)
+                print(f"[AutoControl] Post-command grace period ({elapsed}s of {self._post_cmd_grace_sec}s) — miner may be recalibrating, skipping power_on")
+                print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+                print(f"{'='*60}\n")
+                return
+            print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
             self.miner.power_on()
+            self.last_set_ts = time.time()
             self.state.save(miner_power_state="running")
             time.sleep(2)  # Brief delay
             print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
@@ -423,8 +447,15 @@ class AutoControlService:
         # Ensure miner is on if target > 0. If we have to power it on, do ONLY that
         # this tick — see PRIORITY 2 comment for rationale (firmware lock contention).
         if tier_pct > 0 and is_miner_off:
+            if self._in_post_cmd_grace_period():
+                elapsed = int(time.time() - self.last_set_ts)
+                print(f"[AutoControl] Post-command grace period ({elapsed}s of {self._post_cmd_grace_sec}s) — miner may be recalibrating, skipping power_on")
+                print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+                print(f"{'='*60}\n")
+                return
             print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
             self.miner.power_on()
+            self.last_set_ts = time.time()
             self.state.save(miner_power_state="running")
             time.sleep(2)
             print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
@@ -434,6 +465,117 @@ class AutoControlService:
         self._set_power_with_rate_limit(tier_pct)
         print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
         print(f"{'='*60}\n")
+
+    # ---- Emergency helpers ----
+
+    def _trip_emergency(self, soc: float):
+        """Trip emergency latch on first SOC-below-threshold detection."""
+        self.target_pct = 0
+        self.target_w = 0
+        self.current_state_description = f"Emergency shutdown - SOC below {self.emergency_soc}%"
+        self.stop_reason = "emergency_soc"
+        self.resume_at_soc = self.emergency_soc
+        self.last_set_ts = time.time()
+
+        print(f"[AutoControl] Condition met: Emergency shutdown (SOC={soc:.1f}% < {self.emergency_soc}%)")
+
+        if not self.emergency_active:
+            self.emergency_active = True
+            self.emergency_verified_off = False
+            self.emergency_attempts_this_latch = 0
+            self.state.save(emergency_active=True)
+            print(f"[AutoControl] Emergency latch SET")
+
+        print(f"[AutoControl] Draining queue and sending emergency power off...")
+        self.miner.controller.drain_queue()
+        verified = self._emergency_stop_with_verify()
+
+        if verified:
+            self.state.save(miner_power_state="stopped", target_power_pct=0)
+        else:
+            self.stop_reason = "emergency_unverified"
+
+        print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+        print(f"{'='*60}\n")
+
+    def _run_emergency_latch_tick(self, soc: float):
+        """One tick while emergency latch is active: re-check miner, re-stop if needed."""
+        print(f"[AutoControl] Emergency latch active — checking miner state (SOC={soc:.1f}%)")
+
+        if not self._check_verified_off():
+            print(f"[AutoControl] Miner not confirmed off — draining queue and re-stopping...")
+            self.miner.controller.drain_queue()
+            verified = self._emergency_stop_with_verify()
+            if not verified:
+                self.stop_reason = "emergency_unverified"
+        else:
+            self.stop_reason = "emergency_soc"
+
+        # Clear latch only when: verified-off succeeded this latch period AND SOC >= 90%
+        if self.emergency_verified_off and soc >= 90:
+            self.emergency_active = False
+            self.state.save(emergency_active=False)
+            print(f"[AutoControl] Emergency latch CLEARED (SOC={soc:.1f}% >= 90% and verified off)")
+
+    def _emergency_stop_with_verify(self) -> bool:
+        """Send emergency_power_off and verify via re-poll. Up to 5 attempts.
+        Returns True if verified-off condition is confirmed, False otherwise.
+        Logs success only after verification is confirmed.
+        """
+        for attempt in range(5):
+            self.emergency_attempts_this_latch += 1
+            accepted = self.miner.emergency_power_off()
+            print(f"[AutoControl] Emergency stop attempt {attempt + 1}/5 — command accepted: {accepted}")
+
+            # Wait up to 10s for miner to respond to the power-limit command
+            for _ in range(10):
+                time.sleep(1)
+                if self._check_verified_off():
+                    print(f"[AutoControl] ✓ Miner powered off (verified after attempt {attempt + 1})")
+                    self.emergency_verified_off = True
+                    return True
+
+            if attempt < 4:
+                print(f"[AutoControl] Not yet off — waiting 5s before retry...")
+                time.sleep(5)
+
+        print(f"[AutoControl] ✗✗✗ EMERGENCY STOP UNVERIFIED — MINER STILL RUNNING ✗✗✗")
+        return False
+
+    def _check_verified_off(self) -> bool:
+        """Check verified-off condition: MHS 5s==0, is_off==true.
+        Uses direct nc_api.summary() and miner_status_cmd() (both non-privileged, no token lock).
+        NOTE: Power Limit is always 0 on this firmware regardless of miner state;
+        do not use it as a stop indicator.
+        """
+        try:
+            nc_api = self.miner.api
+            summ = nc_api.summary()
+            item = ((summ or {}).get("SUMMARY") or [{}])[0]
+            mhs_5s = float(item.get("MHS 5s") or 0)
+
+            if mhs_5s != 0.0:
+                print(f"[AutoControl] Verified-off check FAILED: MHS 5s={mhs_5s} (still hashing)")
+                return False
+
+            # MHS 5s is 0 — confirm is_off via status cmd if available
+            is_off = True
+            try:
+                status_reply = nc_api.miner_status_cmd()
+                mining_list = (status_reply or {}).get("MINING") or []
+                mining_info = mining_list[0] if mining_list and isinstance(mining_list[0], dict) else {}
+                mineroff_val = str(mining_info.get("mineroff", "")).lower()
+                if mineroff_val == "false":
+                    is_off = False
+                # If mineroff absent from response, trust MHS 5s == 0 above
+            except Exception:
+                pass
+
+            print(f"[AutoControl] Verified-off check: MHS 5s={mhs_5s}, is_off={is_off}")
+            return is_off
+        except Exception as e:
+            print(f"[AutoControl] _check_verified_off error: {e}")
+            return False
 
     def _calculate_soc_tier(self, soc: float) -> int:
         """
@@ -469,6 +611,14 @@ class AutoControlService:
         else:
             return 0
 
+    def _in_post_cmd_grace_period(self) -> bool:
+        """True within _post_cmd_grace_sec of the last queued privileged command.
+        During firmware chip recalibration after adjust_power_limit, the miner's
+        Power Limit and MHS 5s both read 0, making is_off appear True. This guard
+        prevents autocontrol from issuing a redundant power_on during that window.
+        """
+        return self.last_set_ts > 0 and (time.time() - self.last_set_ts) < self._post_cmd_grace_sec
+
     def _set_power_with_rate_limit(self, target_pct: int):
         """
         Set miner power with rate limiting.
@@ -498,6 +648,14 @@ class AutoControlService:
         except Exception as e:
             print(f"[AutoControl] ✗ Power adjustment failed: {e}")
 
+    def force_tick(self):
+        """Force a single _away_mode_control evaluation outside the normal loop.
+        Used by test endpoints only. Not thread-safe with the running control loop,
+        but the loop sleeps min_interval_sec between ticks, making collision unlikely.
+        """
+        if self.mode == "away":
+            self._away_mode_control()
+
     def get_state(self) -> Dict[str, Any]:
         """Get current auto-control state for debugging and display."""
         sunset_time = self._get_sunset_time()
@@ -512,6 +670,9 @@ class AutoControlService:
         if not self.enabled:
             effective_stop_reason = "manual_off" if self.miner.is_off else "normal"
             effective_resume_at_soc = None
+        elif self.stop_reason == "emergency_unverified":
+            effective_stop_reason = "emergency_unverified"
+            effective_resume_at_soc = self.resume_at_soc
         elif self.stop_reason == "emergency_soc":
             effective_stop_reason = "emergency_soc"
             effective_resume_at_soc = self.resume_at_soc
@@ -542,4 +703,7 @@ class AutoControlService:
             "battery_age_seconds": self.battery.get_battery_age_seconds(),
             "stop_reason": effective_stop_reason,
             "resume_at_soc": effective_resume_at_soc,
+            "emergency_active": self.emergency_active,
+            "emergency_verified_off": self.emergency_verified_off,
+            "emergency_attempts_this_latch": self.emergency_attempts_this_latch,
         }

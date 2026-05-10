@@ -620,6 +620,49 @@ def autocontrol_disable():
     autocontrol_service.disable()
     return jsonify({"ok": True, "enabled": False})
 
+# --- Test-only Routes (LAN service, Tailscale-protected — no auth gating needed) ---
+
+@app.post("/api/test/trip_emergency")
+def test_trip_emergency():
+    """TEST-ONLY: Temporarily raise emergency_soc threshold above current SOC to trigger
+    a PRIORITY 1 emergency trip, then restore the original threshold.
+    Leaves emergency_active latch in whatever state the tick produced.
+    """
+    battery_snap = battery_service.get_status()
+    original_soc = battery_snap.get("soc_percent")
+    if original_soc is None:
+        return jsonify({"error": "No SOC data available"}), 503
+
+    original_threshold = autocontrol_service.get_emergency_soc()
+    trip_threshold = int(original_soc) + 5
+
+    autocontrol_service.emergency_soc = trip_threshold
+    try:
+        autocontrol_service.force_tick()
+    finally:
+        autocontrol_service.emergency_soc = original_threshold
+
+    return jsonify({
+        "original_soc": original_soc,
+        "trip_threshold": trip_threshold,
+        "tick_completed": True,
+        "emergency_active_after": autocontrol_service.emergency_active,
+    })
+
+
+@app.post("/api/test/clear_emergency")
+def test_clear_emergency():
+    """TEST-ONLY: Reset emergency_active latch. Does not change miner power state.
+    Do not call from production paths.
+    """
+    autocontrol_service.emergency_active = False
+    autocontrol_service.emergency_verified_off = False
+    autocontrol_service.emergency_attempts_this_latch = 0
+    autocontrol_service.stop_reason = "normal"
+    autocontrol_service.state.save(emergency_active=False)
+    return jsonify({"emergency_active": False, "note": "test-only reset; do not call from production paths"})
+
+
 @app.post("/api/autocontrol/set-mode")
 def autocontrol_set_mode():
     """Set auto-control mode (away or present)."""

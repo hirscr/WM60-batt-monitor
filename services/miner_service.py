@@ -58,18 +58,56 @@ class MinerController:
     def enqueue_set_power_pct(self, percent: int, on_verified=None):
         self.q.put(("power_pct", {"percent": int(percent)}, on_verified))
 
+    def drain_queue(self):
+        """Remove all pending ops from the queue without executing them.
+        LIMITATION: cannot cancel an op already executing on the worker thread.
+        If a power_on was in flight when drain is called, it may still complete.
+        The Layer 3 verify-and-retry loop in AutoControlService handles this case
+        by detecting the miner is still on and issuing another emergency stop.
+        """
+        drained = 0
+        while True:
+            try:
+                self.q.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        if drained:
+            print(f"[MinerController] Drained {drained} pending op(s) from queue")
+
     def _verify(self, kind: str, req: Dict[str, Any]) -> bool:
         """Verify that a command succeeded by polling the miner.
 
-        For stop/resume: uses the 'status' command and inspects Msg.mineroff.
+        For stop: checks SUMMARY Power Limit == 0 AND MHS 5s == 0 (MD5-crypt shutdown path).
+        For resume: uses the 'status' command and inspects MINING[0].mineroff.
         For power_limit: checks SUMMARY Power Limit field.
         For power_pct: checks SUMMARY Power Limit matches the target watts.
         A fresh API instance is used to avoid shared-state issues.
         """
         try:
-            if kind in ("stop", "resume"):
+            if kind == "stop":
+                # Verify MHS 5s == 0 via summary (non-privileged).
+                # NOTE: Power Limit is always 0 on this firmware regardless of state;
+                # do not use it as a stop indicator. MHS 5s is the reliable metric.
+                for _ in range(10):
+                    try:
+                        fresh_api = self._make_fresh_api()
+                        if isinstance(fresh_api, NCMinerAPI):
+                            summary = fresh_api.summary()
+                        else:
+                            summary = asyncio.run(fresh_api.summary())
+                        lst = (summary or {}).get("SUMMARY") or []
+                        s = lst[0] if lst and isinstance(lst[0], dict) else {}
+                        mhs_5s = float(s.get("MHS 5s") or 0)
+                        if mhs_5s == 0.0:
+                            return True
+                    except Exception as ve:
+                        print(f"[MinerController] _verify stop poll error: {ve}")
+                    time.sleep(1)
+                return False
+
+            if kind == "resume":
                 # Use status command to check mineroff field — retry up to 10 seconds.
-                target_mineroff = "true" if kind == "stop" else "false"
                 for _ in range(10):
                     try:
                         fresh_api = self._make_fresh_api()
@@ -78,20 +116,13 @@ class MinerController:
                         else:
                             status_reply = asyncio.run(fresh_api.send_command("status"))
                         if status_reply:
-                            # Try Msg.mineroff first (firmware 20240605.01.REL path)
-                            msg = status_reply.get("Msg") or {}
-                            if isinstance(msg, dict):
-                                mineroff_val = str(msg.get("mineroff", "")).lower()
-                                if mineroff_val == target_mineroff:
-                                    return True
-                            # Also try MINING[0].mineroff (alternative path)
                             mining_list = status_reply.get("MINING") or []
                             mining_info = mining_list[0] if mining_list and isinstance(mining_list[0], dict) else {}
                             mineroff_val = str(mining_info.get("mineroff", "")).lower()
-                            if mineroff_val == target_mineroff:
+                            if mineroff_val == "false":
                                 return True
                     except Exception as ve:
-                        print(f"[MinerController] _verify status poll error: {ve}")
+                        print(f"[MinerController] _verify resume poll error: {ve}")
                     time.sleep(1)
                 return False
 
@@ -156,6 +187,9 @@ class MinerController:
         })
         try:
             if kind == "stop":
+                # Use AES power_off (no respbefore — that causes enc json load err on this
+                # firmware). adjust_power_limit(0) does NOT stop the miner; the firmware
+                # treats 0 as unconstrained and keeps hashing.
                 priv_api = self._make_fresh_api()
                 if isinstance(priv_api, NCMinerAPI):
                     priv_api.power_off()
@@ -196,7 +230,17 @@ class MinerController:
                         priv_api.send_privileged_command("adjust_power_limit", power_limit=str(watts))
                     )
                 print(f"[MinerController] Response: {result}")
-                print(f"[MinerController] ✓ Power limit set to {watts}W ({percent}%)")
+                status_list = result.get("STATUS") if isinstance(result, dict) else None
+                if isinstance(status_list, list) and status_list:
+                    status_code = status_list[0].get("STATUS", "")
+                elif isinstance(status_list, str):
+                    status_code = status_list
+                else:
+                    status_code = ""
+                if status_code == "S":
+                    print(f"[MinerController] ✓ Power limit set to {watts}W ({percent}%)")
+                else:
+                    print(f"[MinerController] ✗ Power limit command failed (will verify current state)")
             else:
                 raise ValueError(f"Unknown op {kind}")
 
@@ -474,8 +518,22 @@ class MinerService:
         self.controller.enqueue_resume(on_verified=on_verified)
 
     def power_off(self, on_verified=None):
-        """Turn miner off."""
+        """Turn miner off via queue."""
         self.controller.enqueue_stop(on_verified=on_verified)
+
+    def emergency_power_off(self) -> bool:
+        """Emergency stop: call AES power_off directly on the calling thread.
+        Bypasses the FIFO queue entirely — no queueing, no MinerController.
+        Uses _token_max_attempts=1 to fail fast if the session is locked, instead
+        of sleeping 185s. The caller's retry loop handles repeated attempts.
+        Returns True if the AES command was accepted (encrypted response received).
+        This is NOT proof the miner is off; verified-off requires the caller to
+        re-poll and confirm MHS 5s==0, is_off==true.
+        NOTE: adjust_power_limit(0) does NOT stop this firmware — it treats 0 as
+        unconstrained and keeps hashing. AES power_off is the only reliable path.
+        """
+        result = self.api.send_aes_privileged_command("power_off", _token_max_attempts=1)
+        return isinstance(result, dict) and "enc" in result
 
     def get_op_status(self) -> dict:
         """Get operation status."""

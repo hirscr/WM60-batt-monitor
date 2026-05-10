@@ -162,6 +162,10 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+# Debug logs (config IS committed, output is not)
+logs/debug.log
+logs/*.log
+
 # WhatsMiner Controller - Sensitive Data
 config.local.yaml
 config.*.local.yaml
