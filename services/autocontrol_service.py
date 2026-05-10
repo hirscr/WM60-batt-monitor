@@ -339,12 +339,19 @@ class AutoControlService:
             print(f"[AutoControl] Condition met: Full power opportunity (SOC > 99% AND PV > {self.max_pv_power}W)")
             print(f"[AutoControl] Target power: 100% ({self.base_watts}W)")
 
-            # Ensure miner is on
+            # Ensure miner is on. If we have to power it on, do ONLY that this tick:
+            # firmware locks the privileged session for ~180s per get_token, so
+            # enqueueing power_on + set_power_pct on the same tick self-contends.
+            # The next tick will re-evaluate; once is_off=False, we fall through to
+            # the rate-limited power adjustment below.
             if is_miner_off:
-                print(f"[AutoControl] Powering on miner...")
+                print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
                 self.miner.power_on()
                 self.state.save(miner_power_state="running")
                 time.sleep(2)  # Brief delay for power-on
+                print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+                print(f"{'='*60}\n")
+                return
 
             self._set_power_with_rate_limit(100)
             print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
@@ -362,12 +369,16 @@ class AutoControlService:
             print(f"[AutoControl] Condition met: High SOC conservative (SOC > 90% AND PV < {self.max_pv_power}W)")
             print(f"[AutoControl] Target power: 90% ({self.target_w}W)")
 
-            # Ensure miner is on
+            # Ensure miner is on. If we have to power it on, do ONLY that this tick
+            # (see PRIORITY 2 comment for rationale).
             if is_miner_off:
-                print(f"[AutoControl] Powering on miner...")
+                print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
                 self.miner.power_on()
                 self.state.save(miner_power_state="running")
                 time.sleep(2)
+                print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+                print(f"{'='*60}\n")
+                return
 
             self._set_power_with_rate_limit(90)
             print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
@@ -387,13 +398,12 @@ class AutoControlService:
             print(f"[AutoControl] Condition met: After sunset startup")
             print(f"[AutoControl] Time is after sunset AND SOC > {self.after_sunset_min_soc}% AND miner is off")
             print(f"[AutoControl] Target power: {tier_pct}% ({self.target_w}W) based on SOC tier")
-            print(f"[AutoControl] Powering on miner...")
+            print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
 
+            # One privileged op per tick when miner is off — see PRIORITY 2 comment.
             self.miner.power_on()
             self.state.save(miner_power_state="running")
             time.sleep(2)  # Brief delay
-
-            self._set_power_with_rate_limit(tier_pct)
             print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
             print(f"{'='*60}\n")
             return
@@ -410,12 +420,16 @@ class AutoControlService:
         print(f"[AutoControl] SOC tier: {tier_pct}% for SOC={soc:.1f}%")
         print(f"[AutoControl] Target power: {tier_pct}% ({self.target_w}W)")
 
-        # Ensure miner is on if target > 0
+        # Ensure miner is on if target > 0. If we have to power it on, do ONLY that
+        # this tick — see PRIORITY 2 comment for rationale (firmware lock contention).
         if tier_pct > 0 and is_miner_off:
-            print(f"[AutoControl] Powering on miner...")
+            print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
             self.miner.power_on()
             self.state.save(miner_power_state="running")
             time.sleep(2)
+            print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+            print(f"{'='*60}\n")
+            return
 
         self._set_power_with_rate_limit(tier_pct)
         print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
@@ -471,13 +485,16 @@ class AutoControlService:
 
         print(f"[AutoControl] Sending power command: {target_pct}%...")
 
+        def _on_verified():
+            print(f"[AutoControl] ✓ Power verified at {target_pct}%")
+
         try:
-            self.miner.set_power_pct(target_pct)
+            self.miner.set_power_pct(target_pct, on_verified=_on_verified)
             self.last_set_w = int(self.base_watts * (target_pct / 100.0))
             self.last_set_ts = wall_now
             self.state.save(target_power_pct=target_pct)
 
-            print(f"[AutoControl] ✓ Power adjusted successfully")
+            print(f"[AutoControl] Power command queued ({target_pct}%)")
         except Exception as e:
             print(f"[AutoControl] ✗ Power adjustment failed: {e}")
 

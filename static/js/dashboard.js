@@ -847,6 +847,10 @@ function updateMinerStopReasonBanner() {
     text = 'Miner off (manual).';
     bg = '#e9ecef';
     color = '#495057';
+  } else if (minerStatus.is_off === true && autoStatus.enabled && stopReason === 'normal') {
+    text = 'Miner off — startup pending.';
+    bg = '#e9ecef';
+    color = '#495057';
   } else if (stopReason === 'ramping' || upfreqComplete === 0) {
     text = 'Miner ramping — upfreq not complete. Running at reduced hashrate.';
     bg = '#cce5ff';
