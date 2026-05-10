@@ -1159,11 +1159,19 @@ function renderBraiinsStatus(data) {
   if (elAllTime) {
     elAllTime.textContent = (data.all_time_btc != null ? data.all_time_btc.toFixed(8) + ' BTC' : '—');
   }
+  const elAllTimeUsd = document.getElementById('braiinsAllTimeUsd');
+  if (elAllTimeUsd) {
+    elAllTimeUsd.textContent = (data.all_time_usd != null ? '≈ $' + data.all_time_usd.toFixed(2) : '');
+  }
 
   // Balance
   const elBalance = document.getElementById('braiinsBalanceBtc');
   if (elBalance) {
     elBalance.textContent = (data.account_balance_btc != null ? data.account_balance_btc.toFixed(8) + ' BTC' : '—');
+  }
+  const elBalanceUsd = document.getElementById('braiinsBalanceUsd');
+  if (elBalanceUsd) {
+    elBalanceUsd.textContent = (data.account_balance_usd != null ? '≈ $' + data.account_balance_usd.toFixed(2) : '');
   }
 }
 
