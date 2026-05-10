@@ -68,6 +68,12 @@ class BatteryService:
         self._last_snap_ts_str: Optional[str] = None
         self._last_snap_datetime: Optional[datetime] = None
 
+        # Startup grace period: return True from is_fresh() until we've had enough
+        # time for the first poll to complete. This prevents the safety gate from
+        # firing immediately on service restart before any battery data arrives.
+        self._start_time: Optional[float] = None
+        self._grace_period_sec: float = max(60.0, 5.0 * poll_seconds)
+
         # Connection status tracking
         self.connection_status = ConnectionStatus(connected=False)
         self._first_connect_time: Optional[float] = None
@@ -79,6 +85,7 @@ class BatteryService:
 
         print("[BatteryService] Starting...")
         self._running = True
+        self._start_time = time.time()
 
         # Create and start EG4 client
         self.client = EG4Client(
@@ -237,8 +244,18 @@ class BatteryService:
 
     def is_fresh(self) -> bool:
         """Return True only if the most recent snapshot is within FRESHNESS_WINDOW_SEC of now.
-        Returns False until the first real EG4 poll succeeds."""
+
+        Special case: during the startup grace period (first N seconds after start()),
+        return True even if no poll has succeeded yet. This prevents the autocontrol
+        safety gate from firing before the first battery poll completes.
+        After the grace period with still no data, return False (genuinely stale).
+        """
         if self._last_snap_datetime is None:
+            # No successful poll yet — check if we are still within the startup grace period.
+            if self._start_time is not None:
+                elapsed = time.time() - self._start_time
+                if elapsed < self._grace_period_sec:
+                    return True
             return False
         age = (datetime.now(timezone.utc) - self._last_snap_datetime).total_seconds()
         return age <= FRESHNESS_WINDOW_SEC

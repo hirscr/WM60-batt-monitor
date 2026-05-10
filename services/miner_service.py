@@ -54,23 +54,96 @@ class MinerController:
         self.q.put(("power_pct", {"percent": int(percent)}, on_verified))
 
     def _verify(self, kind: str, req: Dict[str, Any]) -> bool:
+        """Verify that a command succeeded by polling the miner.
+
+        For stop/resume: uses the 'status' command and inspects Msg.mineroff.
+        For power_limit: checks SUMMARY Power Limit field.
+        For power_pct: checks SUMMARY Power Limit matches the target watts.
+        A fresh API instance is used to avoid shared-state issues.
+        """
         try:
-            summary = asyncio.run(self.api.summary())
-            if not isinstance(summary, dict):
+            if kind in ("stop", "resume"):
+                # Use status command to check mineroff field — retry up to 10 seconds.
+                target_mineroff = "true" if kind == "stop" else "false"
+                for _ in range(10):
+                    try:
+                        fresh_api = self._make_fresh_api()
+                        if isinstance(fresh_api, NCMinerAPI):
+                            status_reply = fresh_api.miner_status_cmd()
+                        else:
+                            status_reply = asyncio.run(fresh_api.send_command("status"))
+                        if status_reply:
+                            # Try Msg.mineroff first (firmware 20240605.01.REL path)
+                            msg = status_reply.get("Msg") or {}
+                            if isinstance(msg, dict):
+                                mineroff_val = str(msg.get("mineroff", "")).lower()
+                                if mineroff_val == target_mineroff:
+                                    return True
+                            # Also try MINING[0].mineroff (alternative path)
+                            mining_list = status_reply.get("MINING") or []
+                            mining_info = mining_list[0] if mining_list and isinstance(mining_list[0], dict) else {}
+                            mineroff_val = str(mining_info.get("mineroff", "")).lower()
+                            if mineroff_val == target_mineroff:
+                                return True
+                    except Exception as ve:
+                        print(f"[MinerController] _verify status poll error: {ve}")
+                    time.sleep(1)
                 return False
-            lst = summary.get("SUMMARY") or []
-            s = lst[0] if lst and isinstance(lst[0], dict) else {}
-            if kind == "stop":
-                return s.get("is_mining") is False
-            if kind == "resume":
-                return s.get("is_mining") is True
+
             if kind == "power_limit":
-                return str(s.get("Power Limit")) == str(req["watts"])
+                # Check SUMMARY Power Limit equals requested watts — retry up to 5 seconds.
+                for _ in range(5):
+                    try:
+                        fresh_api = self._make_fresh_api()
+                        if isinstance(fresh_api, NCMinerAPI):
+                            summary = fresh_api.summary()
+                        else:
+                            summary = asyncio.run(fresh_api.summary())
+                        lst = (summary or {}).get("SUMMARY") or []
+                        s = lst[0] if lst and isinstance(lst[0], dict) else {}
+                        if str(s.get("Power Limit")) == str(req["watts"]):
+                            return True
+                    except Exception as ve:
+                        print(f"[MinerController] _verify power_limit poll error: {ve}")
+                    time.sleep(1)
+                return False
+
             if kind == "power_pct":
-                return True
+                # Verify Power Limit matches the target watts calculated from percent.
+                target_watts = int(3600 * (req["percent"] / 100))
+                for _ in range(5):
+                    try:
+                        fresh_api = self._make_fresh_api()
+                        if isinstance(fresh_api, NCMinerAPI):
+                            summary = fresh_api.summary()
+                        else:
+                            summary = asyncio.run(fresh_api.summary())
+                        lst = (summary or {}).get("SUMMARY") or []
+                        s = lst[0] if lst and isinstance(lst[0], dict) else {}
+                        if str(s.get("Power Limit")) == str(target_watts):
+                            return True
+                    except Exception as ve:
+                        print(f"[MinerController] _verify power_pct poll error: {ve}")
+                    time.sleep(1)
+                return False
+
         except Exception:
             return False
         return True
+
+    def _make_fresh_api(self):
+        """Create a fresh API instance for privileged commands.
+
+        Reusing a BTMinerRPCAPI instance across threads is unsafe because the
+        AES-encrypted handshake has internal state. Each privileged command gets
+        its own instance. NCMinerAPI is stateless so returns the shared instance.
+        """
+        if isinstance(self.api, NCMinerAPI):
+            return self.api
+        # BTMinerRPCAPI: construct fresh instance with same host and password.
+        fresh = BTMinerRPCAPI(self.api.ip)
+        fresh.pwd = self.api.pwd
+        return fresh
 
     def _run_op(self, kind: str, req: Dict[str, Any], on_verified=None):
         self.state.update({
@@ -83,31 +156,44 @@ class MinerController:
         })
         try:
             if kind == "stop":
-                asyncio.run(self.api.power_off())
+                priv_api = self._make_fresh_api()
+                if isinstance(priv_api, NCMinerAPI):
+                    priv_api.power_off()
+                else:
+                    asyncio.run(priv_api.power_off())
             elif kind == "resume":
-                asyncio.run(self.api.power_on())
+                priv_api = self._make_fresh_api()
+                if isinstance(priv_api, NCMinerAPI):
+                    priv_api.power_on()
+                else:
+                    asyncio.run(priv_api.power_on())
             elif kind == "power_limit":
-                asyncio.run(
-                    self.api.send_privileged_command(
+                priv_api = self._make_fresh_api()
+                if isinstance(priv_api, NCMinerAPI):
+                    priv_api.send_privileged_command(
                         "adjust_power_limit", power_limit=str(req["watts"])
                     )
-                )
+                else:
+                    asyncio.run(
+                        priv_api.send_privileged_command(
+                            "adjust_power_limit", power_limit=str(req["watts"])
+                        )
+                    )
             elif kind == "power_pct":
                 # Convert percentage to watts (max 3600W)
                 percent = req['percent']
                 watts = int(3600 * (percent / 100))
                 print(f"[MinerController] Setting power to {percent}% ({watts}W)...")
-                print(f"[MinerController] Using API: {type(self.api).__name__}")
-                print(f"[MinerController] Using password: {bool(self.api.pwd)}")
+                priv_api = self._make_fresh_api()
+                print(f"[MinerController] Using API: {type(priv_api).__name__}")
+                print(f"[MinerController] Using password: {bool(priv_api.pwd)}")
 
                 # Use adjust_power_limit (permanent) instead of set_power_pct (temporary)
-                # NCMinerAPI has synchronous send_privileged_command
-                # BTMinerRPCAPI needs async
-                if isinstance(self.api, NCMinerAPI):
-                    result = self.api.send_privileged_command("adjust_power_limit", power_limit=str(watts))
+                if isinstance(priv_api, NCMinerAPI):
+                    result = priv_api.send_privileged_command("adjust_power_limit", power_limit=str(watts))
                 else:
                     result = asyncio.run(
-                        self.api.send_privileged_command("adjust_power_limit", power_limit=str(watts))
+                        priv_api.send_privileged_command("adjust_power_limit", power_limit=str(watts))
                     )
                 print(f"[MinerController] Response: {result}")
                 print(f"[MinerController] ✓ Power limit set to {watts}W ({percent}%)")
@@ -129,6 +215,9 @@ class MinerController:
 
             self.state["op_state"] = "idle"
         except Exception as e:
+            import traceback
+            print(f"[MinerController] ✗ Op '{kind}' failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
             self.state["op_state"] = "error"
             self.state["error"] = str(e)
 

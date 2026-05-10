@@ -276,7 +276,9 @@ class AutoControlService:
             self.current_state_description = f"Battery telemetry stale ({age_str}s) — miner stopped for safety."
             self.stop_reason = "battery_stale"
             self.resume_at_soc = None
-            self.miner.power_off()
+            # Only enqueue power_off if the miner is not already confirmed off.
+            if not self.miner.is_off:
+                self.miner.power_off()
             return
 
         # Get current state
