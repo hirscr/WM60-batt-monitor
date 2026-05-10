@@ -18,14 +18,19 @@ from utils.nc_miner_api import NCMinerAPI
 class MinerController:
     """Async command queue for miner operations."""
 
-    def __init__(self, api):
+    def __init__(self, api, priv_api=None):
         """
         Initialize controller.
 
         Args:
-            api: API for both polling and privileged commands (NCMinerAPI or BTMinerRPCAPI)
+            api: API for polling (NCMinerAPI or BTMinerRPCAPI).
+            priv_api: API for privileged commands (always NCMinerAPI). If None,
+                      falls back to api (for backward compatibility when api is NCMinerAPI).
         """
         self.api = api
+        # Use dedicated privileged API if provided; otherwise fall back to polling API.
+        # NCMinerAPI is subprocess-based and stateless, so it is always safe to reuse.
+        self._priv_api = priv_api if priv_api is not None else api
         self.q = queue.Queue()
         self.state: dict[str, object] = {
             "op_state": "idle",
@@ -132,18 +137,13 @@ class MinerController:
         return True
 
     def _make_fresh_api(self):
-        """Create a fresh API instance for privileged commands.
+        """Return the privileged command API instance.
 
-        Reusing a BTMinerRPCAPI instance across threads is unsafe because the
-        AES-encrypted handshake has internal state. Each privileged command gets
-        its own instance. NCMinerAPI is stateless so returns the shared instance.
+        NCMinerAPI is subprocess-based and stateless — it is safe to reuse across
+        calls. It uses MD5-crypt authentication (not pyasic's AES handshake), which
+        works with firmware 20240605.01.REL on both macOS and Linux.
         """
-        if isinstance(self.api, NCMinerAPI):
-            return self.api
-        # BTMinerRPCAPI: construct fresh instance with same host and password.
-        fresh = BTMinerRPCAPI(self.api.ip)
-        fresh.pwd = self.api.pwd
-        return fresh
+        return self._priv_api
 
     def _run_op(self, kind: str, req: Dict[str, Any], on_verified=None):
         self.state.update({
@@ -237,21 +237,17 @@ class MinerService:
     """Service for miner polling and control."""
 
     def __init__(self, host: str, password: str, poll_seconds: int, log_interval_sec: int, log_file: str = None):
-        # Use NC-based API on macOS (supports both polling and encrypted privileged commands)
-        use_nc = platform.system() == "Darwin"
+        # Always use NCMinerAPI for both polling and privileged commands.
+        # NCMinerAPI uses nc (subprocess) which closes the TCP connection immediately
+        # after each command, avoiding the miner's "over max connect" limit.
+        # BTMinerRPCAPI (pyasic asyncio) holds connections longer and exhausts
+        # the miner's connection limit, preventing auth sessions from succeeding.
+        print(f"[MinerService] Using NCMinerAPI for polling and privileged commands")
+        self.api = NCMinerAPI(host, password=password)
+        self.use_async = False
 
-        if use_nc:
-            print(f"[MinerService] Using NCMinerAPI (macOS - supports polling + encrypted privileged commands)")
-            self.api = NCMinerAPI(host, password=password)
-            self.use_async = False
-        else:
-            print(f"[MinerService] Using pyasic API (BTMinerRPCAPI)")
-            self.api = BTMinerRPCAPI(host)
-            self.api.pwd = password
-            self.use_async = True
-
-        # Single API for both polling and privileged commands
-        self.controller = MinerController(self.api)
+        # Polling API + privileged command API (same instance — NCMinerAPI is stateless)
+        self.controller = MinerController(self.api, priv_api=self.api)
 
         self.poll_seconds = poll_seconds
         self.log_interval_sec = log_interval_sec

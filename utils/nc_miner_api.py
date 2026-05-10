@@ -2,7 +2,9 @@
 """
 NC-based miner API - workaround for macOS socket issues.
 Uses nc command via subprocess instead of Python sockets.
-Supports encrypted privileged commands using MD5 crypt authentication.
+Supports two encrypted privileged command formats:
+  - MD5-crypt inline (enc_pwd field) — works for adjust_power_limit
+  - AES envelope (pyasic format) — required for power_off and power_on
 """
 import subprocess
 import json
@@ -61,12 +63,12 @@ class NCMinerAPI:
         return result if result else {}
 
     def power_off(self):
-        """Power off miner."""
-        return self._send_command("power_off")
+        """Power off miner using AES-encrypted privileged command."""
+        return self.send_aes_privileged_command("power_off", respbefore="true")
 
     def power_on(self):
-        """Power on miner."""
-        return self._send_command("power_on")
+        """Power on miner using AES-encrypted privileged command."""
+        return self.send_aes_privileged_command("power_on")
 
     def get_token(self) -> Optional[Dict[str, Any]]:
         """Get authentication token from miner."""
@@ -78,6 +80,115 @@ class NCMinerAPI:
             raise ValueError("Password not set")
         # Use MD5 crypt (same format as pyasic: $1$salt$hash)
         return md5_crypt.using(salt=salt).hash(self.pwd)
+
+    def send_aes_privileged_command(self, command: str, **params) -> Dict[str, Any]:
+        """
+        Send a privileged command using pyasic's AES envelope format.
+
+        Required for power_off and power_on on firmware 20240605.01.REL.
+        The MD5-crypt inline format (send_privileged_command) returns "invalid data"
+        for those commands; the AES envelope is the only accepted format.
+
+        The command is:
+          1. Get token (get_token) for salt/time/newsalt
+          2. Derive host_passwd_md5 and host_sign via MD5-crypt chains
+          3. AES-encrypt the command body using sha256(host_passwd_md5) as key
+          4. Send {"enc": 1, "data": "<base64>"} envelope via nc
+        """
+        if not self.pwd:
+            return {"STATUS": [{"STATUS": "E", "Msg": "Password not configured"}]}
+
+        print(f"[NCMinerAPI] Sending AES privileged command: {command}")
+
+        try:
+            # Import pyasic helpers (available in miner-venv)
+            from pyasic.rpc.btminer import _crypt, create_privileged_cmd
+        except ImportError as e:
+            print(f"[NCMinerAPI] ✗ Cannot import pyasic for AES encryption: {e}")
+            return {"STATUS": [{"STATUS": "E", "Msg": f"pyasic not available: {e}"}]}
+
+        try:
+            # Step 1: Get token
+            print(f"[NCMinerAPI] Step 1: Getting authentication token...")
+            token_response = self.get_token()
+
+            if not token_response:
+                return {"STATUS": [{"STATUS": "E", "Msg": "Failed to get token"}]}
+
+            msg = token_response.get("Msg", {})
+            if isinstance(msg, str):
+                # Error response like "over max connect"
+                print(f"[NCMinerAPI] ✗ Token error: {msg}")
+                return {"STATUS": [{"STATUS": "E", "Msg": msg}]}
+
+            salt = msg.get("salt")
+            time_str = msg.get("time")
+            newsalt = msg.get("newsalt")
+
+            if not salt or not time_str or not newsalt:
+                print(f"[NCMinerAPI] ✗ Invalid token response: {token_response}")
+                return {"STATUS": [{"STATUS": "E", "Msg": "Invalid token response"}]}
+
+            print(f"[NCMinerAPI] ✓ Got token (salt: {salt}, time: {time_str})")
+
+            # Step 2: Derive host_passwd_md5 and host_sign (pyasic algorithm)
+            pwd_crypt = _crypt(self.pwd, "$1$" + salt + "$")
+            host_passwd_md5 = pwd_crypt.split("$")[3]
+            tmp_crypt = _crypt(host_passwd_md5 + time_str, "$1$" + newsalt + "$")
+            host_sign = tmp_crypt.split("$")[3]
+
+            token_data = {
+                "host_sign": host_sign,
+                "host_passwd_md5": host_passwd_md5,
+            }
+
+            # Step 3: Build command dict and AES-encrypt it
+            cmd_dict = {"cmd": command}
+            for key, value in params.items():
+                cmd_dict[key] = str(value)
+
+            enc_payload = create_privileged_cmd(token_data, cmd_dict)
+            print(f"[NCMinerAPI] AES payload built ({len(enc_payload)} bytes)")
+
+            # Brief pause to allow get_token connection to close before opening new one
+            import time as _time
+            _time.sleep(0.5)
+
+            # Step 4: Send via nc
+            result = subprocess.run(
+                ['nc', '-w', str(self.timeout), self.ip, str(self.port)],
+                input=enc_payload,
+                capture_output=True,
+                timeout=self.timeout + 2
+            )
+
+            if result.returncode == 0:
+                response = result.stdout.decode('utf-8', errors='replace').strip()
+                print(f"[NCMinerAPI] AES response received ({len(response)} bytes)")
+                try:
+                    data = json.loads(response)
+                    # AES responses are encrypted — presence of "enc" key indicates success
+                    if "enc" in data:
+                        print(f"[NCMinerAPI] ✓ AES command accepted (encrypted response received)")
+                    elif data.get("STATUS") == "E":
+                        print(f"[NCMinerAPI] ✗ ERROR: {data.get('Msg')}")
+                    return data
+                except json.JSONDecodeError:
+                    print(f"[NCMinerAPI] ✗ JSON decode error on response: {response[:100]}")
+                    return {"STATUS": [{"STATUS": "E", "Msg": "JSON decode error"}]}
+            else:
+                error_msg = result.stderr.decode()
+                print(f"[NCMinerAPI] ✗ nc failed: {error_msg}")
+                return {"STATUS": [{"STATUS": "E", "Msg": f"nc failed: {error_msg}"}]}
+
+        except subprocess.TimeoutExpired:
+            print(f"[NCMinerAPI] ✗ Timeout")
+            return {"STATUS": [{"STATUS": "E", "Msg": "Timeout"}]}
+        except Exception as e:
+            print(f"[NCMinerAPI] ✗ AES command error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"STATUS": [{"STATUS": "E", "Msg": str(e)}]}
 
     def send_privileged_command(self, command: str, **params) -> Dict[str, Any]:
         """
