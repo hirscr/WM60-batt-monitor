@@ -70,6 +70,54 @@ class NCMinerAPI:
         """Power on miner using AES-encrypted privileged command."""
         return self.send_aes_privileged_command("power_on")
 
+    def _get_token_with_retry(self, max_attempts: int = 3) -> Optional[Dict[str, Any]]:
+        """
+        Fetch authentication token, waiting if the miner reports "over max connect".
+
+        The WhatsMiner firmware allows only one privileged session at a time with a
+        ~180s timeout. CRITICAL: each get_token call (success OR failure) starts/resets
+        the timer. So we MUST NOT poll get_token repeatedly while blocked — doing so
+        extends the lock indefinitely and the session never expires.
+
+        Strategy: on first "over max connect", sleep 185s (enough for the session to
+        expire), then try once more. Repeat up to max_attempts total.
+
+        Args:
+            max_attempts: Maximum number of get_token attempts (default 3).
+
+        Returns:
+            Token response dict on success, None if all attempts fail.
+        """
+        import time as _time
+        SESSION_TIMEOUT_SEC = 185  # Slightly more than observed ~180s firmware timeout
+
+        for attempt in range(max_attempts):
+            token_response = self.get_token()
+            if not token_response:
+                print(f"[NCMinerAPI] get_token returned None (attempt {attempt+1}/{max_attempts})")
+                if attempt + 1 < max_attempts:
+                    print(f"[NCMinerAPI] Sleeping {SESSION_TIMEOUT_SEC}s for session to expire...")
+                    _time.sleep(SESSION_TIMEOUT_SEC)
+                continue
+
+            msg = token_response.get("Msg", {})
+            if isinstance(msg, dict) and msg.get("salt"):
+                # Success
+                if attempt > 0:
+                    print(f"[NCMinerAPI] ✓ Token acquired on attempt {attempt+1}")
+                return token_response
+
+            # Error case — "over max connect" or other
+            err_msg = msg if isinstance(msg, str) else token_response.get("Msg", "unknown")
+            if attempt + 1 < max_attempts:
+                print(f"[NCMinerAPI] Token blocked ({err_msg}), sleeping {SESSION_TIMEOUT_SEC}s for session to expire (attempt {attempt+1}/{max_attempts})...")
+                _time.sleep(SESSION_TIMEOUT_SEC)
+            else:
+                print(f"[NCMinerAPI] ✗ Token blocked ({err_msg}) on final attempt {attempt+1}/{max_attempts}")
+
+        print(f"[NCMinerAPI] ✗ Failed to acquire token after {max_attempts} attempts")
+        return None
+
     def get_token(self) -> Optional[Dict[str, Any]]:
         """Get authentication token from miner."""
         return self._send_command("get_token")
@@ -108,16 +156,15 @@ class NCMinerAPI:
             return {"STATUS": [{"STATUS": "E", "Msg": f"pyasic not available: {e}"}]}
 
         try:
-            # Step 1: Get token
+            # Step 1: Get token (with retry if session is busy)
             print(f"[NCMinerAPI] Step 1: Getting authentication token...")
-            token_response = self.get_token()
+            token_response = self._get_token_with_retry()
 
             if not token_response:
-                return {"STATUS": [{"STATUS": "E", "Msg": "Failed to get token"}]}
+                return {"STATUS": [{"STATUS": "E", "Msg": "Timed out waiting for auth session"}]}
 
             msg = token_response.get("Msg", {})
             if isinstance(msg, str):
-                # Error response like "over max connect"
                 print(f"[NCMinerAPI] ✗ Token error: {msg}")
                 return {"STATUS": [{"STATUS": "E", "Msg": msg}]}
 
@@ -207,15 +254,18 @@ class NCMinerAPI:
         print(f"[NCMinerAPI] Sending privileged command: {command}")
 
         try:
-            # Step 1: Get token
+            # Step 1: Get token (with retry if session is busy)
             print(f"[NCMinerAPI] Step 1: Getting authentication token...")
-            token_response = self.get_token()
+            token_response = self._get_token_with_retry()
 
-            if not token_response or "Msg" not in token_response:
-                print(f"[NCMinerAPI] ✗ Failed to get token: {token_response}")
-                return {"STATUS": [{"STATUS": "E", "Msg": "Failed to get authentication token"}]}
+            if not token_response:
+                return {"STATUS": [{"STATUS": "E", "Msg": "Timed out waiting for auth session"}]}
 
             msg = token_response.get("Msg", {})
+            if isinstance(msg, str):
+                print(f"[NCMinerAPI] ✗ Token error: {msg}")
+                return {"STATUS": [{"STATUS": "E", "Msg": msg}]}
+
             salt = msg.get("salt")
             time_str = msg.get("time")
 
