@@ -194,8 +194,9 @@
       </div>
 
       <!-- Right: The Chart -->
-      <div class="chart-area">
+      <div class="chart-area" style="position: relative;">
         <div id="unifiedChart" style="height: 600px;"></div>
+        <div id="chartLoadingOverlay" style="display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(255,255,255,0.75); align-items: center; justify-content: center; font-size: 1.5em; font-weight: 600; color: #333; z-index: 10; pointer-events: none;">Data loading…</div>
       </div>
     </div>
 

@@ -148,15 +148,15 @@ function initUnifiedChart() {
 
   // Define all 9 traces
   const traces = [
-    { x: [], y: [], name: 'Miner Power (W)', mode: 'lines', yaxis: 'y', line: { color: '#1772FF', width: 2 } },
-    { x: [], y: [], name: 'PV Power In (W)', mode: 'lines', yaxis: 'y', line: { color: '#52c41a', width: 2 } },
-    { x: [], y: [], name: 'EPS Power (W)', mode: 'lines', yaxis: 'y', line: { color: '#faad14', width: 2 } },
-    { x: [], y: [], name: 'Net Power (W)', mode: 'lines', yaxis: 'y', line: { color: '#722ed1', width: 2 } },
-    { x: [], y: [], name: 'Fan Speed (RPM)', mode: 'lines', yaxis: 'y', line: { color: '#13c2c2', width: 2 } },
-    { x: [], y: [], name: 'Hash Rate (TH/s)', mode: 'lines', yaxis: 'y2', line: { color: '#eb2f96', width: 2 } },
-    { x: [], y: [], name: 'Environment Temp (°C)', mode: 'lines', yaxis: 'y2', line: { color: '#fa8c16', width: 2 } },
-    { x: [], y: [], name: 'Miner Temp (°C)', mode: 'lines', yaxis: 'y2', line: { color: '#f5222d', width: 2 } },
-    { x: [], y: [], name: 'Battery SOC (%)', mode: 'lines', yaxis: 'y2', line: { color: '#a0d911', width: 2 } }
+    { x: [], y: [], name: 'Miner Power (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#1772FF', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'PV Power In (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#52c41a', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'EPS Power (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#faad14', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'Net Power (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#722ed1', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'Fan Speed (RPM)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#13c2c2', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'Hash Rate (TH/s)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#eb2f96', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'Environment Temp (°C)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#fa8c16', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'Miner Temp (°C)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#f5222d', width: 2 }, marker: { size: 4 } },
+    { x: [], y: [], name: 'Battery SOC (%)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#a0d911', width: 2 }, marker: { size: 4 } }
   ];
 
   Plotly.newPlot('unifiedChart', traces, layout, { responsive: true });
@@ -169,6 +169,9 @@ function initUnifiedChart() {
 async function loadChartData(hours) {
   console.log(`[loadChartData] CALLED with hours=${hours}`);
   addDebugLog(`[API] Requesting ${hours} hours of chart data...`, 'info');
+
+  const overlay = document.getElementById('chartLoadingOverlay');
+  if (overlay) overlay.style.display = 'flex';
 
   try {
     const url = `/api/chart-data?hours=${hours}`;
@@ -218,6 +221,8 @@ async function loadChartData(hours) {
     console.error('[loadChartData] EXCEPTION:', e);
     console.error('[loadChartData] Stack trace:', e.stack);
     addDebugLog(`[API] Failed to load chart data: ${e.message}`, 'error');
+  } finally {
+    if (overlay) overlay.style.display = 'none';
   }
 }
 
@@ -348,7 +353,8 @@ function updateUnifiedChart(hours) {
   Plotly.update('unifiedChart', {
     x: [timestamps, timestamps, timestamps, timestamps, timestamps, timestamps, timestamps, timestamps, timestamps],
     y: [miner_power, pv_power, eps_power, net_power, fan_speed, hash_rate, env_temp, miner_temp, battery_soc],
-    mode: ['lines', 'lines', 'lines', 'lines', 'lines', 'lines', 'lines', 'lines', 'lines']
+    mode: ['lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers'],
+    connectgaps: [true, true, true, true, true, true, true, true, true]
   });
 
   // Set X-axis range to show FULL selected time window (not just the available data)

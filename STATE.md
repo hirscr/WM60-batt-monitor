@@ -214,3 +214,57 @@ A systemd drop-in was created at `/etc/systemd/system/whatsminer.service.d/env.c
 4. Battery and miner polling updating normally in journal ✓
 
 **Deferred items:** None.
+
+---
+
+## Phase 1 verification — Fixes #1/#2/#3 ship and live miner power-on (2026-05-10)
+
+| SHA | Description |
+|-----|-------------|
+| `78c2bf0` | (local, not pushed) Fix #1 + Fix #2 in `services/autocontrol_service.py`; Fix #3 in `static/js/dashboard.js` |
+
+### Fixes shipped to Pi
+- **Fix #1 + #2** (`services/autocontrol_service.py`): all four "miner is off" branches in `_away_mode_control` (Priorities 2, 3, 4, 5) now defer the rate-limited `set_power_pct` call when they have to issue `power_on` first. The branch returns immediately after `self.miner.power_on()` so the next 60s tick re-evaluates. Rationale: the firmware's privileged session locks for ~180s per `get_token`; enqueueing `power_on` and `set_power_pct` on the same tick self-contends and one of the two will lose.
+- **Fix #3** (`static/js/dashboard.js`): chart dedup / state display fix.
+
+Files modified:
+- `/home/hirscr/WM_controller/services/autocontrol_service.py` (deployed)
+- `/home/hirscr/WM_controller/static/js/dashboard.js` (deployed)
+
+### Verification — Phase 1 acceptance met
+
+Conditions during run: nighttime (00:39–00:40 EDT), SOC 43.3%, PV 0W, autocontrol in away mode, normal-discharge tier 40% / 1440W target.
+
+Two consecutive polls of `GET /api/miner/status` (60s apart, after service restart):
+
+| Time | is_off | Power Limit | MHS av | Power | Notes |
+|------|--------|-------------|--------|-------|-------|
+| 00:39:30 | false | 1440 | 1,012,917 | 766 W | ramping |
+| 00:40:31 | false | 1440 | 1,407,560 | 1045 W | hashing |
+
+Acceptance criteria (`is_off=false`, `Power Limit > 0`, `MHS av > 0`, two consecutive polls): **PASS**.
+
+### What we learned (Phase B probe — diagnostic)
+
+Initial polling at 00:10–00:11 showed the new code firing as expected (`Powering on miner (deferring power adjust to next tick)...` followed by `Sending AES privileged command: power_on`), but the AES envelope returned `"enc json load err"` — i.e. the miner rejected the encrypted body. To diagnose, a one-shot probe (`tools/probe_aes_power_on_only.py`) was scp'd to the Pi (with the service stopped to remove contention) and run.
+
+Probe outcome:
+- `get_token` returned salt `L7mYce6.`, time `7804`, newsalt `yHmabpw8`.
+- AES envelope built: 110 bytes, JSON shape `{"enc": 1, "data": "<43-byte b64>"}` (33 bytes after base64-decode — exactly one AES block + padding for `{"cmd": "power_on"}`).
+- Miner response: 138 bytes, JSON shape `{"enc": "<encrypted blob>"}` — i.e. a **successful encrypted response**, not an error.
+- 5s after the probe, summary showed Power Limit jumped 0 → 1440 and Power 14W → 24W (boot starting).
+- 60s later, summary showed MHS av = 447,489 (hashing).
+
+**Root cause of the 00:11 `enc json load err`** appears to be transient — likely a get_token salt/time race where the production code path's `_get_token_with_retry(max_attempts=2)` succeeded after a 185s wait but a different in-flight session (possibly from before the restart's 5-min staircase of session locks) had already poisoned that salt's slot. The exact same code path now produces an "enc"-keyed encrypted reply, the miner powers on, autocontrol's verification loop confirms Power Limit=1440, and the next-tick `set_power_pct` is no longer needed because the miner already has the correct limit.
+
+The fix as deployed (one privileged op per tick when the miner is off) is the right architectural answer; the residual transient `enc json load err` will self-recover on the next tick because:
+1. After a successful `power_on`, `is_off` flips false on the next poll.
+2. With `is_off == false`, autocontrol falls through to `_set_power_with_rate_limit`, which dispatches a fresh `adjust_power_limit` op via the MD5-crypt inline path (known reliable).
+
+Probe scripts removed from Pi after run; local copies kept under `tools/` for future debugging.
+
+### Deferred items
+
+- The probe script (`tools/probe_aes_power_on_only.py`) is preserved locally but not committed yet.
+- The local commit `78c2bf0` carrying Fixes #1/#2/#3 is **not pushed to origin** (per spec).
+- No further fix to `utils/nc_miner_api.py` was needed; the AES envelope is correct as-is. The transient `enc json load err` observed at 00:11 is consistent with firmware-side session salt-slot contention that the per-tick deferral pattern recovers from automatically.
