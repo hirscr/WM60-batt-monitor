@@ -83,10 +83,7 @@ const chartState = {
   allData: [],  // All loaded data
   currentHours: 72,  // Currently loaded hours (default 3 days)
   maxLoadedHours: 72,  // Maximum hours loaded so far
-  autoRefreshEnabled: true,  // Auto-refresh on by default
-  autoRefreshInterval: null,  // Interval timer
-  lastUpdateTime: null,  // Last time data was fetched
-  isUserInteracting: false  // Pause refresh during user interaction
+  lastUpdateTime: null  // Last time data was fetched (manual loads only)
 };
 
 // Initialize on page load
@@ -113,8 +110,6 @@ document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     console.log('[Dashboard] Step 4: Starting polling...');
     startPolling();
-    console.log('[Dashboard] Step 5: Starting auto-refresh...');
-    startChartAutoRefresh();
     addDebugLog('Dashboard initialized', 'success');
   } catch (err) {
     console.error('[Dashboard] Initialization ERROR:', err);
@@ -148,15 +143,15 @@ function initUnifiedChart() {
 
   // Define all 9 traces
   const traces = [
-    { x: [], y: [], name: 'Miner Power (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#1772FF', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'PV Power In (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#52c41a', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'EPS Power (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#faad14', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'Net Power (W)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#722ed1', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'Fan Speed (RPM)', mode: 'lines+markers', connectgaps: true, yaxis: 'y', line: { color: '#13c2c2', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'Hash Rate (TH/s)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#eb2f96', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'Environment Temp (°C)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#fa8c16', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'Miner Temp (°C)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#f5222d', width: 2 }, marker: { size: 4 } },
-    { x: [], y: [], name: 'Battery SOC (%)', mode: 'lines+markers', connectgaps: true, yaxis: 'y2', line: { color: '#a0d911', width: 2 }, marker: { size: 4 } }
+    { x: [], y: [], name: 'Miner Power (W)', mode: 'lines', connectgaps: true, yaxis: 'y', line: { color: '#1772FF', width: 2 } },
+    { x: [], y: [], name: 'PV Power In (W)', mode: 'lines', connectgaps: true, yaxis: 'y', line: { color: '#52c41a', width: 2 } },
+    { x: [], y: [], name: 'EPS Power (W)', mode: 'lines', connectgaps: true, yaxis: 'y', line: { color: '#faad14', width: 2 } },
+    { x: [], y: [], name: 'Net Power (W)', mode: 'lines', connectgaps: true, yaxis: 'y', line: { color: '#722ed1', width: 2 } },
+    { x: [], y: [], name: 'Fan Speed (RPM)', mode: 'lines', connectgaps: true, yaxis: 'y', line: { color: '#13c2c2', width: 2 } },
+    { x: [], y: [], name: 'Hash Rate (TH/s)', mode: 'lines', connectgaps: true, yaxis: 'y2', line: { color: '#eb2f96', width: 2 } },
+    { x: [], y: [], name: 'Environment Temp (°C)', mode: 'lines', connectgaps: true, yaxis: 'y2', line: { color: '#fa8c16', width: 2 } },
+    { x: [], y: [], name: 'Miner Temp (°C)', mode: 'lines', connectgaps: true, yaxis: 'y2', line: { color: '#f5222d', width: 2 } },
+    { x: [], y: [], name: 'Battery SOC (%)', mode: 'lines', connectgaps: true, yaxis: 'y2', line: { color: '#a0d911', width: 2 } }
   ];
 
   Plotly.newPlot('unifiedChart', traces, layout, { responsive: true });
@@ -323,6 +318,35 @@ function updateUnifiedChart(hours) {
     addDebugLog(`[TimeRange] Showing: ${first.toLocaleString()} to ${last.toLocaleString()}`, 'info');
   }
 
+  // Downsample by time span to keep render fast on long windows.
+  // <=24h: full resolution. >24h: stride-N where N = ceil(hours/24).
+  // For 'all', compute hours from data span.
+  let effectiveHours;
+  if (hours === 'all') {
+    if (filteredData.length >= 2) {
+      const firstTs = new Date(filteredData[0].timestamp).getTime();
+      const lastTs = new Date(filteredData[filteredData.length - 1].timestamp).getTime();
+      effectiveHours = (lastTs - firstTs) / 3.6e6;
+    } else {
+      effectiveHours = 0;
+    }
+  } else {
+    effectiveHours = hours;
+  }
+
+  if (effectiveHours > 24 && filteredData.length > 0) {
+    const N = Math.max(1, Math.ceil(effectiveHours / 24));
+    const lastPoint = filteredData[filteredData.length - 1];
+    const beforeLen = filteredData.length;
+    filteredData = filteredData.filter((_, i) => i % N === 0);
+    // Always include the most recent point
+    if (filteredData.length && filteredData[filteredData.length - 1] !== lastPoint) {
+      filteredData.push(lastPoint);
+    }
+    console.log(`[updateUnifiedChart] Decimation: stride=${N}, ${beforeLen} -> ${filteredData.length} points`);
+    addDebugLog(`[Plotly] Decimated ${beforeLen}→${filteredData.length} points (stride ${N})`, 'info');
+  }
+
   // Extract arrays for each series
   const timestamps = filteredData.map(row => new Date(row.timestamp));
   const miner_power = filteredData.map(row => row.miner_power);
@@ -353,7 +377,7 @@ function updateUnifiedChart(hours) {
   Plotly.update('unifiedChart', {
     x: [timestamps, timestamps, timestamps, timestamps, timestamps, timestamps, timestamps, timestamps, timestamps],
     y: [miner_power, pv_power, eps_power, net_power, fan_speed, hash_rate, env_temp, miner_temp, battery_soc],
-    mode: ['lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers', 'lines+markers'],
+    mode: ['lines', 'lines', 'lines', 'lines', 'lines', 'lines', 'lines', 'lines', 'lines'],
     connectgaps: [true, true, true, true, true, true, true, true, true]
   });
 
@@ -481,66 +505,12 @@ function allSeriesOff() {
   addDebugLog('All series turned off', 'info');
 }
 
-// Auto-refresh chart data
-function startChartAutoRefresh() {
-  if (chartState.autoRefreshInterval) {
-    clearInterval(chartState.autoRefreshInterval);
-  }
-
-  console.log('[AutoRefresh] Starting auto-refresh with 20 second interval');
-  addDebugLog('[AutoRefresh] Enabled, refreshing every 20 seconds', 'info');
-
-  chartState.autoRefreshInterval = setInterval(async () => {
-    if (!chartState.autoRefreshEnabled || chartState.isUserInteracting) {
-      console.log('[AutoRefresh] Skipping - disabled or user interacting');
-      return;
-    }
-
-    try {
-      console.log('[AutoRefresh] Fetching latest data...');
-
-      // Reload current time range to get fresh data
-      await loadChartData(chartState.currentHours);
-
-      chartState.lastUpdateTime = new Date();
-      console.log(`[AutoRefresh] Updated at ${chartState.lastUpdateTime.toLocaleTimeString()}`);
-
-    } catch (err) {
-      console.error('[AutoRefresh] Failed:', err);
-      addDebugLog(`[AutoRefresh] Update failed: ${err.message}`, 'error');
-    }
-  }, 20000); // 20 seconds
-}
-
-function stopChartAutoRefresh() {
-  if (chartState.autoRefreshInterval) {
-    clearInterval(chartState.autoRefreshInterval);
-    chartState.autoRefreshInterval = null;
-    console.log('[AutoRefresh] Stopped');
-    addDebugLog('[AutoRefresh] Stopped', 'warning');
-  }
-}
-
-function toggleAutoRefresh() {
-  chartState.autoRefreshEnabled = !chartState.autoRefreshEnabled;
-
-  const indicator = document.getElementById('autoRefreshIndicator');
-  const toggleBtn = document.getElementById('autoRefreshToggle');
-
-  if (chartState.autoRefreshEnabled) {
-    startChartAutoRefresh();
-    indicator.textContent = '● LIVE';
-    indicator.style.color = '#52c41a';
-    toggleBtn.textContent = 'Pause Auto-Refresh';
-    addDebugLog('[AutoRefresh] Enabled', 'success');
-  } else {
-    stopChartAutoRefresh();
-    indicator.textContent = '○ PAUSED';
-    indicator.style.color = '#faad14';
-    toggleBtn.textContent = 'Resume Auto-Refresh';
-    addDebugLog('[AutoRefresh] Disabled', 'warning');
-  }
-}
+// Chart auto-refresh has been removed. The chart only re-fetches when the user
+// clicks a time-range button. These shims remain as no-ops so any lingering
+// callers (e.g. an HTML onclick) don't throw.
+function startChartAutoRefresh() { /* no-op: auto-refresh disabled */ }
+function stopChartAutoRefresh() { /* no-op: auto-refresh disabled */ }
+function toggleAutoRefresh() { /* no-op: auto-refresh disabled */ }
 
 // Update axis ranges
 function updateAxisRanges() {
@@ -1401,18 +1371,8 @@ function setupEventListeners() {
     }
   });
 
-  // Unified chart checkboxes (new IDs)
-  ['toggle_hash_rate', 'toggle_miner_power', 'toggle_fan_speed', 'toggle_env_temp',
-   'toggle_miner_temp', 'toggle_battery_soc', 'toggle_pv_power', 'toggle_eps_power',
-   'toggle_net_power'].forEach(id => {
-    const elem = document.getElementById(id);
-    if (elem) {
-      elem.addEventListener('change', () => {
-        // Re-render the unified chart with current data
-        updateUnifiedChart(chartState.currentHours);
-      });
-    }
-  });
+  // Unified chart trace toggles are wired up in setupChartToggles() via
+  // Plotly.restyle — no need to re-render the whole chart on each toggle.
 }
 
 // Apply power percent
