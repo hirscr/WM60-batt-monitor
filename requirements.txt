@@ -23,3 +23,6 @@ passlib==1.7.4
 
 # Optional: Network scanning
 requests==2.31.0
+
+# Testing
+pytest

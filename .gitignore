@@ -182,5 +182,5 @@ wm_status_log.csv
 .AppleDouble
 .LSOverride
 
-# Test files (may contain sensitive data)
-test_*.py
+# Ad-hoc root-level test scripts (may contain sensitive data)
+/test_*.py

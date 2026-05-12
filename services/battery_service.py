@@ -14,6 +14,23 @@ from models.device import ConnectionStatus
 # Autocontrol must stop the miner when stale.
 FRESHNESS_WINDOW_SEC = 600  # 10 minutes
 
+# Canonical CSV schema for eg4_battery_log.csv. The writer pins fieldnames to
+# this exact list (in this exact order) so DictReader-based consumers map
+# columns positionally to the correct keys. Any pre-existing file with a
+# different header is archived on startup and a fresh log is created.
+CSV_FIELDNAMES = [
+    "ts",
+    "soc_percent",
+    "pack_voltage_v",
+    "pack_current_a",
+    "pv_power_w",
+    "load_power_w",
+    "grid_power_w",
+    "ac_couple_w",
+    "battery_net_w",
+    "units",
+]
+
 
 class BatteryService:
     """
@@ -82,6 +99,15 @@ class BatteryService:
         """Start battery service."""
         if self._running:
             return
+
+        # Reconcile CSV schema BEFORE spawning the polling thread so there is
+        # no race between archive/rename and the first _log_to_csv call. If
+        # reconciliation raises, surface the error and continue startup —
+        # future writes will fail loudly until the operator intervenes.
+        try:
+            self._reconcile_csv_schema()
+        except Exception as e:
+            print(f"[BatteryService] CSV schema reconciliation failed: {e}")
 
         print("[BatteryService] Starting...")
         self._running = True
@@ -284,14 +310,55 @@ class BatteryService:
             "session_age_hours": (time.time() - self._last_auth_time) / 3600 if self._last_auth_time else None,
         }
 
+    def _reconcile_csv_schema(self):
+        """Ensure the on-disk CSV uses the canonical schema.
+
+        Called once at startup, before any polling thread runs. If the file
+        does not exist or is empty, nothing to do — the first write will
+        create it with the canonical header. If the existing header matches
+        CSV_FIELDNAMES exactly (same fields, same order), keep using it.
+        Otherwise, atomically rename the legacy file to a timestamped archive
+        path beside it and let the next write create a fresh file.
+        """
+        if not os.path.exists(self.log_file) or os.path.getsize(self.log_file) == 0:
+            print("[BatteryService] CSV schema check: no existing file, will create on first write.")
+            return
+
+        with open(self.log_file, "r", newline="") as f:
+            reader = csv.reader(f)
+            try:
+                existing_header = next(reader)
+            except StopIteration:
+                existing_header = []
+
+        if existing_header == CSV_FIELDNAMES:
+            print("[BatteryService] CSV schema OK.")
+            return
+
+        log_dir = os.path.dirname(self.log_file)
+        base_name = os.path.basename(self.log_file)
+        stem, ext = os.path.splitext(base_name)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive_path = os.path.join(log_dir, f"{stem}_legacy_{stamp}{ext}")
+
+        os.rename(self.log_file, archive_path)
+        print(
+            f"[BatteryService] WARNING: Legacy CSV schema detected — "
+            f"archived to {archive_path}. Starting fresh log with canonical schema."
+        )
+
     def _log_to_csv(self, row: dict):
-        """Append row to CSV log file."""
+        """Append row to CSV log file using the pinned canonical schema."""
         try:
             os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
             file_exists = os.path.exists(self.log_file)
 
             with open(self.log_file, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=row.keys())
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=CSV_FIELDNAMES,
+                    extrasaction="ignore",
+                )
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(row)
