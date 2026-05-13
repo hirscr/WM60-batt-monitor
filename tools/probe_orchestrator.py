@@ -246,16 +246,25 @@ def build_token_data(pwd: str, token: dict) -> dict:
 
 
 def send_aes(host: str, token_data: dict, cmd_dict: dict, timeout: int = 6) -> Tuple[Optional[dict], str]:
-    """Send AES-enveloped privileged command. Returns (parsed_json_or_None, raw_text)."""
-    from pyasic.rpc.btminer import create_privileged_cmd
+    """Send AES-enveloped privileged command. Returns (decrypted_dict_or_None, display_text)."""
+    from pyasic.rpc.btminer import create_privileged_cmd, parse_btminer_priviledge_data
 
     envelope = create_privileged_cmd(dict(token_data), dict(cmd_dict))
     raw = nc_send_raw(host, MINER_PORT, envelope, timeout=timeout)
     text = raw.decode("utf-8", errors="replace").strip()
     try:
-        return json.loads(text), text
+        resp = json.loads(text)
     except json.JSONDecodeError:
         return None, text
+
+    if isinstance(resp, dict) and "enc" in resp:
+        try:
+            decrypted = parse_btminer_priviledge_data(dict(token_data), resp)
+            return decrypted, json.dumps(decrypted)
+        except Exception as e:
+            return resp, f"(decrypt failed: {e}) {text}"
+
+    return resp, text
 
 
 def send_md5crypt_adjust_power_limit(host: str, pwd: str, watts: int, timeout: int = 6) -> Tuple[Optional[dict], str]:
@@ -855,7 +864,7 @@ class ProbeOrchestrator:
 
         time.sleep(0.5)
         resp_obj, resp_text = send_aes(self.host, token_data, cmd_dict)
-        self.log.write(f"- Response (raw, truncated): `{resp_text[:300]}`")
+        self.log.write(f"- Response (decrypted): `{resp_text[:300]}`")
 
         if isinstance(resp_obj, dict):
             status_top = resp_obj.get("STATUS")

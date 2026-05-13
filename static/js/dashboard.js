@@ -1544,7 +1544,7 @@ function renderProbePanel(data) {
   document.getElementById('probeRunId').textContent = data.run_id || '—';
 
   const warn = document.getElementById('probeOrchestratorWarning');
-  warn.style.display = data.pid_alive ? 'none' : '';
+  warn.style.display = (data.pid_alive || data.phase === 'complete') ? 'none' : '';
 
   // Last snapshot (PL/P/Upfreq).
   const snap = data.last_summary_snapshot || {};
