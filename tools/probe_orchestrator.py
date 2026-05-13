@@ -883,7 +883,10 @@ class ProbeOrchestrator:
             if elapsed < GET_TOKEN_RATE_LIMIT_SECONDS:
                 wait = GET_TOKEN_RATE_LIMIT_SECONDS - elapsed
                 self.log.write(f"- Waiting {wait:.0f}s to respect 185s inter-command minimum")
-                time.sleep(wait)
+                deadline_wait = time.time() + wait
+                while time.time() < deadline_wait:
+                    time.sleep(min(HEARTBEAT_INTERVAL_SECONDS, deadline_wait - time.time()))
+                    self._save_state()
 
         try:
             token_data = self.token_cache.get()
