@@ -1495,11 +1495,124 @@ function startPolling() {
   // Poll backend logs every 3 seconds
   setInterval(pollBackendLogs, 3000);
 
+  // Poll probe orchestrator state every 10 seconds
+  setInterval(refreshProbeStatus, 10000);
+
   // Initial refresh
   console.log('[StartPolling] Calling initial refreshStatus()...');
   refreshStatus();
   console.log('[StartPolling] Calling initial pollBackendLogs()...');
   pollBackendLogs();
+  refreshProbeStatus();
+}
+
+// ===== Probe orchestrator panel =====
+async function refreshProbeStatus() {
+  try {
+    const res = await fetch('/api/probe/status', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    renderProbePanel(data);
+  } catch (e) {
+    console.error('[Probe] status fetch failed:', e);
+  }
+}
+
+function renderProbePanel(data) {
+  const panel = document.getElementById('probePanel');
+  if (!panel) return;
+  if (!data || !data.present) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+
+  // Top-level fields.
+  document.getElementById('probePhase').textContent = data.phase || '—';
+  const safety = data.safety_state || '—';
+  const safetyEl = document.getElementById('probeSafety');
+  safetyEl.textContent = safety + (data.last_safety_detail ? ` (${data.last_safety_detail})` : '');
+  safetyEl.className = 'probe-safety-' + (safety === 'running' ? 'ok' : 'warn');
+  document.getElementById('probeCandidate').textContent = data.current_candidate || '—';
+  document.getElementById('probeTarget').textContent = data.current_target_pct != null ? `${data.current_target_pct}%` : '—';
+  document.getElementById('probeCurrentLevel').textContent = data.current_level_pct != null ? `${data.current_level_pct}%` : '—';
+  const hbAge = data.heartbeat_age_seconds;
+  document.getElementById('probeHeartbeat').textContent = hbAge != null ? `${hbAge.toFixed(1)}s ago` : '—';
+  const pidAliveEl = document.getElementById('probePidAlive');
+  pidAliveEl.textContent = data.pid_alive ? `yes (PID ${data.pid})` : `no (PID ${data.pid ?? '?'})`;
+  pidAliveEl.className = data.pid_alive ? 'probe-pid-ok' : 'probe-pid-dead';
+  document.getElementById('probeRunId').textContent = data.run_id || '—';
+
+  const warn = document.getElementById('probeOrchestratorWarning');
+  warn.style.display = data.pid_alive ? 'none' : '';
+
+  // Last snapshot (PL/P/Upfreq).
+  const snap = data.last_summary_snapshot || {};
+  const snapStr = Object.keys(snap).length
+    ? `PL=${snap.power_limit_w ?? '—'}W P=${snap.power_w ?? '—'}W MHS5s=${snap.mhs_5s ?? '—'} Upfreq=${snap.upfreq_complete ?? '—'}`
+    : '—';
+  document.getElementById('probeLastSnapshot').textContent = snapStr;
+
+  // Verdict.
+  const verdictBlock = document.getElementById('probeVerdictBlock');
+  if (data.verdict) {
+    verdictBlock.style.display = '';
+    document.getElementById('probeVerdict').textContent = data.verdict;
+  } else {
+    verdictBlock.style.display = 'none';
+  }
+
+  // Candidates table.
+  const tbody = document.getElementById('probeCandidatesBody');
+  tbody.innerHTML = '';
+  const candidates = data.candidates || [];
+  candidates.forEach((c, idx) => {
+    const tr = document.createElement('tr');
+    const isCurrent = data.current_candidate_index === idx;
+    if (isCurrent) tr.className = 'probe-candidate-current';
+    tr.innerHTML = `
+      <td>${idx + 1}</td>
+      <td><code>${c.label}</code></td>
+      <td>${c.value_type}</td>
+      <td>${formatOutcome(c.phase_a_outcome)}</td>
+      <td>${formatOutcome(c.phase_a_confirm_outcome)}</td>
+      <td>${c.phase_b_cycle_count ?? 0}</td>
+      <td>${formatOutcome(c.phase_b_last_outcome)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // Stop button enable/disable based on whether probe is still running.
+  const stopBtn = document.getElementById('probeStopBtn');
+  const stillRunning = data.pid_alive && data.phase !== 'complete' && data.phase !== 'error';
+  stopBtn.disabled = !stillRunning || data.stop_flag_present;
+  if (data.stop_flag_present) stopBtn.textContent = 'Stop queued';
+  else stopBtn.textContent = 'Stop Probe';
+}
+
+function formatOutcome(o) {
+  if (!o) return '—';
+  const cls = ({
+    'Success': 'probe-outcome-success',
+    'Reset':   'probe-outcome-reset',
+    'No-op':   'probe-outcome-noop',
+    'Error':   'probe-outcome-error',
+    'Timeout': 'probe-outcome-timeout',
+    'Stopped': 'probe-outcome-noop',
+  })[o] || '';
+  return `<span class="${cls}">${o}</span>`;
+}
+
+async function stopProbe() {
+  if (!confirm('Send stop signal to probe? Wind-down (set 1800W, re-enable autocontrol) will run.')) return;
+  try {
+    const res = await fetch('/api/probe/stop', { method: 'POST' });
+    const data = await res.json();
+    addDebugLog(`[Probe] stop queued: ${JSON.stringify(data)}`, 'info');
+    refreshProbeStatus();
+  } catch (e) {
+    addDebugLog(`[Probe] stop failed: ${e.message}`, 'error');
+  }
 }
 
 // Poll backend logs

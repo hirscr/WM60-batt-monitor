@@ -184,3 +184,10 @@ wm_status_log.csv
 
 # Ad-hoc root-level test scripts (may contain sensitive data)
 /test_*.py
+
+# Probe orchestrator runtime files (regenerated each run)
+tools/probe_state.json
+tools/probe_stop.flag
+tools/probe.pid
+logs/probe_*.md
+logs/probe_orchestrator.nohup.out

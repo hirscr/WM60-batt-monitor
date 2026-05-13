@@ -30,6 +30,9 @@ from services.autocontrol_service import AutoControlService
 from services.network_scanner import NetworkScanner
 from services.braiins_service import BraiinsService
 
+# API blueprints
+from api.probe import probe_bp
+
 # ========== LOG BUFFER ==========
 class LogBuffer:
     """Thread-safe buffer for capturing backend logs."""
@@ -105,6 +108,9 @@ sys.stderr = LogCapture(sys.stderr, "error")
 
 # Initialize Flask app
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+
+# Register API blueprints
+app.register_blueprint(probe_bp)
 
 # Load settings
 print("[APP] Loading configuration...")

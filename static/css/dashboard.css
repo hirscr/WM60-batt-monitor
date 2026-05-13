@@ -568,3 +568,86 @@ h2 {
     display: none;
   }
 }
+
+/* ===== Probe Orchestrator Panel ===== */
+#probePanel .probe-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+#probePanel .probe-stop-btn {
+  background: #c0392b;
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  font-weight: bold;
+  cursor: pointer;
+}
+#probePanel .probe-stop-btn:disabled {
+  background: #aaa;
+  cursor: not-allowed;
+}
+#probePanel .probe-warning {
+  background: #fff1f0;
+  color: #a8071a;
+  border: 1px solid #ffa39e;
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin-bottom: 10px;
+  font-weight: bold;
+}
+#probePanel .probe-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content 1fr;
+  gap: 4px 12px;
+  font-size: 0.92em;
+  margin-bottom: 8px;
+}
+#probePanel .probe-grid > div:nth-child(odd) {
+  font-weight: 600;
+  color: #555;
+}
+#probePanel .probe-snapshot {
+  font-size: 0.88em;
+  color: #444;
+  margin-bottom: 8px;
+}
+#probePanel .probe-snapshot code {
+  background: #f5f5f5;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+#probePanel .probe-verdict {
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 8px 0;
+}
+#probePanel .probe-safety-ok { color: #237804; font-weight: 600; }
+#probePanel .probe-safety-warn { color: #a8071a; font-weight: 600; }
+#probePanel .probe-pid-ok { color: #237804; }
+#probePanel .probe-pid-dead { color: #a8071a; font-weight: 600; }
+#probePanel .probe-candidates-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88em;
+  margin-top: 8px;
+}
+#probePanel .probe-candidates-table th,
+#probePanel .probe-candidates-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid #eee;
+}
+#probePanel .probe-candidates-table th {
+  background: #fafafa;
+}
+#probePanel .probe-candidate-current { background: #fffbe6; }
+#probePanel .probe-outcome-success { color: #237804; font-weight: 600; }
+#probePanel .probe-outcome-reset { color: #a8071a; font-weight: 600; }
+#probePanel .probe-outcome-noop { color: #555; }
+#probePanel .probe-outcome-error { color: #d46b08; font-weight: 600; }
+#probePanel .probe-outcome-timeout { color: #531dab; }

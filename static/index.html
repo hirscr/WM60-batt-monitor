@@ -148,6 +148,50 @@
     </div>
   </div>
 
+  <!-- Probe Orchestrator Panel (auto-hides when no probe state file present) -->
+  <div class="card" id="probePanel" style="display:none;">
+    <div class="probe-header">
+      <h2>Power-Tuning Probe</h2>
+      <button id="probeStopBtn" class="probe-stop-btn" onclick="stopProbe()">Stop Probe</button>
+    </div>
+    <div id="probeOrchestratorWarning" class="probe-warning" style="display:none;">
+      ORCHESTRATOR DEAD — restart via ssh + tools/_launch_probe.sh
+    </div>
+    <div class="probe-summary">
+      <div class="probe-grid">
+        <div>Phase:</div><div id="probePhase">—</div>
+        <div>Safety:</div><div id="probeSafety">—</div>
+        <div>Candidate:</div><div id="probeCandidate">—</div>
+        <div>Target:</div><div id="probeTarget">—</div>
+        <div>Current level:</div><div id="probeCurrentLevel">—</div>
+        <div>Heartbeat:</div><div id="probeHeartbeat">—</div>
+        <div>PID alive:</div><div id="probePidAlive">—</div>
+        <div>Run ID:</div><div id="probeRunId">—</div>
+      </div>
+      <div class="probe-snapshot">
+        <span>Last miner snapshot:</span> <code id="probeLastSnapshot">—</code>
+      </div>
+      <div class="probe-verdict" id="probeVerdictBlock" style="display:none;">
+        <strong>Verdict:</strong> <span id="probeVerdict"></span>
+      </div>
+    </div>
+    <h3>Candidates</h3>
+    <table class="probe-candidates-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Label</th>
+          <th>Type</th>
+          <th>Phase A</th>
+          <th>Confirm</th>
+          <th>B cycles</th>
+          <th>B last</th>
+        </tr>
+      </thead>
+      <tbody id="probeCandidatesBody"></tbody>
+    </table>
+  </div>
+
   <!-- Network Devices -->
   <div class="card">
     <h2 id="networkDevicesHeader">Network Devices (scanning 192.168.86.1-254)</h2>
