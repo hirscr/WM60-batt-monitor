@@ -736,7 +736,7 @@ class ProbeOrchestrator:
         """Poll for OBSERVATION_SECONDS and classify the outcome.
 
         Returns (outcome, polls) where outcome in {Success, Reset, No-op,
-        Error, Timeout} and polls is the list of recorded snapshots.
+        Error} and polls is the list of recorded snapshots.
         """
         target_w = int(round(self.base_watts * target_pct / 100.0))
         band_w = max(50, int(round(self.base_watts * SUCCESS_BAND_FRAC)))
@@ -751,6 +751,7 @@ class ProbeOrchestrator:
         deadline = time.time() + OBSERVATION_SECONDS
         success_streak_start: Optional[float] = None
         zero_power_polls = 0
+        zero_upfreq_polls = 0
         max_movement_w = 0.0
         observed_meaningful_movement = False
         last_safety_check = 0.0
@@ -774,7 +775,10 @@ class ProbeOrchestrator:
             self.log.write(f"    - t+{elapsed}s: {snapshot_str(snap)}")
 
             p = snap.get("power_w")
-            # Reset detection.
+            upfreq = snap.get("upfreq_complete")
+
+            # Reset detection: Power==0 OR Upfreq dropped to 0 (chip recalibration
+            # keeps drawing idle power so Power rarely hits 0, but Upfreq==0 is unambiguous).
             if p is not None and p <= 1.0:
                 zero_power_polls += 1
                 if zero_power_polls >= 2:
@@ -782,6 +786,14 @@ class ProbeOrchestrator:
                     return "Reset", polls
             else:
                 zero_power_polls = 0
+
+            if upfreq == 0:
+                zero_upfreq_polls += 1
+                if zero_upfreq_polls >= 2:
+                    self.log.write(f"  - RESET: Upfreq Complete=0 for 2 consecutive polls (chip recalibration)")
+                    return "Reset", polls
+            else:
+                zero_upfreq_polls = 0
 
             # Movement tracking.
             if p is not None:
@@ -816,9 +828,9 @@ class ProbeOrchestrator:
             )
             return "No-op", polls
         self.log.write(
-            f"  - TIMEOUT: Power moved (max ΔP={max_movement_w:.0f}W) but never settled in target band"
+            f"  - RESET: window elapsed, Power moved (max ΔP={max_movement_w:.0f}W) but never reached target band"
         )
-        return "Timeout", polls
+        return "Reset", polls
 
     def wait_for_recovery(self) -> bool:
         """After a Reset, wait for Power > 0. Returns True if recovered."""
@@ -945,7 +957,7 @@ class ProbeOrchestrator:
                 current_level_pct = LEVEL_HIGH_PCT if abs(inferred_pct - LEVEL_HIGH_PCT) < abs(inferred_pct - LEVEL_LOW_PCT) else LEVEL_LOW_PCT
                 self._save_state(current_level_pct=current_level_pct)
                 continue
-            # No-op / Error / Timeout — leave current_level unchanged.
+            # No-op / Error — leave current_level unchanged.
         return winner_idx
 
     def phase_a_confirm(self, winner_idx: int) -> bool:
@@ -1093,7 +1105,7 @@ class ProbeOrchestrator:
             verdict = f"PARTIAL: `{cand['label']}` succeeded one-way but failed bidirectional confirmation"
             self.log.write(f"- {verdict}")
         else:
-            verdict = "NO CANDIDATE QUALIFIED — every shape was Reset, No-op, Error, or Timeout"
+            verdict = "NO CANDIDATE QUALIFIED — every shape was Reset, No-op, or Error"
             self.log.write(f"- {verdict}")
             self.log.write("- Per-candidate outcomes:")
             for c in self.state["candidates"]:

@@ -1597,7 +1597,6 @@ function formatOutcome(o) {
     'Reset':   'probe-outcome-reset',
     'No-op':   'probe-outcome-noop',
     'Error':   'probe-outcome-error',
-    'Timeout': 'probe-outcome-timeout',
     'Stopped': 'probe-outcome-noop',
   })[o] || '';
   return `<span class="${cls}">${o}</span>`;
