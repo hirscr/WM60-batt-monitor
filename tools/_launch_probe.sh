@@ -39,7 +39,7 @@ fi
 cd "${PROJECT_DIR}" || exit 1
 
 echo "[launch] Starting orchestrator…"
-nohup "${VENV_PY}" "${ORCH}" >> "${NOHUP_LOG}" 2>&1 &
+nohup "${VENV_PY}" "${ORCH}" "$@" >> "${NOHUP_LOG}" 2>&1 &
 launched_pid=$!
 disown "${launched_pid}" 2>/dev/null || true
 

@@ -572,6 +572,7 @@ class ProbeOrchestrator:
             "candidates": [
                 {"label": c["label"], "value_type": c["value_type"],
                  "phase_a_outcome": None, "phase_a_confirm_outcome": None,
+                 "phase_b_outcome": None,
                  "phase_b_cycle_count": 0, "phase_b_last_outcome": None}
                 for c in probe_candidates.CANDIDATES
             ],
@@ -1024,6 +1025,81 @@ class ProbeOrchestrator:
 
     # ---- Phase B ----
 
+    # Candidates excluded from Phase B (definitively invalid on this firmware).
+    PHASE_B_SKIP_LABELS = {"set_power_limit_watts_str"}
+
+    def phase_b_sweep(self) -> Optional[int]:
+        """Sweep candidates with Upfreq=1 pre-wait before every command.
+
+        Skips PHASE_B_SKIP_LABELS. Records into phase_b_outcome (phase_a_outcome untouched).
+        Returns winner index or None.
+        """
+        self.log.header("Phase B — Candidate Sweep (Upfreq=1 pre-wait)")
+        self._save_state(phase="phase_b_sweep")
+        current_level_pct = self.state["current_level_pct"]
+
+        for idx, cand in enumerate(probe_candidates.CANDIDATES):
+            if cand["label"] in self.PHASE_B_SKIP_LABELS:
+                self.log.write(f"- Skipping {cand['label']} (excluded from Phase B)")
+                continue
+            if stop_requested():
+                self.log.write("- Stop flag set; aborting sweep")
+                return None
+            self.hold_for_safety()
+
+            if not self.wait_for_upfreq_one(f"pre-wait for {cand['label']}"):
+                self.log.write(f"- Aborted: Upfreq=1 not reached before {cand['label']}")
+                return None
+
+            target_pct = LEVEL_HIGH_PCT if current_level_pct == LEVEL_LOW_PCT else LEVEL_LOW_PCT
+            self.log.subheader(
+                f"Attempt {idx+1}/{len(probe_candidates.CANDIDATES)}: "
+                f"{cand['label']} ({current_level_pct}% -> {target_pct}%)"
+            )
+            self.log.kv("timestamp_utc", dt.datetime.now(dt.timezone.utc).isoformat())
+            self._save_state(
+                phase="phase_b_sweep",
+                current_candidate=cand["label"],
+                current_candidate_index=idx,
+                current_target_pct=target_pct,
+            )
+
+            start_snap = snapshot_fields(summary(self.host))
+            self.log.write(f"- Start snapshot: {snapshot_str(start_snap)}")
+
+            _, _, hard_error = self.issue_candidate(idx, target_pct)
+            if hard_error:
+                self.state["candidates"][idx]["phase_b_outcome"] = "Error"
+                self._save_state()
+                continue
+
+            outcome, _ = self.classify_attempt(cand["label"], target_pct, start_snap)
+            self.state["candidates"][idx]["phase_b_outcome"] = outcome
+            self.log.kv("Outcome", f"**{outcome}**")
+            self._save_state()
+
+            if outcome == "Stopped":
+                return None
+            if outcome == "Success":
+                self._save_state(current_level_pct=target_pct)
+                return idx
+            if outcome == "Reset":
+                recovered = self.wait_for_recovery()
+                if not recovered:
+                    self.log.write("- Did not recover in time — aborting sweep")
+                    return None
+                snap = snapshot_fields(summary(self.host))
+                pl = snap.get("power_limit_w") or self.base_watts * (LEVEL_LOW_PCT / 100.0)
+                inferred_pct = int(round(100.0 * pl / self.base_watts))
+                current_level_pct = (
+                    LEVEL_HIGH_PCT
+                    if abs(inferred_pct - LEVEL_HIGH_PCT) < abs(inferred_pct - LEVEL_LOW_PCT)
+                    else LEVEL_LOW_PCT
+                )
+                self._save_state(current_level_pct=current_level_pct)
+            # No-op / Error — leave current_level unchanged, next candidate.
+        return None
+
     def phase_b_alternate(self, winner_idx: int) -> None:
         """Cycle the confirmed command indefinitely between 50% and 60%."""
         cand = probe_candidates.CANDIDATES[winner_idx]
@@ -1132,13 +1208,14 @@ class ProbeOrchestrator:
             for c in self.state["candidates"]:
                 self.log.write(
                     f"  - {c['label']}: phase_a={c['phase_a_outcome']} "
+                    f"phase_b={c['phase_b_outcome']} "
                     f"confirm={c['phase_a_confirm_outcome']}"
                 )
         self._save_state(phase="complete", verdict=verdict)
 
     # ---- top-level run ----
 
-    def run(self) -> None:
+    def run(self, start_phase_b: bool = False) -> None:
         try:
             baseline = self.phase_0_setup()
             if baseline is None:
@@ -1148,13 +1225,17 @@ class ProbeOrchestrator:
                 return
 
             if stop_requested():
-                self.log.write("\nStop requested before Phase A — winding down.")
+                self.log.write("\nStop requested before sweep — winding down.")
                 self.phase_z_winddown()
                 self.write_verdict(None, False)
                 return
 
-            winner_idx = self.phase_a_sweep()
             confirmed = False
+            if start_phase_b:
+                winner_idx = self.phase_b_sweep()
+            else:
+                winner_idx = self.phase_a_sweep()
+
             if winner_idx is not None and not stop_requested():
                 confirmed = self.phase_a_confirm(winner_idx)
                 if confirmed and not stop_requested():
@@ -1210,6 +1291,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true",
                         help="Override single-instance lock (use with care)")
+    parser.add_argument("--start-phase-b", action="store_true",
+                        help="Skip Phase A; sweep candidates with Upfreq=1 pre-wait")
     args = parser.parse_args()
 
     if not args.force:
@@ -1243,7 +1326,7 @@ def main():
 
     _log(f"Probe starting. PID={os.getpid()} log={log_path}")
     orch = ProbeOrchestrator(config, log, run_id)
-    orch.run()
+    orch.run(start_phase_b=args.start_phase_b)
     _log("Probe finished.")
 
 
