@@ -1575,6 +1575,7 @@ function renderProbePanel(data) {
       <td><code>${c.label}</code></td>
       <td>${c.value_type}</td>
       <td>${formatOutcome(c.phase_a_outcome)}</td>
+      <td>${formatOutcome(c.phase_b_outcome)}</td>
       <td>${formatOutcome(c.phase_a_confirm_outcome)}</td>
       <td>${c.phase_b_cycle_count ?? 0}</td>
       <td>${formatOutcome(c.phase_b_last_outcome)}</td>
