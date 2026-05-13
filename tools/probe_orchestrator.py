@@ -833,10 +833,17 @@ class ProbeOrchestrator:
         return "Reset", polls
 
     def wait_for_recovery(self) -> bool:
-        """After a Reset, wait for Power > 0. Returns True if recovered."""
-        self.log.write(f"  - Waiting up to {RESET_RECOVERY_MAX_SECONDS//60} min for Power > 0")
+        """After a Reset, wait for power to stabilise (same ±50W for 2 consecutive polls and > 0).
+
+        This firmware keeps drawing idle power through recalibration so Power never
+        hits 0 — but the miner will return 'API command ERROR' if a privileged command
+        is sent while it is still in the acute phase of a reset. Waiting for stable
+        power (not full Upfreq=1) is enough to let the firmware accept the next candidate.
+        """
+        self.log.write(f"  - Waiting for power to stabilise after reset (cap {RESET_RECOVERY_MAX_SECONDS//60} min)")
         deadline = time.time() + RESET_RECOVERY_MAX_SECONDS
         last_safety_check = 0.0
+        prev_power: Optional[float] = None
         while time.time() < deadline:
             if stop_requested():
                 return False
@@ -851,10 +858,11 @@ class ProbeOrchestrator:
             snap = snapshot_fields(s)
             self._heartbeat(last_snapshot=snap)
             p = snap.get("power_w") or 0.0
-            if p > 1.0:
-                self.log.write(f"  - Recovered: Power={p}W")
+            if p > 1.0 and prev_power is not None and abs(p - prev_power) <= 50:
+                self.log.write(f"  - Power stable at {p}W — proceeding to next candidate")
                 return True
-        self.log.write(f"  - Recovery TIMEOUT after {RESET_RECOVERY_MAX_SECONDS//60} min")
+            prev_power = p if p > 1.0 else None
+        self.log.write(f"  - Recovery cap reached after {RESET_RECOVERY_MAX_SECONDS//60} min")
         return False
 
     # ---- sending candidates ----
