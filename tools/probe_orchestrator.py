@@ -554,6 +554,7 @@ class ProbeOrchestrator:
         self.run_id = run_id
 
         self.token_cache = TokenCache(self.host, self.pwd)
+        self._last_cmd_time: Optional[float] = None  # enforces 185s inter-command minimum
 
         # Persistent state mirror — written on every transition.
         self.state: Dict[str, Any] = {
@@ -876,6 +877,14 @@ class ProbeOrchestrator:
         cand = probe_candidates.CANDIDATES[candidate_idx]
         cmd_dict = probe_candidates.render(cand["cmd"], target_pct, self.base_watts)
         self.log.write(f"- Request cmd_dict (token redacted): `{json.dumps(cmd_dict)}`")
+
+        if self._last_cmd_time is not None:
+            elapsed = time.time() - self._last_cmd_time
+            if elapsed < GET_TOKEN_RATE_LIMIT_SECONDS:
+                wait = GET_TOKEN_RATE_LIMIT_SECONDS - elapsed
+                self.log.write(f"- Waiting {wait:.0f}s to respect 185s inter-command minimum")
+                time.sleep(wait)
+
         try:
             token_data = self.token_cache.get()
         except RuntimeError as e:
@@ -884,6 +893,7 @@ class ProbeOrchestrator:
 
         time.sleep(0.5)
         resp_obj, resp_text = send_aes(self.host, token_data, cmd_dict)
+        self._last_cmd_time = time.time()
         self.log.write(f"- Response (decrypted): `{resp_text[:300]}`")
 
         if isinstance(resp_obj, dict):
