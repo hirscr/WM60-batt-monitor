@@ -114,8 +114,15 @@ class AutoControlService:
         # re-issuing power_on during the ~60-90s firmware chip recalibration that
         # follows adjust_power_limit, during which Power Limit and MHS 5s both
         # read 0 (making is_off appear True even though the miner is reconfiguring).
-        _POST_CMD_GRACE_SEC = 120
+        _POST_CMD_GRACE_SEC = 300
         self._post_cmd_grace_sec: int = _POST_CMD_GRACE_SEC
+
+        # Last power tier we successfully enqueued. Power commands are only sent when
+        # this changes — the firmware resets on every adjust_power_limit regardless of
+        # whether the value changed, so resending the same tier causes an unnecessary
+        # recalibration cycle. Cleared to None on power_on (so a fresh start re-syncs)
+        # and on enable() (in case tier changed while autocontrol was disabled).
+        self._last_sent_pct: Optional[int] = None
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -141,6 +148,7 @@ class AutoControlService:
         self.enabled = True
         self.state.save(autocontrol=True)
         self.last_set_ts = 0.0  # Allow immediate action
+        self._last_sent_pct = None  # Re-sync tier on first tick
         print(f"[AutoControl] Enabled ({self.mode} mode)")
 
     def disable(self):
@@ -424,6 +432,7 @@ class AutoControlService:
                 print(f"{'='*60}\n")
                 return
             print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
+            self._last_sent_pct = None  # Force tier sync after power-on
             self.miner.power_on()
             self.last_set_ts = time.time()
             self.state.save(miner_power_state="running")
@@ -454,6 +463,7 @@ class AutoControlService:
                 print(f"{'='*60}\n")
                 return
             print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
+            self._last_sent_pct = None  # Force tier sync after power-on
             self.miner.power_on()
             self.last_set_ts = time.time()
             self.state.save(miner_power_state="running")
@@ -476,6 +486,7 @@ class AutoControlService:
         self.stop_reason = "emergency_soc"
         self.resume_at_soc = self.emergency_soc
         self.last_set_ts = time.time()
+        self._last_sent_pct = None  # Force tier re-sync when miner recovers from emergency
 
         print(f"[AutoControl] Condition met: Emergency shutdown (SOC={soc:.1f}% < {self.emergency_soc}%)")
 
@@ -621,11 +632,17 @@ class AutoControlService:
 
     def _set_power_with_rate_limit(self, target_pct: int):
         """
-        Set miner power with rate limiting.
+        Set miner power, but only when the SOC tier has changed.
 
         Args:
             target_pct: Target power percentage
         """
+        # Skip if tier hasn't changed — adjust_power_limit always causes a full
+        # firmware recalibration, even when the value is identical to what's running.
+        if self._last_sent_pct is not None and target_pct == self._last_sent_pct:
+            print(f"[AutoControl] Tier unchanged at {target_pct}% — no power command needed")
+            return
+
         wall_now = time.time()
 
         # Check rate limit
@@ -633,7 +650,7 @@ class AutoControlService:
             print(f"[AutoControl] Rate limited - last adjustment {int(wall_now - self.last_set_ts)}s ago")
             return
 
-        print(f"[AutoControl] Sending power command: {target_pct}%...")
+        print(f"[AutoControl] Sending power command: {target_pct}% (was {self._last_sent_pct}%)...")
 
         def _on_verified():
             print(f"[AutoControl] ✓ Power verified at {target_pct}%")
@@ -642,6 +659,7 @@ class AutoControlService:
             self.miner.set_power_pct(target_pct, on_verified=_on_verified)
             self.last_set_w = int(self.base_watts * (target_pct / 100.0))
             self.last_set_ts = wall_now
+            self._last_sent_pct = target_pct
             self.state.save(target_power_pct=target_pct)
 
             print(f"[AutoControl] Power command queued ({target_pct}%)")
