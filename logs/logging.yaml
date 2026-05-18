@@ -1,0 +1,17 @@
+# Logging tag config for WM Controller.
+# Each tag is a named boolean. Log calls only emit when their tag is true.
+# Toggle tags here to control runtime logging without code changes.
+# All tags default to false. Add new tags as needed; convention is UPPER_SNAKE.
+
+tags:
+  # Example tags — add real ones as logging is added to the codebase.
+  AUTOCONTROL: false
+  BATTERY_FRESHNESS: false
+  MINER_RPC: false
+  EG4_SESSION: false
+  NETWORK_SCAN: false
+  POWER_COMMAND: false
+  # Weather-gate feature — keep enabled while the feature is new so the
+  # operator can observe the first few pre-sunrise evaluations.
+  WEATHER: true
+  WEATHER_GATE: true

@@ -38,6 +38,8 @@ class AutoControlService:
                  mode: str,
                  away_config: dict,
                  location_config: dict,
+                 weather_service=None,
+                 weather_gate=None,
                  **kwargs):
         """
         Initialize auto-control service.
@@ -51,6 +53,9 @@ class AutoControlService:
             mode: Control mode ("away" or "present")
             away_config: Away mode configuration dict
             location_config: Location configuration for sunset
+            weather_service: Optional WeatherService instance for forecast data
+            weather_gate: Optional WeatherGate instance owning the pre-sunrise
+                evaluation. When None, the weather gate is bypassed entirely.
         """
         self.miner = miner_service
         self.battery = battery_service
@@ -58,6 +63,8 @@ class AutoControlService:
         self.base_watts = base_watts
         self.min_interval_sec = min_interval_sec
         self.mode = mode
+        self.weather = weather_service
+        self.weather_gate = weather_gate
 
         # Away mode configuration — emergency_soc may be overridden by persisted runtime value
         config_emergency_soc = away_config.get("emergency_soc", 30)
@@ -308,6 +315,15 @@ class AutoControlService:
 
         is_miner_off = self.miner.is_off
 
+        # WEATHER GATE (additive): pre-sunrise check decides whether the day's
+        # forecast solar harvest can refill the battery. If not, autocontrol is
+        # held off for the day with stop_reason="weather_disabled". Recovery
+        # may re-enable later if SOC climbs back in time. The battery_stale
+        # gate above always wins.
+        if self._evaluate_weather_gate(soc):
+            self._apply_weather_disabled(soc)
+            return
+
         if not isinstance(soc, (int, float)):
             print("[AutoControl] No valid SOC data")
             return
@@ -528,6 +544,80 @@ class AutoControlService:
             self.state.save(emergency_active=False)
             print(f"[AutoControl] Emergency latch CLEARED (SOC={soc:.1f}% >= 90% and verified off)")
 
+    # ---- Weather gate helpers ----
+
+    def _evaluate_weather_gate(self, soc: Optional[float]) -> bool:
+        """Run one weather-gate tick. Return True iff caller should hold the
+        miner off with stop_reason="weather_disabled" this tick.
+        """
+        if self.weather_gate is None or self.weather is None:
+            return False
+        try:
+            forecast = self.weather.get_today_forecast()
+            outcome = self.weather_gate.evaluate(
+                soc_pct=soc,
+                battery_fresh=self.battery.is_fresh(),
+                forecast=forecast,
+            )
+        except Exception as exc:
+            print(f"[AutoControl] Weather gate evaluation error: {exc}")
+            # On error, do not force-disable — defer to existing logic.
+            return False
+        # The single source of truth is gate.disabled (set by evaluate()).
+        # The outcome string is informational; gate.disabled drives behavior.
+        return bool(self.weather_gate.disabled)
+
+    def force_evaluate_weather_gate(self) -> dict:
+        """Force an immediate gate evaluation outside the normal window guard.
+
+        Used by /api/weather/evaluate_now. Returns the gate's snapshot after
+        running. If no weather_gate is wired, returns an empty dict with a note.
+        """
+        if self.weather_gate is None or self.weather is None:
+            return {"error": "weather_gate_not_configured"}
+
+        # Bypass the once-per-day guard so the operator can re-run the
+        # decision on demand.
+        self.weather_gate.evaluated_date = None
+        soc = None
+        try:
+            snap = self.battery.get_status()
+            soc = snap.get("soc_percent")
+        except Exception:
+            pass
+        forecast = self.weather.get_today_forecast()
+        outcome = self.weather_gate.evaluate(
+            soc_pct=soc,
+            battery_fresh=self.battery.is_fresh(),
+            forecast=forecast,
+        )
+        state = self.weather_gate.get_state()
+        state["outcome"] = outcome
+        return state
+
+    def _apply_weather_disabled(self, soc: Optional[float]):
+        """Force-stop the miner with stop_reason='weather_disabled'."""
+        gate_state = self.weather_gate.get_state() if self.weather_gate else {}
+        reason_detail = gate_state.get("reason") or "weather_disabled"
+        expected = gate_state.get("expected_kwh")
+        deficit = gate_state.get("deficit_kwh")
+        self.target_pct = 0
+        self.target_w = 0
+        self.current_state_description = (
+            f"Weather gate disabled autocontrol ({reason_detail})."
+        )
+        self.stop_reason = "weather_disabled"
+        self.resume_at_soc = None
+        soc_str = f"{soc:.1f}%" if isinstance(soc, (int, float)) else "?"
+        exp_str = f"{expected:.2f}" if isinstance(expected, (int, float)) else "?"
+        def_str = f"{deficit:.2f}" if isinstance(deficit, (int, float)) else "?"
+        print(
+            f"[AutoControl] Weather gate active ({reason_detail}) — "
+            f"SOC={soc_str}, expected={exp_str}kWh, deficit={def_str}kWh"
+        )
+        if not self.miner.is_off:
+            self.miner.power_off()
+
     def _emergency_stop_with_verify(self) -> bool:
         """Send emergency_power_off and verify via re-poll. Up to 5 attempts.
         Returns True if verified-off condition is confirmed, False otherwise.
@@ -705,6 +795,16 @@ class AutoControlService:
             effective_stop_reason = self.stop_reason
             effective_resume_at_soc = self.resume_at_soc
 
+        # If the weather gate is holding the miner off, override the derived
+        # stop_reason so the dashboard banner can display the new state.
+        if self.weather_gate is not None and self.weather_gate.disabled and self.enabled:
+            effective_stop_reason = "weather_disabled"
+            effective_resume_at_soc = None
+
+        weather_gate_state = (
+            self.weather_gate.get_state() if self.weather_gate is not None else None
+        )
+
         return {
             "enabled": self.enabled,
             "mode": self.mode,
@@ -724,4 +824,5 @@ class AutoControlService:
             "emergency_active": self.emergency_active,
             "emergency_verified_off": self.emergency_verified_off,
             "emergency_attempts_this_latch": self.emergency_attempts_this_latch,
+            "weather_gate": weather_gate_state,
         }

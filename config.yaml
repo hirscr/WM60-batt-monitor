@@ -51,3 +51,21 @@ app:
   port: 8080
   host: "0.0.0.0"  # Bind to all interfaces (accessible from network)
   debug: false
+
+# Weather-gated autocontrol — pre-sunrise check that decides whether the day's
+# forecasted solar harvest can both refill the battery and power the miner.
+# When the forecast is insufficient, autocontrol is disabled for the day so the
+# battery can charge fully from solar. Editable fields can be tuned at runtime
+# from the dashboard (POST /api/weather/config); refresh/freshness are
+# config-only.
+weather_gate:
+  enabled: true                       # master switch — false disables the gate entirely
+  battery_total_kwh: 75.0             # nominal pack capacity (kWh) used for deficit calc
+  summer_max_kwh: 75.0                # cloud-free harvest on/around summer solstice
+  winter_max_kwh: 30.0                # cloud-free harvest on/around winter solstice
+  safety_factor: 1.1                  # expected_kwh must clear deficit * this to keep on
+  pre_sunrise_window_minutes: 30      # evaluate during this window before sunrise
+  recovery_soc_threshold_pct: 90      # re-enable autocontrol when SOC reaches this
+  recovery_min_hours_before_sunset: 3.0  # only recover if at least this much daylight remains
+  forecast_refresh_seconds: 3600      # how often to poll Open-Meteo (config-only)
+  forecast_freshness_seconds: 7200    # snapshot older than this is considered stale

@@ -29,9 +29,9 @@ from services.battery_service import BatteryService
 from services.autocontrol_service import AutoControlService
 from services.network_scanner import NetworkScanner
 from services.braiins_service import BraiinsService
-
-# API blueprints
-from api.probe import probe_bp
+from services.weather_service import WeatherService
+from services.weather_gate import WeatherGate, WeatherGateConfigSnapshot
+from api.weather import create_blueprint as create_weather_blueprint
 
 # ========== LOG BUFFER ==========
 class LogBuffer:
@@ -109,9 +109,6 @@ sys.stderr = LogCapture(sys.stderr, "error")
 # Initialize Flask app
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
-# Register API blueprints
-app.register_blueprint(probe_bp)
-
 # Load settings
 print("[APP] Loading configuration...")
 settings = load_settings()
@@ -148,6 +145,43 @@ battery_service = BatteryService(
     session_refresh_hours=settings.battery.session_refresh_hours
 )
 
+# Weather service — Open-Meteo forecast cache, refreshed hourly. Polls the
+# free keyless endpoint with the autocontrol location coordinates so the
+# weather gate can decide whether the day's expected solar harvest is enough.
+weather_service = WeatherService(
+    latitude=settings.autocontrol.location.latitude,
+    longitude=settings.autocontrol.location.longitude,
+    timezone_str=settings.autocontrol.location.timezone,
+    refresh_seconds=settings.weather_gate.forecast_refresh_seconds,
+    freshness_seconds=settings.weather_gate.forecast_freshness_seconds,
+)
+
+
+def _weather_gate_config_snapshot() -> WeatherGateConfigSnapshot:
+    """Per-tick view of editable weather_gate parameters.
+
+    Reads from the live settings object so /api/weather/config edits land
+    immediately without a service restart.
+    """
+    wg = settings.weather_gate
+    return WeatherGateConfigSnapshot(
+        enabled=wg.enabled,
+        battery_total_kwh=wg.battery_total_kwh,
+        summer_max_kwh=wg.summer_max_kwh,
+        winter_max_kwh=wg.winter_max_kwh,
+        safety_factor=wg.safety_factor,
+        pre_sunrise_window_minutes=wg.pre_sunrise_window_minutes,
+        recovery_soc_threshold_pct=wg.recovery_soc_threshold_pct,
+        recovery_min_hours_before_sunset=wg.recovery_min_hours_before_sunset,
+    )
+
+
+weather_gate = WeatherGate(
+    state_manager=state_mgr,
+    timezone_str=settings.autocontrol.location.timezone,
+    config_provider=_weather_gate_config_snapshot,
+)
+
 # Auto-control service
 autocontrol_service = AutoControlService(
     miner_service=miner_service,
@@ -166,8 +200,15 @@ autocontrol_service = AutoControlService(
         "longitude": settings.autocontrol.location.longitude,
         "timezone": settings.autocontrol.location.timezone
     },
+    weather_service=weather_service,
+    weather_gate=weather_gate,
     sunset_hour=settings.autocontrol.sunset_hour,
     sunset_minute=settings.autocontrol.sunset_minute
+)
+
+# Register the weather blueprint now that its three collaborators exist.
+app.register_blueprint(
+    create_weather_blueprint(weather_service, autocontrol_service, settings)
 )
 
 # Network scanner
@@ -791,6 +832,7 @@ if __name__ == "__main__":
     print("[APP] Starting services...")
     miner_service.start()
     battery_service.start()
+    weather_service.start()
     autocontrol_service.start()
     network_scanner.start_background_scan()
     if _braiins_enabled:

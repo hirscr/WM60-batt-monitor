@@ -148,49 +148,64 @@
     </div>
   </div>
 
-  <!-- Probe Orchestrator Panel (auto-hides when no probe state file present) -->
-  <div class="card" id="probePanel" style="display:none;">
-    <div class="probe-header">
-      <h2>Power-Tuning Probe</h2>
-      <button id="probeStopBtn" class="probe-stop-btn" onclick="stopProbe()">Stop Probe</button>
+  <!-- Weather Gate Card -->
+  <div class="card" id="weatherCard">
+    <div class="weather-header">
+      <h2>Weather Gate</h2>
+      <button id="weatherEvaluateBtn" class="btn-small" onclick="forceEvaluateWeatherGate()">Force re-evaluate</button>
     </div>
-    <div id="probeOrchestratorWarning" class="probe-warning" style="display:none;">
-      ORCHESTRATOR DEAD — restart via ssh + tools/_launch_probe.sh
+
+    <!-- Section A: Today's forecast + decision (read-only) -->
+    <div class="weather-section">
+      <h3>Today's forecast</h3>
+      <div class="weather-grid">
+        <div>Sunrise:</div><div id="weatherSunrise">—</div>
+        <div>Sunset:</div><div id="weatherSunset">—</div>
+        <div>Cloud cover:</div><div id="weatherCloudCover">—</div>
+        <div>Max for day:</div><div id="weatherMaxForDay">—</div>
+        <div>Expected energy:</div><div id="weatherExpected">—</div>
+        <div>Current SOC:</div><div id="weatherSoc">—</div>
+        <div>Deficit:</div><div id="weatherDeficit">—</div>
+        <div>Last evaluated:</div><div id="weatherEvaluatedAt">—</div>
+      </div>
+      <div id="weatherDecisionBanner" class="weather-decision weather-decision-neutral">—</div>
+      <div id="weatherFreshness" class="weather-freshness">Forecast freshness: —</div>
     </div>
-    <div class="probe-summary">
-      <div class="probe-grid">
-        <div>Phase:</div><div id="probePhase">—</div>
-        <div>Safety:</div><div id="probeSafety">—</div>
-        <div>Candidate:</div><div id="probeCandidate">—</div>
-        <div>Target:</div><div id="probeTarget">—</div>
-        <div>Current level:</div><div id="probeCurrentLevel">—</div>
-        <div>Heartbeat:</div><div id="probeHeartbeat">—</div>
-        <div>PID alive:</div><div id="probePidAlive">—</div>
-        <div>Run ID:</div><div id="probeRunId">—</div>
+
+    <!-- Section B: Editable parameters -->
+    <div class="weather-section">
+      <h3>Parameters</h3>
+      <div class="weather-config-grid">
+        <label>Master enable
+          <input type="checkbox" id="weatherCfgEnabled" />
+        </label>
+        <label>Battery total (kWh)
+          <input type="number" id="weatherCfgBatteryKwh" step="0.1" min="0.1" />
+        </label>
+        <label>Summer max (kWh)
+          <input type="number" id="weatherCfgSummerKwh" step="0.1" min="0.1" />
+        </label>
+        <label>Winter max (kWh)
+          <input type="number" id="weatherCfgWinterKwh" step="0.1" min="0.1" />
+        </label>
+        <label>Safety factor (1.0–2.0)
+          <input type="number" id="weatherCfgSafetyFactor" step="0.05" min="1.0" max="2.0" />
+        </label>
+        <label>Pre-sunrise window (min)
+          <input type="number" id="weatherCfgPreSunriseMin" step="1" min="0" max="240" />
+        </label>
+        <label>Recovery SOC (%)
+          <input type="number" id="weatherCfgRecoverySoc" step="1" min="0" max="100" />
+        </label>
+        <label>Min hours before sunset for recovery
+          <input type="number" id="weatherCfgRecoveryHours" step="0.25" min="0" max="12" />
+        </label>
       </div>
-      <div class="probe-snapshot">
-        <span>Last miner snapshot:</span> <code id="probeLastSnapshot">—</code>
-      </div>
-      <div class="probe-verdict" id="probeVerdictBlock" style="display:none;">
-        <strong>Verdict:</strong> <span id="probeVerdict"></span>
+      <div class="weather-save-row">
+        <button class="btn-small" onclick="saveWeatherConfig()">Save</button>
+        <span id="weatherSaveStatus" class="weather-save-status"></span>
       </div>
     </div>
-    <h3>Candidates</h3>
-    <table class="probe-candidates-table">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Label</th>
-          <th>Type</th>
-          <th>Phase A</th>
-          <th>Phase B</th>
-          <th>Confirm</th>
-          <th>B cycles</th>
-          <th>B last</th>
-        </tr>
-      </thead>
-      <tbody id="probeCandidatesBody"></tbody>
-    </table>
   </div>
 
   <!-- Network Devices -->

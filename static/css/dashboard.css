@@ -569,85 +569,101 @@ h2 {
   }
 }
 
-/* ===== Probe Orchestrator Panel ===== */
-#probePanel .probe-header {
+/* ===== Weather Gate Card ===== */
+#weatherCard .weather-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 10px;
 }
-#probePanel .probe-stop-btn {
-  background: #c0392b;
-  color: white;
-  border: none;
-  padding: 8px 16px;
-  border-radius: 4px;
-  font-weight: bold;
-  cursor: pointer;
+#weatherCard .weather-section {
+  border-top: 1px solid #eee;
+  padding-top: 8px;
+  margin-top: 8px;
 }
-#probePanel .probe-stop-btn:disabled {
-  background: #aaa;
-  cursor: not-allowed;
+#weatherCard .weather-section:first-of-type {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
 }
-#probePanel .probe-warning {
-  background: #fff1f0;
-  color: #a8071a;
-  border: 1px solid #ffa39e;
-  padding: 8px 12px;
-  border-radius: 4px;
-  margin-bottom: 10px;
-  font-weight: bold;
+#weatherCard .weather-section h3 {
+  margin: 0 0 6px 0;
+  font-size: 0.95em;
+  color: #555;
 }
-#probePanel .probe-grid {
+#weatherCard .weather-grid {
   display: grid;
-  grid-template-columns: max-content 1fr max-content 1fr;
+  grid-template-columns: max-content 1fr;
   gap: 4px 12px;
   font-size: 0.92em;
   margin-bottom: 8px;
 }
-#probePanel .probe-grid > div:nth-child(odd) {
+#weatherCard .weather-grid > div:nth-child(odd) {
   font-weight: 600;
   color: #555;
 }
-#probePanel .probe-snapshot {
-  font-size: 0.88em;
-  color: #444;
-  margin-bottom: 8px;
-}
-#probePanel .probe-snapshot code {
-  background: #f5f5f5;
-  padding: 2px 6px;
-  border-radius: 3px;
-}
-#probePanel .probe-verdict {
-  background: #f6ffed;
-  border: 1px solid #b7eb8f;
+#weatherCard .weather-decision {
+  margin-top: 8px;
   padding: 8px 12px;
   border-radius: 4px;
-  margin: 8px 0;
+  font-weight: bold;
 }
-#probePanel .probe-safety-ok { color: #237804; font-weight: 600; }
-#probePanel .probe-safety-warn { color: #a8071a; font-weight: 600; }
-#probePanel .probe-pid-ok { color: #237804; }
-#probePanel .probe-pid-dead { color: #a8071a; font-weight: 600; }
-#probePanel .probe-candidates-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.88em;
-  margin-top: 8px;
+#weatherCard .weather-decision-on {
+  background: #f6ffed;
+  color: #237804;
+  border: 1px solid #b7eb8f;
 }
-#probePanel .probe-candidates-table th,
-#probePanel .probe-candidates-table td {
-  text-align: left;
-  padding: 4px 8px;
-  border-bottom: 1px solid #eee;
+#weatherCard .weather-decision-off {
+  background: #fff7e6;
+  color: #ad4e00;
+  border: 1px solid #ffd591;
 }
-#probePanel .probe-candidates-table th {
+#weatherCard .weather-decision-recovered {
+  background: #e6f7ff;
+  color: #0050b3;
+  border: 1px solid #91d5ff;
+}
+#weatherCard .weather-decision-neutral {
   background: #fafafa;
+  color: #555;
+  border: 1px solid #eee;
 }
-#probePanel .probe-candidate-current { background: #fffbe6; }
-#probePanel .probe-outcome-success { color: #237804; font-weight: 600; }
-#probePanel .probe-outcome-reset { color: #a8071a; font-weight: 600; }
-#probePanel .probe-outcome-noop { color: #555; }
-#probePanel .probe-outcome-error { color: #d46b08; font-weight: 600; }
-#probePanel .probe-outcome-timeout { color: #531dab; }
+#weatherCard .weather-freshness {
+  margin-top: 6px;
+  font-size: 0.85em;
+  color: #888;
+}
+#weatherCard .weather-config-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(160px, 1fr));
+  gap: 8px 16px;
+  margin-bottom: 8px;
+}
+#weatherCard .weather-config-grid label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.88em;
+  color: #444;
+  gap: 4px;
+}
+#weatherCard .weather-config-grid input[type="number"] {
+  padding: 4px 6px;
+  font-size: 0.95em;
+  border: 1px solid #ddd;
+  border-radius: 3px;
+}
+#weatherCard .weather-save-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+#weatherCard .weather-save-status {
+  font-size: 0.88em;
+  color: #555;
+}
+@media (max-width: 600px) {
+  #weatherCard .weather-config-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
