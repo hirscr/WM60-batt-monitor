@@ -5,6 +5,91 @@
 
 ---
 
+## 🔔 PENDING FOREMAN DISPATCH (2026-05-18)
+
+**File**: `FOREMAN_PROMPT_TIER_PROMOTION.md` (project root)
+
+**Status**: Drafted in a FIXER session on 2026-05-18. Spec was negotiated
+in detail with the user. NOT YET DISPATCHED. Per CLAUDE.md DISPATCH RULE,
+dispatch requires explicit user "OK" first.
+
+**Scope summary**:
+- Extend `services/weather_service.py` to fetch Open-Meteo hourly cloud
+  cover and expose `cloud_cover_remaining_daylight_pct` (mean from now
+  through today's sunset).
+- Replace Priorities 2 and 3 in `services/autocontrol_service.py` with
+  weather-aware tier promotion:
+  - SOC crosses upward through 90% AND remaining-daylight cloud cover < 10%
+    AND > 3h before sunset → promote to 90% tier (one-shot).
+  - From 90% tier, SOC crosses upward through 99% with same conditions →
+    promote to 100% tier.
+- Demotion is SOC-driven only: 100→90 when SOC < 99, 90→Priority 5 (80%)
+  when SOC < 90. Each demotion arms a 30-minute cooldown for that tier.
+- Stale forecast / past-sunset / unreachable WeatherService blocks
+  promotion but never forces demotion.
+- Persist new state via `utils/state_manager.py`; surface in
+  `/api/autocontrol/status` and dashboard.
+- No Pi deployment in this task.
+
+**Already shipped** (commit `f5705d0`, 2026-05-18): weather_gate (daily
+pre-sunrise decision), WeatherService, solar model, weather config API,
+weather card UI, full Power-Tuning Probe removal. Tier promotion is the
+in-tick complement to the daily gate.
+
+---
+
+## 🚨 KNOWN ISSUE — User "Power" toggle flips OFF on its own (2026-05-18)
+
+**Severity**: Functional bug. The toggle is a USER COMMAND, not a status indicator.
+
+**Symptom**: The "Power" checkbox/toggle on the dashboard (the user-facing
+master kill switch the user clicks to shut the miner down) flips to OFF on
+its own during transient autocontrol verification failures, even though the
+user did not click it. User observed this at ~11:40 AM ET on 2026-05-18.
+
+**Trigger observed**: At 11:33 AM ET autocontrol ratcheted the SOC tier from
+60% → 70%, sending `adjust_power_limit` via the privileged NCMinerAPI path.
+The `MinerController` reported `✗ Verification failed for power_pct`. As a
+side effect of the failed privileged-op sequence, the miner physically
+powered off (a known firmware quirk on this WhatsMiner — failed token-based
+ops can leave the miner in a powered-down state). Autocontrol waited 300s
+(grace period), then issued AES `power_on`. By ~11:41 the miner was ramping
+back up. By 11:50 it was hashing again at 33+ TH/s.
+
+During that 5–8 minute window, **the user-facing Power toggle showed OFF**.
+That is incorrect: the user never clicked anything. The toggle should only
+ever change in response to a user action; it should not mirror the
+miner's transient powered-down state.
+
+**Root cause hypothesis**: dashboard JS or backend state is conflating
+"miner is_off" (status) with "user wants miner off" (intent). Likely in
+`static/js/dashboard.js` near `updateMinerStatus()` or a `power_toggle`
+handler, or in the backend where the user-intent state is persisted.
+
+**Fix direction (not implemented; do not start without explicit approval)**:
+- Identify the dashboard element the user means by "power checkbox" —
+  almost certainly a manual on/off toggle separate from the autocontrol
+  enable toggle.
+- Audit any code path that writes to that toggle's persisted state. The
+  only writer should be the user-action handler (the POST endpoint
+  triggered by a click).
+- Ensure no service-side code (MinerService, AutoControlService,
+  MinerController) ever sets the user-intent flag based on `is_off`,
+  verification failures, or any other observed miner status.
+
+**Related**: STATE.md "Phase 1 verification" already documented the
+firmware quirk and the 300s grace period — those mitigations are working
+correctly. This issue is purely about the UI/state-management contract,
+not the autocontrol safety logic.
+
+---
+
+**Pi tailscale address**: `raspyvpn` / `100.96.1.104` (user `hirscr`).
+LAN address `192.168.86.46` only works from the install site's local
+network; remote sessions must use the tailscale name.
+
+---
+
 ## Priority Blocks Landed
 
 ### Priority 1 — Battery freshness safety gate ✅
