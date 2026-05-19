@@ -1609,7 +1609,7 @@ async function refreshWeatherCard() {
 }
 
 function renderWeatherCard(data) {
-  const card = document.getElementById('weatherCard');
+  const card = document.getElementById('weatherForecastCard');
   if (!card) return;
   const forecast = data.forecast || {};
   const gate = data.gate || {};
@@ -1674,6 +1674,10 @@ function renderWeatherCard(data) {
     }
   }
 
+  // Section A2: Tier promotion — sourced from autocontrol/status (the main
+  // poll loop already fetches it). Falls back to '—' before the first poll.
+  renderTierPromotion();
+
   // Section B: editable config — only populate the inputs once, otherwise
   // typing would get clobbered on every poll.
   if (!weatherCardLoaded) {
@@ -1687,6 +1691,71 @@ function renderWeatherCard(data) {
     const enabledEl = document.getElementById('weatherCfgEnabled');
     if (enabledEl) enabledEl.checked = !!cfg.enabled;
     weatherCardLoaded = true;
+  }
+}
+
+function renderTierPromotion() {
+  const auto = state.lastAutocontrolStatus || {};
+  const tp = auto.tier_promotion || {};
+  const tier = tp.tier;
+
+  // "Tier: 80% / 90% / 100%" — when the tier-promotion service is not
+  // promoting (tier=null), the effective tier is the decile table cap (80%).
+  let tierLabel = '80%';
+  if (tier === 100) tierLabel = '100%';
+  else if (tier === 90) tierLabel = '90%';
+  setText('tierPromoTier', tierLabel);
+
+  const lastSoc = tp.last_seen_soc;
+  setText(
+    'tierPromoLastSoc',
+    (typeof lastSoc === 'number') ? lastSoc.toFixed(1) + '%' : '—'
+  );
+
+  setText('tierPromoCooldown90', formatCooldown(tp.cooldown_remaining_90_sec));
+  setText('tierPromoCooldown100', formatCooldown(tp.cooldown_remaining_100_sec));
+
+  const detail = document.getElementById('tierPromoDetail');
+  if (!detail) return;
+  detail.className = 'tier-promo-detail';
+  if (tier === 100 || tier === 90) {
+    detail.classList.add('tier-promo-active');
+    const sunsetStr = (auto.weather_gate && auto.weather_gate.sunset_dt) || null;
+    const hoursStr = hoursUntil(sunsetStr);
+    const hoursPart = hoursStr ? ` — ${hoursStr} to sunset` : '';
+    detail.textContent = `Promoted to ${tier}% — clear sky${hoursPart}.`;
+  } else if (
+    (tp.cooldown_remaining_90_sec && tp.cooldown_remaining_90_sec > 0) ||
+    (tp.cooldown_remaining_100_sec && tp.cooldown_remaining_100_sec > 0)
+  ) {
+    detail.classList.add('tier-promo-cooldown');
+    const c90 = tp.cooldown_remaining_90_sec || 0;
+    const c100 = tp.cooldown_remaining_100_sec || 0;
+    const active = c100 > c90 ? c100 : c90;
+    const tierName = c100 > c90 ? '100%' : '90%';
+    detail.textContent = `Cooldown: ${Math.ceil(active / 60)}m remaining (${tierName} re-promotion blocked).`;
+  } else {
+    detail.textContent = 'Tier promotion inactive — falling through to decile table.';
+  }
+}
+
+function formatCooldown(sec) {
+  if (sec == null || sec <= 0) return 'inactive';
+  if (sec >= 60) return `${Math.ceil(sec / 60)}m remaining`;
+  return `${sec}s remaining`;
+}
+
+function hoursUntil(isoOrNull) {
+  if (!isoOrNull) return null;
+  try {
+    const dt = new Date(isoOrNull);
+    if (isNaN(dt.getTime())) return null;
+    const diffSec = (dt.getTime() - Date.now()) / 1000;
+    if (diffSec <= 0) return null;
+    const h = diffSec / 3600;
+    return h >= 1 ? `${h.toFixed(1)}h` : `${Math.round(diffSec / 60)}m`;
+  } catch {
+    return null;
   }
 }
 

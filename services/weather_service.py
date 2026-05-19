@@ -68,7 +68,8 @@ class WeatherService:
 
         # Cached snapshot. Populated after first successful poll.
         # Shape: {"cloud_cover_pct": float, "sunrise_dt": datetime,
-        #         "sunset_dt": datetime, "for_date": date, "fetched_at": datetime}
+        #         "sunset_dt": datetime, "for_date": date, "fetched_at": datetime,
+        #         "hourly_times": list[datetime], "hourly_cloud_cover": list[float]}
         self._snapshot: Optional[dict] = None
         self._last_error: Optional[str] = None
 
@@ -106,6 +107,7 @@ class WeatherService:
 
             {
                 "cloud_cover_pct": float | None,
+                "cloud_cover_remaining_daylight_pct": float | None,
                 "sunrise_dt": datetime | None,
                 "sunset_dt": datetime | None,
                 "for_date": date | None,
@@ -114,6 +116,11 @@ class WeatherService:
                 "is_fresh": bool,
                 "last_error": str | None,
             }
+
+        `cloud_cover_remaining_daylight_pct` is the arithmetic mean of hourly
+        cloud cover from the current hour through the sunset hour, inclusive.
+        It is None when we're past sunset, hourly data is missing/malformed,
+        or no snapshot exists yet.
         """
         with self._lock:
             snap = dict(self._snapshot) if self._snapshot else None
@@ -122,6 +129,7 @@ class WeatherService:
         if snap is None:
             return {
                 "cloud_cover_pct": None,
+                "cloud_cover_remaining_daylight_pct": None,
                 "sunrise_dt": None,
                 "sunset_dt": None,
                 "for_date": None,
@@ -132,8 +140,14 @@ class WeatherService:
             }
 
         age = self._age_seconds_from(snap.get("fetched_at"))
+        remaining = self._remaining_daylight_cloud_cover(
+            snap.get("hourly_times"),
+            snap.get("hourly_cloud_cover"),
+            snap.get("sunset_dt"),
+        )
         return {
             "cloud_cover_pct": snap.get("cloud_cover_pct"),
+            "cloud_cover_remaining_daylight_pct": remaining,
             "sunrise_dt": snap.get("sunrise_dt"),
             "sunset_dt": snap.get("sunset_dt"),
             "for_date": snap.get("for_date"),
@@ -208,6 +222,7 @@ class WeatherService:
             "longitude": f"{self._longitude}",
             "timezone": self._timezone_str,
             "daily": "cloud_cover_mean,sunrise,sunset",
+            "hourly": "cloud_cover",
             "forecast_days": "1",
         }
         url = OPEN_METEO_URL + "?" + urllib.parse.urlencode(params)
@@ -246,13 +261,94 @@ class WeatherService:
         sunset_dt = self._iso_local(sunset_str, tz)
         fetched_at = datetime.now(timezone.utc)
 
+        # Hourly arrays are optional. Open-Meteo always returns them when
+        # `hourly=` is in the query, but a defensive parse keeps the daily
+        # snapshot intact when the hourly block is missing or malformed.
+        hourly_times, hourly_cloud_cover = self._parse_hourly(payload, tz)
+
         return {
             "cloud_cover_pct": float(cloud_cover) if cloud_cover is not None else None,
             "sunrise_dt": sunrise_dt,
             "sunset_dt": sunset_dt,
             "for_date": for_date,
             "fetched_at": fetched_at,
+            "hourly_times": hourly_times,
+            "hourly_cloud_cover": hourly_cloud_cover,
         }
+
+    @staticmethod
+    def _parse_hourly(payload: dict, tz: ZoneInfo) -> tuple:
+        """Pull hourly time + cloud cover arrays. Returns (None, None) when
+        the hourly block is missing or malformed — callers treat that as
+        'unknown remaining-daylight cloud cover'.
+        """
+        hourly = payload.get("hourly")
+        if not isinstance(hourly, dict):
+            return None, None
+        times = hourly.get("time")
+        clouds = hourly.get("cloud_cover")
+        if not isinstance(times, list) or not isinstance(clouds, list):
+            return None, None
+        if len(times) != len(clouds):
+            return None, None
+        parsed_times: list = []
+        for entry in times:
+            try:
+                dt = datetime.fromisoformat(entry)
+            except (TypeError, ValueError):
+                return None, None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=tz)
+            parsed_times.append(dt)
+        parsed_clouds: list = []
+        for v in clouds:
+            try:
+                parsed_clouds.append(float(v))
+            except (TypeError, ValueError):
+                return None, None
+        return parsed_times, parsed_clouds
+
+    def _remaining_daylight_cloud_cover(
+        self,
+        hourly_times,
+        hourly_cloud_cover,
+        sunset_dt,
+    ) -> Optional[float]:
+        """Mean hourly cloud cover from the current hour through the sunset
+        hour, inclusive. Returns None when past sunset, missing inputs, or
+        malformed data leaves no eligible hours.
+
+        Rule details:
+          - Bin the current local time down to the top of the hour.
+          - Include every hourly bucket whose timestamp is in
+            [current_hour, sunset_hour] inclusive.
+          - "Sunset hour" is the floor-hour of sunset_dt (so a 19:42 sunset
+            keeps the 19:00 bucket in the average).
+        """
+        if not hourly_times or not hourly_cloud_cover or sunset_dt is None:
+            return None
+        if len(hourly_times) != len(hourly_cloud_cover):
+            return None
+        try:
+            tz = sunset_dt.tzinfo or ZoneInfo(self._timezone_str)
+        except Exception:
+            return None
+        now_local = self._now_local(tz)
+        if now_local >= sunset_dt:
+            return None
+        current_hour = now_local.replace(minute=0, second=0, microsecond=0)
+        sunset_hour = sunset_dt.replace(minute=0, second=0, microsecond=0)
+        if sunset_hour < current_hour:
+            return None
+        values = []
+        for ts, val in zip(hourly_times, hourly_cloud_cover):
+            if not isinstance(ts, datetime):
+                continue
+            if current_hour <= ts <= sunset_hour:
+                values.append(float(val))
+        if not values:
+            return None
+        return sum(values) / len(values)
 
     @staticmethod
     def _iso_local(iso_str: str, tz: ZoneInfo) -> datetime:
@@ -263,6 +359,13 @@ class WeatherService:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=tz)
         return dt
+
+    @staticmethod
+    def _now_local(tz: ZoneInfo) -> datetime:
+        """Wallclock 'now' in the given timezone. Wrapped so tests can patch
+        a single method instead of mocking the datetime module wholesale.
+        """
+        return datetime.now(tz)
 
     @staticmethod
     def _age_seconds_from(fetched_at: Optional[datetime]) -> Optional[float]:

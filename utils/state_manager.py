@@ -5,6 +5,14 @@ DEFAULT_STATE = {
     "miner_power_state": "stopped", # "stopped", "running", or "pending"
     "target_power_pct": 0,          # e.g., 40 for 40 percent
     "emergency_soc": None,          # runtime override for emergency SOC %; None means use config value
+    # Tier-promotion state — owned by services/tier_promotion.py. Timestamps
+    # are monotonic-clock samples; only meaningful within a single process.
+    # They are persisted to avoid spurious post-restart promotions, even though
+    # the cooldown math compares against the new monotonic clock.
+    "weather_promotion_tier": None,        # None | 90 | 100
+    "last_demotion_from_90_ts": 0.0,
+    "last_demotion_from_100_ts": 0.0,
+    "last_seen_soc": None,                 # float | None
     "last_updated": 0               # unix time seconds
 }
 

@@ -148,6 +148,9 @@ def _serialize_forecast(forecast: dict) -> dict:
 
     return {
         "cloud_cover_pct": forecast.get("cloud_cover_pct"),
+        "cloud_cover_remaining_daylight_pct": forecast.get(
+            "cloud_cover_remaining_daylight_pct"
+        ),
         "sunrise": _iso(forecast.get("sunrise_dt")),
         "sunset": _iso(forecast.get("sunset_dt")),
         "for_date": _iso(forecast.get("for_date")),

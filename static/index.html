@@ -148,16 +148,15 @@
     </div>
   </div>
 
-  <!-- Weather Gate Card -->
-  <div class="card" id="weatherCard">
-    <div class="weather-header">
-      <h2>Weather Gate</h2>
-      <button id="weatherEvaluateBtn" class="btn-small" onclick="forceEvaluateWeatherGate()">Force re-evaluate</button>
-    </div>
+  <!-- Weather Gate + Parameters (side-by-side pair) -->
+  <div class="weather-pair">
+    <!-- LEFT: Weather Gate (forecast + decision + tier promotion) -->
+    <div class="card" id="weatherForecastCard">
+      <div class="weather-header">
+        <h2>Weather Gate</h2>
+        <button id="weatherEvaluateBtn" class="btn-small" onclick="forceEvaluateWeatherGate()">Force re-evaluate</button>
+      </div>
 
-    <!-- Section A: Today's forecast + decision (read-only) -->
-    <div class="weather-section">
-      <h3>Today's forecast</h3>
       <div class="weather-grid">
         <div>Sunrise:</div><div id="weatherSunrise">—</div>
         <div>Sunset:</div><div id="weatherSunset">—</div>
@@ -170,36 +169,54 @@
       </div>
       <div id="weatherDecisionBanner" class="weather-decision weather-decision-neutral">—</div>
       <div id="weatherFreshness" class="weather-freshness">Forecast freshness: —</div>
+
+      <!-- Tier promotion (weather-aware boost above the decile table) -->
+      <div class="weather-section">
+        <h3>Tier promotion</h3>
+        <div class="weather-grid">
+          <div>Current tier:</div><div id="tierPromoTier">—</div>
+          <div>Last seen SOC:</div><div id="tierPromoLastSoc">—</div>
+          <div>90% cooldown:</div><div id="tierPromoCooldown90">—</div>
+          <div>100% cooldown:</div><div id="tierPromoCooldown100">—</div>
+        </div>
+        <div id="tierPromoDetail" class="tier-promo-detail">—</div>
+      </div>
     </div>
 
-    <!-- Section B: Editable parameters -->
-    <div class="weather-section">
-      <h3>Parameters</h3>
-      <div class="weather-config-grid">
-        <label>Master enable
-          <input type="checkbox" id="weatherCfgEnabled" />
-        </label>
-        <label>Battery total (kWh)
-          <input type="number" id="weatherCfgBatteryKwh" step="0.1" min="0.1" />
-        </label>
-        <label>Summer max (kWh)
-          <input type="number" id="weatherCfgSummerKwh" step="0.1" min="0.1" />
-        </label>
-        <label>Winter max (kWh)
-          <input type="number" id="weatherCfgWinterKwh" step="0.1" min="0.1" />
-        </label>
-        <label>Safety factor (1.0–2.0)
-          <input type="number" id="weatherCfgSafetyFactor" step="0.05" min="1.0" max="2.0" />
-        </label>
-        <label>Pre-sunrise window (min)
-          <input type="number" id="weatherCfgPreSunriseMin" step="1" min="0" max="240" />
-        </label>
-        <label>Recovery SOC (%)
-          <input type="number" id="weatherCfgRecoverySoc" step="1" min="0" max="100" />
-        </label>
-        <label>Min hours before sunset for recovery
-          <input type="number" id="weatherCfgRecoveryHours" step="0.25" min="0" max="12" />
-        </label>
+    <!-- RIGHT: Parameters (editable form, narrow inputs) -->
+    <div class="card" id="weatherParamsCard">
+      <h2>Parameters</h2>
+      <div class="params-row params-row-check">
+        <label for="weatherCfgEnabled">Master enable</label>
+        <input type="checkbox" id="weatherCfgEnabled" />
+      </div>
+      <div class="params-row">
+        <label for="weatherCfgBatteryKwh">Battery total (kWh)</label>
+        <input type="number" id="weatherCfgBatteryKwh" step="0.1" min="0.1" />
+      </div>
+      <div class="params-row">
+        <label for="weatherCfgSummerKwh">Summer max (kWh)</label>
+        <input type="number" id="weatherCfgSummerKwh" step="0.1" min="0.1" />
+      </div>
+      <div class="params-row">
+        <label for="weatherCfgWinterKwh">Winter max (kWh)</label>
+        <input type="number" id="weatherCfgWinterKwh" step="0.1" min="0.1" />
+      </div>
+      <div class="params-row">
+        <label for="weatherCfgSafetyFactor">Safety factor (1.0–2.0)</label>
+        <input type="number" id="weatherCfgSafetyFactor" step="0.05" min="1.0" max="2.0" />
+      </div>
+      <div class="params-row">
+        <label for="weatherCfgPreSunriseMin">Pre-sunrise window (min)</label>
+        <input type="number" id="weatherCfgPreSunriseMin" step="1" min="0" max="240" />
+      </div>
+      <div class="params-row">
+        <label for="weatherCfgRecoverySoc">Recovery SOC (%)</label>
+        <input type="number" id="weatherCfgRecoverySoc" step="1" min="0" max="100" />
+      </div>
+      <div class="params-row">
+        <label for="weatherCfgRecoveryHours">Min hours before sunset for recovery</label>
+        <input type="number" id="weatherCfgRecoveryHours" step="0.25" min="0" max="12" />
       </div>
       <div class="weather-save-row">
         <button class="btn-small" onclick="saveWeatherConfig()">Save</button>
@@ -273,6 +290,6 @@
     </div>
   </div>
 
-  <script src="/static/js/dashboard.js?v=20260509-0003"></script>
+  <script src="/static/js/dashboard.js?v=20260519-0001"></script>
 </body>
 </html>

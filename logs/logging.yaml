@@ -15,3 +15,5 @@ tags:
   # operator can observe the first few pre-sunrise evaluations.
   WEATHER: true
   WEATHER_GATE: true
+  # Tier promotion — log only on state transitions (one-shot per change).
+  TIER_PROMO: true

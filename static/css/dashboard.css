@@ -569,101 +569,143 @@ h2 {
   }
 }
 
-/* ===== Weather Gate Card ===== */
-#weatherCard .weather-header {
+/* ===== Weather Gate + Parameters (side-by-side pair) ===== */
+.weather-pair {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 15px;
+  margin-bottom: 15px;
+}
+@media (min-width: 900px) {
+  .weather-pair {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+  }
+}
+
+/* --- LEFT card: Weather Gate (forecast + decision + tier promotion) --- */
+#weatherForecastCard .weather-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 10px;
 }
-#weatherCard .weather-section {
-  border-top: 1px solid #eee;
-  padding-top: 8px;
-  margin-top: 8px;
-}
-#weatherCard .weather-section:first-of-type {
-  border-top: none;
-  padding-top: 0;
-  margin-top: 0;
-}
-#weatherCard .weather-section h3 {
-  margin: 0 0 6px 0;
-  font-size: 0.95em;
-  color: #555;
-}
-#weatherCard .weather-grid {
+#weatherForecastCard .weather-grid {
   display: grid;
   grid-template-columns: max-content 1fr;
   gap: 4px 12px;
   font-size: 0.92em;
   margin-bottom: 8px;
 }
-#weatherCard .weather-grid > div:nth-child(odd) {
+#weatherForecastCard .weather-grid > div:nth-child(odd) {
   font-weight: 600;
   color: #555;
 }
-#weatherCard .weather-decision {
+#weatherForecastCard .weather-decision {
   margin-top: 8px;
   padding: 8px 12px;
   border-radius: 4px;
   font-weight: bold;
 }
-#weatherCard .weather-decision-on {
+#weatherForecastCard .weather-decision-on {
   background: #f6ffed;
   color: #237804;
   border: 1px solid #b7eb8f;
 }
-#weatherCard .weather-decision-off {
+#weatherForecastCard .weather-decision-off {
   background: #fff7e6;
   color: #ad4e00;
   border: 1px solid #ffd591;
 }
-#weatherCard .weather-decision-recovered {
+#weatherForecastCard .weather-decision-recovered {
   background: #e6f7ff;
   color: #0050b3;
   border: 1px solid #91d5ff;
 }
-#weatherCard .weather-decision-neutral {
+#weatherForecastCard .weather-decision-neutral {
   background: #fafafa;
   color: #555;
   border: 1px solid #eee;
 }
-#weatherCard .weather-freshness {
+#weatherForecastCard .weather-freshness {
   margin-top: 6px;
   font-size: 0.85em;
   color: #888;
 }
-#weatherCard .weather-config-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(160px, 1fr));
-  gap: 8px 16px;
-  margin-bottom: 8px;
+#weatherForecastCard .weather-section {
+  border-top: 1px solid #eee;
+  padding-top: 8px;
+  margin-top: 12px;
 }
-#weatherCard .weather-config-grid label {
-  display: flex;
-  flex-direction: column;
+#weatherForecastCard .weather-section h3 {
+  margin: 0 0 6px 0;
+  font-size: 0.95em;
+  color: #555;
+}
+#weatherForecastCard .tier-promo-detail {
+  margin-top: 6px;
+  padding: 6px 10px;
   font-size: 0.88em;
   color: #444;
-  gap: 4px;
+  background: #fafafa;
+  border: 1px solid #eee;
+  border-radius: 3px;
 }
-#weatherCard .weather-config-grid input[type="number"] {
+#weatherForecastCard .tier-promo-detail.tier-promo-active {
+  background: #f6ffed;
+  color: #237804;
+  border-color: #b7eb8f;
+}
+#weatherForecastCard .tier-promo-detail.tier-promo-cooldown {
+  background: #fff7e6;
+  color: #ad4e00;
+  border-color: #ffd591;
+}
+
+/* --- RIGHT card: Parameters (narrow inputs, label-left input-right) --- */
+#weatherParamsCard {
+  width: max-content;
+  max-width: 100%;
+}
+@media (max-width: 899px) {
+  #weatherParamsCard {
+    width: auto;
+  }
+}
+#weatherParamsCard .params-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  font-size: 0.9em;
+  color: #444;
+}
+#weatherParamsCard .params-row label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+#weatherParamsCard .params-row input[type="number"] {
+  flex: 0 0 auto;
+  width: 5.5em;
   padding: 4px 6px;
   font-size: 0.95em;
   border: 1px solid #ddd;
   border-radius: 3px;
+  text-align: right;
 }
-#weatherCard .weather-save-row {
+#weatherParamsCard .params-row-check input[type="checkbox"] {
+  flex: 0 0 auto;
+  margin-right: 0;
+}
+#weatherParamsCard .weather-save-row {
   display: flex;
   align-items: center;
   gap: 12px;
+  margin-top: 10px;
 }
-#weatherCard .weather-save-status {
+#weatherParamsCard .weather-save-status {
   font-size: 0.88em;
   color: #555;
-}
-@media (max-width: 600px) {
-  #weatherCard .weather-config-grid {
-    grid-template-columns: 1fr;
-  }
 }
 

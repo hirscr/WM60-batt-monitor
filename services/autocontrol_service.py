@@ -14,7 +14,9 @@ except ImportError:
     ASTRAL_AVAILABLE = False
     print("[AutoControl] WARNING: astral library not available, using fixed sunset time")
 
+from utils.log_config import log
 from utils.state_manager import StateManager
+from services.tier_promotion import TierPromotion
 
 
 class AutoControlService:
@@ -22,11 +24,10 @@ class AutoControlService:
     Automatic power control with Away Mode.
 
     Away Mode implements sophisticated control logic:
-    1. Emergency shutdown at SOC < 30%
-    2. Full power (100%) when SOC > 99% AND PV > 3600W
-    3. High SOC conservative (90%) when SOC > 90% AND PV < 3600W
-    4. After sunset startup when time > sunset AND SOC > 40% AND miner off
-    5. Normal discharge tiers (SOC% → power%)
+    1. Emergency shutdown at SOC < emergency_soc
+    2. Tier promotion (weather-aware 90%/100% boost above the decile table)
+    3. After sunset startup when time > sunset AND SOC > 40% AND miner off
+    4. Normal discharge tiers (SOC% → power%)
     """
 
     def __init__(self,
@@ -112,6 +113,21 @@ class AutoControlService:
         self.emergency_active: bool = bool(saved_state.get("emergency_active", False))
         self.emergency_verified_off: bool = False
         self.emergency_attempts_this_latch: int = 0
+
+        # Tier-promotion service. State persists across restarts via state_manager.
+        # last_seen_soc starts as None so the very first tick after restart will
+        # initialize it (no false-positive promotion). The persisted value is
+        # treated as advisory only — see TierPromotion.evaluate() for details.
+        self.tier_promotion = TierPromotion(
+            tier=saved_state.get("weather_promotion_tier"),
+            last_demotion_from_90_ts=saved_state.get("last_demotion_from_90_ts", 0.0),
+            last_demotion_from_100_ts=saved_state.get("last_demotion_from_100_ts", 0.0),
+            # Always start with last_seen_soc=None at process start. This forces
+            # the first tick to record the live SOC instead of trusting an
+            # old persisted value (which could be hours stale and produce a
+            # bogus "upward crossing").
+            last_seen_soc=None,
+        )
 
         # Cache today's sunset
         self._cached_sunset_date: Optional[date] = None
@@ -288,11 +304,10 @@ class AutoControlService:
         Away Mode control logic with priority conditions.
 
         Priority order:
-        1. Emergency shutdown (SOC < 30%)
-        2. Full power (SOC > 99% AND PV > 3600W)
-        3. High SOC conservative (SOC > 90% AND PV < 3600W)
-        4. After sunset startup (after sunset AND SOC > 40% AND miner off)
-        5. Normal discharge tiers (SOC → power%)
+        1. Emergency shutdown (SOC < emergency_soc)
+        2. Tier promotion (weather-aware 90%/100% boost when conditions are right)
+        3. After sunset startup (after sunset AND SOC > 40% AND miner off)
+        4. Normal discharge tiers (SOC → power%)
         """
 
         # SAFETY GATE: If battery telemetry is stale, stop the miner and do nothing else.
@@ -354,79 +369,17 @@ class AutoControlService:
             self._trip_emergency(soc)
             return
 
-        # PRIORITY 2: Full Power (SOC > 99% AND PV > max_pv_power)
-        if soc > 99 and pv_power > self.max_pv_power:
-            self.target_pct = 100
-            self.target_w = self.base_watts
-            self.current_state_description = "Full power - battery full with excess solar"
-            self.latched_floor_w = None  # Reset latch
-            self.stop_reason = "normal"
-            self.resume_at_soc = None
-
-            print(f"[AutoControl] Condition met: Full power opportunity (SOC > 99% AND PV > {self.max_pv_power}W)")
-            print(f"[AutoControl] Target power: 100% ({self.base_watts}W)")
-
-            # Ensure miner is on. If we have to power it on, do ONLY that this tick:
-            # firmware locks the privileged session for ~180s per get_token, so
-            # enqueueing power_on + set_power_pct on the same tick self-contends.
-            # The next tick will re-evaluate; once is_off=False, we fall through to
-            # the rate-limited power adjustment below.
-            if is_miner_off:
-                if self._in_post_cmd_grace_period():
-                    elapsed = int(time.time() - self.last_set_ts)
-                    print(f"[AutoControl] Post-command grace period ({elapsed}s of {self._post_cmd_grace_sec}s) — miner may be recalibrating, skipping power_on")
-                    print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
-                    print(f"{'='*60}\n")
-                    return
-                print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
-                self.miner.power_on()
-                self.last_set_ts = time.time()
-                self.state.save(miner_power_state="running")
-                time.sleep(2)  # Brief delay for power-on
-                print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
-                print(f"{'='*60}\n")
-                return
-
-            self._set_power_with_rate_limit(100)
-            print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
-            print(f"{'='*60}\n")
+        # PRIORITY 2: Tier promotion (weather-aware boost above the decile table)
+        # Returns a tier (None | 90 | 100). When the tier is 90 or 100 we run
+        # the same "miner-on + set_power" branch used by the decile table; the
+        # only difference is the percentage. Power commands are only sent when
+        # the tier actually changes — see TierPromotion.evaluate().
+        tier_eval = self._evaluate_tier_promotion(soc)
+        if tier_eval is not None and tier_eval.target_pct is not None:
+            self._apply_tier_promotion(tier_eval, is_miner_off)
             return
 
-        # PRIORITY 3: High SOC Conservative (SOC > 90% AND PV < max_pv_power)
-        if soc > 90 and pv_power < self.max_pv_power:
-            self.target_pct = 90
-            self.target_w = int(self.base_watts * 0.9)
-            self.current_state_description = "High SOC conservative - limited solar"
-            self.stop_reason = "normal"
-            self.resume_at_soc = None
-
-            print(f"[AutoControl] Condition met: High SOC conservative (SOC > 90% AND PV < {self.max_pv_power}W)")
-            print(f"[AutoControl] Target power: 90% ({self.target_w}W)")
-
-            # Ensure miner is on. If we have to power it on, do ONLY that this tick
-            # (see PRIORITY 2 comment for rationale).
-            if is_miner_off:
-                if self._in_post_cmd_grace_period():
-                    elapsed = int(time.time() - self.last_set_ts)
-                    print(f"[AutoControl] Post-command grace period ({elapsed}s of {self._post_cmd_grace_sec}s) — miner may be recalibrating, skipping power_on")
-                    print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
-                    print(f"{'='*60}\n")
-                    return
-                print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
-                self.miner.power_on()
-                self.last_set_ts = time.time()
-                self.state.save(miner_power_state="running")
-                time.sleep(2)
-                print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
-                print(f"{'='*60}\n")
-                return
-
-            self._set_power_with_rate_limit(90)
-            print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
-            print(f"{'='*60}\n")
-            return
-
-        # PRIORITY 4: After Sunset Startup
+        # PRIORITY 3: After Sunset Startup
         if is_past_sunset and soc > self.after_sunset_min_soc and is_miner_off:
             # Calculate appropriate power tier based on current SOC
             tier_pct = self._calculate_soc_tier(soc)
@@ -440,7 +393,9 @@ class AutoControlService:
             print(f"[AutoControl] Time is after sunset AND SOC > {self.after_sunset_min_soc}% AND miner is off")
             print(f"[AutoControl] Target power: {tier_pct}% ({self.target_w}W) based on SOC tier")
 
-            # One privileged op per tick when miner is off — see PRIORITY 2 comment.
+            # One privileged op per tick when miner is off — the firmware
+            # locks the privileged session for ~180s per get_token, so
+            # power_on + set_power_pct on the same tick would self-contend.
             if self._in_post_cmd_grace_period():
                 elapsed = int(time.time() - self.last_set_ts)
                 print(f"[AutoControl] Post-command grace period ({elapsed}s of {self._post_cmd_grace_sec}s) — miner may be recalibrating, skipping power_on")
@@ -457,7 +412,7 @@ class AutoControlService:
             print(f"{'='*60}\n")
             return
 
-        # PRIORITY 5: Normal Discharge Tiers
+        # PRIORITY 4: Normal Discharge Tiers (decile table)
         tier_pct = self._calculate_soc_tier(soc)
         self.target_pct = tier_pct
         self.target_w = int(self.base_watts * (tier_pct / 100.0))
@@ -470,7 +425,7 @@ class AutoControlService:
         print(f"[AutoControl] Target power: {tier_pct}% ({self.target_w}W)")
 
         # Ensure miner is on if target > 0. If we have to power it on, do ONLY that
-        # this tick — see PRIORITY 2 comment for rationale (firmware lock contention).
+        # this tick — firmware lock contention (see PRIORITY 3 comment above).
         if tier_pct > 0 and is_miner_off:
             if self._in_post_cmd_grace_period():
                 elapsed = int(time.time() - self.last_set_ts)
@@ -617,6 +572,112 @@ class AutoControlService:
         )
         if not self.miner.is_off:
             self.miner.power_off()
+
+    # ---- Tier-promotion helpers ----
+
+    def _evaluate_tier_promotion(self, soc):
+        """Run one TierPromotion.evaluate() tick. Returns the TierEvaluation
+        or None when the weather service is not configured. Logs on tier
+        change only (two-layer gate). Persists state after every call so
+        cooldown timestamps survive a restart.
+        """
+        if self.weather is None:
+            return None
+
+        forecast = {}
+        try:
+            forecast = self.weather.get_today_forecast() or {}
+        except Exception as exc:
+            print(f"[AutoControl] Weather forecast unreachable in tier eval: {exc}")
+            forecast = {}
+
+        sunset_dt = forecast.get("sunset_dt")
+        cloud_remaining = forecast.get("cloud_cover_remaining_daylight_pct")
+        fresh = bool(forecast.get("is_fresh"))
+        now_local = None
+        try:
+            now_local = datetime.now(ZoneInfo(self.timezone_str))
+        except Exception:
+            now_local = None
+
+        prev_tier = self.tier_promotion.tier
+        result = self.tier_promotion.evaluate(
+            soc_pct=soc,
+            cloud_cover_remaining_pct=cloud_remaining,
+            forecast_fresh=fresh,
+            sunset_dt=sunset_dt,
+            now_local=now_local,
+        )
+
+        # Persist tier state every tick — cooldown timestamps need to survive
+        # restarts. State_manager.save() is atomic and cheap.
+        try:
+            self.state.save(**self.tier_promotion.to_state_dict())
+        except Exception as exc:
+            print(f"[AutoControl] Failed to persist tier_promotion state: {exc}")
+
+        if result.tier_changed:
+            print(
+                f"[AutoControl][TIER_PROMO] tier {prev_tier} -> {result.tier} "
+                f"(SOC={soc:.1f}%, cloud_remaining={cloud_remaining}, fresh={fresh})"
+            )
+            if __debug__:
+                log(
+                    "TIER_PROMO",
+                    f"tier {prev_tier}->{result.tier} target_pct={result.target_pct} "
+                    f"soc={soc:.1f} cloud_remaining={cloud_remaining} fresh={fresh} "
+                    f"description={result.description!r}",
+                )
+        return result
+
+    def _apply_tier_promotion(self, tier_eval, is_miner_off: bool) -> None:
+        """Apply a promoted tier (target_pct 90 or 100). Mirrors the
+        miner-on + set_power branches used by the decile-table path.
+
+        Power is only sent on a tier change. The TierPromotion already
+        gated the change; this method handles the side-effects.
+        """
+        target_pct = tier_eval.target_pct  # 90 or 100
+        self.target_pct = target_pct
+        self.target_w = int(self.base_watts * (target_pct / 100.0))
+        self.current_state_description = tier_eval.description
+        self.latched_floor_w = None
+        self.stop_reason = "normal"
+        self.resume_at_soc = None
+
+        print(f"[AutoControl] Condition met: Tier promotion ({tier_eval.description})")
+        print(f"[AutoControl] Target power: {target_pct}% ({self.target_w}W)")
+
+        if is_miner_off:
+            if self._in_post_cmd_grace_period():
+                elapsed = int(time.time() - self.last_set_ts)
+                print(
+                    f"[AutoControl] Post-command grace period ({elapsed}s of "
+                    f"{self._post_cmd_grace_sec}s) — skipping power_on"
+                )
+                print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+                print(f"{'='*60}\n")
+                return
+            print(f"[AutoControl] Powering on miner (deferring power adjust to next tick)...")
+            self._last_sent_pct = None
+            self.miner.power_on()
+            self.last_set_ts = time.time()
+            self.state.save(miner_power_state="running")
+            time.sleep(2)
+            print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+            print(f"{'='*60}\n")
+            return
+
+        # Miner is already on. Only push a fresh power command when the tier
+        # changed this tick — TierPromotion already enforces one-shot semantics.
+        if tier_eval.tier_changed:
+            self._set_power_with_rate_limit(target_pct)
+        else:
+            print(
+                f"[AutoControl] Tier unchanged at {target_pct}% — no power command needed"
+            )
+        print(f"[AutoControl] Next evaluation in {self.min_interval_sec}s")
+        print(f"{'='*60}\n")
 
     def _emergency_stop_with_verify(self) -> bool:
         """Send emergency_power_off and verify via re-poll. Up to 5 attempts.
@@ -805,6 +866,13 @@ class AutoControlService:
             self.weather_gate.get_state() if self.weather_gate is not None else None
         )
 
+        tier_promotion_state = {
+            "tier": self.tier_promotion.tier,
+            "cooldown_remaining_90_sec": self.tier_promotion.cooldown_remaining_90_sec(),
+            "cooldown_remaining_100_sec": self.tier_promotion.cooldown_remaining_100_sec(),
+            "last_seen_soc": self.tier_promotion.last_seen_soc,
+        }
+
         return {
             "enabled": self.enabled,
             "mode": self.mode,
@@ -825,4 +893,5 @@ class AutoControlService:
             "emergency_verified_off": self.emergency_verified_off,
             "emergency_attempts_this_latch": self.emergency_attempts_this_latch,
             "weather_gate": weather_gate_state,
+            "tier_promotion": tier_promotion_state,
         }

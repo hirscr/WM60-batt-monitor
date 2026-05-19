@@ -17,6 +17,33 @@ from typing import Any, Dict, Optional
 
 from eg4_inverter_api import EG4InverterAPI
 
+# Half the 600s battery-freshness gate, so at least one recovery attempt is
+# possible before the staleness threshold fires and autocontrol stops the miner.
+RELOGIN_COOLDOWN_SEC = 300
+
+
+def _is_empty_response(resp) -> bool:
+    """Single authoritative rule for what counts as an empty EG4 response.
+
+    A response is considered empty (i.e. the session is effectively dead and
+    re-login is warranted) when:
+      - resp is None or otherwise falsy
+      - resp is a dict whose "success" field is explicitly False
+      - resp is a dict whose "data" field is None
+
+    All other dict responses with real data are considered non-empty.
+    This rule is encoded here once; callers must not re-check it inline.
+    """
+    if not resp:
+        return True
+    if isinstance(resp, dict):
+        if resp.get("success") is False:
+            return True
+        if resp.get("data") is None:
+            return True
+    return False
+
+
 def _to_plain(o):
     if o is None or isinstance(o, (str,int,float,bool)): return o
     if is_dataclass(o):  # handles nested dataclasses
@@ -55,6 +82,9 @@ class EG4Client:
         self._latest: Dict[str, Any] = {}
         self._last_error: Optional[str] = None
         self._lock = threading.Lock()
+
+        # Monotonic timestamp of last re-login attempt; 0.0 = eligible immediately.
+        self._last_relogin_attempt: float = 0.0
 
         if not self.username or not self.password:
             raise RuntimeError("EG4 creds not set (EG4_USER / EG4_PASS).")
@@ -158,44 +188,77 @@ class EG4Client:
         batt = await self._api.get_inverter_battery_async()
         runtime = await self._api.get_inverter_runtime_async()
 
-        # If no data, try re-login
-        if not batt or not runtime:
+        # Empty-response handling: detect silent session expiry (HTTP 200 with
+        # success=False or data=None) and attempt cooldown-gated re-login.
+        # The freshness gate in BatteryService stops the miner if the snapshot
+        # ts does not advance, so it is safe to return early without merging.
+        batt_empty = _is_empty_response(batt)
+        runtime_empty = _is_empty_response(runtime)
+        if batt_empty or runtime_empty:
+            which = []
+            if batt_empty:
+                which.append("battery")
+            if runtime_empty:
+                which.append("runtime")
+            endpoints_desc = "+".join(which)
+
+            elapsed = time.monotonic() - self._last_relogin_attempt
+            if elapsed < RELOGIN_COOLDOWN_SEC:
+                self._last_error = "empty_response_cooldown"
+                remaining = int(RELOGIN_COOLDOWN_SEC - elapsed)
+                print(
+                    f"[EG4Client] Empty response from {endpoints_desc} — "
+                    f"in cooldown, skipping re-login (next eligible in {remaining}s)"
+                )
+                return
+
+            self._last_error = "empty_response_relogin_pending"
+            print(
+                f"[EG4Client] Empty response from {endpoints_desc} — "
+                f"attempting re-login"
+            )
+            self._last_relogin_attempt = time.monotonic()
             try:
                 await self._api.login(ignore_ssl=True)
-                # Retry fetch after re-login
-                batt = await self._api.get_inverter_battery_async()
-                runtime = await self._api.get_inverter_runtime_async()
-                if not batt or not runtime:
-                    self._last_error = "Still no data after re-login"
-                    return
             except Exception as e:
                 self._last_error = f"Re-login failed: {e}"
+                print(
+                    f"[EG4Client] Re-login attempted but still no data — "
+                    f"next retry in {RELOGIN_COOLDOWN_SEC}s"
+                )
                 return
+
+            # Re-fetch after re-login
+            batt = await self._api.get_inverter_battery_async()
+            runtime = await self._api.get_inverter_runtime_async()
+            if _is_empty_response(batt) or _is_empty_response(runtime):
+                self._last_error = "empty_response_relogin_pending"
+                print(
+                    f"[EG4Client] Re-login attempted but still no data — "
+                    f"next retry in {RELOGIN_COOLDOWN_SEC}s"
+                )
+                return
+            print("[EG4Client] Recovered — session re-established, data flowing")
+            # Fall through to normal merge path; _last_error cleared by outer try/except
 
         b = _to_plain(batt)
         r = _to_plain(runtime)
-
-        # Log the full runtime response to see all available fields
-        print(f"[EG4Client] Full runtime response keys: {list(r.keys())}")
-        print(f"[EG4Client] Runtime sample data: {json.dumps({k: r.get(k) for k in list(r.keys())[:20]}, indent=2)}")
 
         # Derive PV/Load/Grid/Battery powers from runtime
         pv_candidates = [_num(r.get(k)) for k in ("ppv1","ppv2","ppv3")]
         pv_vals = [v for v in pv_candidates if v is not None]
         pv_power_w = sum(pv_vals) if pv_vals else _num(r.get("ppv"))
 
-        # CORRECT WAY: Use EPS (backup) power fields pEpsL1N and pEpsL2N
+        # EPS (backup) power fields pEpsL1N and pEpsL2N give load power
         eps_l1 = _num(r.get("pEpsL1N")) or 0.0
         eps_l2 = _num(r.get("pEpsL2N")) or 0.0
         load_power_w = eps_l1 + eps_l2
-        print(f"[EG4Client] EPS L1N: {eps_l1:.1f}W, EPS L2N: {eps_l2:.1f}W, Total Backup Power: {load_power_w:.1f}W")
 
         # Fallback to old fields if EPS fields not available
         if load_power_w == 0.0:
             load_power_w = _num(r.get("pToUser"))
             if load_power_w is None:
                 load_power_w = _num(r.get("consumptionPower"))
-            print(f"[EG4Client] Using fallback pToUser/consumptionPower: {load_power_w}W")
 
         grid_power_w = _num(r.get("pToGrid"))
         ac_couple_w = _num(r.get("acCouplePower"))
@@ -249,3 +312,9 @@ class EG4Client:
         with self._lock:
             self._latest = merged
             self.history.append(merged)
+
+        # Terse one-line poll summary (replaces the prior verbose dumps)
+        soc_s = f"{soc_pct}%" if soc_pct is not None else "?"
+        pv_s = f"{int(pv_power_w)}w" if pv_power_w is not None else "?"
+        load_s = f"{int(load_power_w)}w" if load_power_w is not None else "?"
+        print(f"[EG4Client] poll ok SOC={soc_s} PV={pv_s} load={load_s}")
