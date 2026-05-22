@@ -44,6 +44,39 @@ def _is_empty_response(resp) -> bool:
     return False
 
 
+def _is_merged_snapshot_empty(merged: dict) -> bool:
+    """Single authoritative rule for the "zombie session" silent-failure mode.
+
+    Some EG4 portal failures (server-side session expiry that leaves the
+    selected-inverter binding orphaned) return structurally-valid objects
+    where every meaningful field is None or zero. _is_empty_response cannot
+    catch this because the raw response is technically non-empty.
+
+    A merged snapshot is considered empty when ALL of the following hold:
+      - soc_percent is None
+      - units is empty/falsy
+      - pv_power_w is None or 0
+      - load_power_w is None or 0
+      - grid_power_w is None or 0
+      - battery_net_w is None or 0
+
+    Any single real reading (even a partial one) means the snapshot has
+    useful data and must be merged normally. This rule is encoded here once;
+    callers must not re-check it inline.
+    """
+    if not isinstance(merged, dict):
+        return True
+    if merged.get("soc_percent") is not None:
+        return False
+    if merged.get("units"):
+        return False
+    for k in ("pv_power_w", "load_power_w", "grid_power_w", "battery_net_w"):
+        v = merged.get(k)
+        if v is not None and v != 0 and v != 0.0:
+            return False
+    return True
+
+
 def _to_plain(o):
     if o is None or isinstance(o, (str,int,float,bool)): return o
     if is_dataclass(o):  # handles nested dataclasses
@@ -182,65 +215,66 @@ class EG4Client:
         except Exception:
             pass
 
-    async def _poll_once(self):
-        assert self._api is not None
-        # Fetch battery & runtime via async endpoints
+    async def _attempt_recovery(self, reason_label: str):
+        """Cooldown-gated re-login + inverter re-select + re-fetch.
+
+        Returns (batt, runtime) on success — caller falls through to merge.
+        Returns None if the cooldown is still active or if the re-login
+        attempt still returns empty responses — caller must return early
+        without advancing the snapshot ts (freshness gate handles safety).
+
+        Centralizes the recovery sequence so the raw-empty and merged-empty
+        paths share the same cooldown timer and the same inverter-reselect
+        step (the latter is essential after a session expiry: the EG4
+        library's selected-inverter binding is lost on re-login and must
+        be re-established or subsequent fetches return all-null objects).
+        """
+        elapsed = time.monotonic() - self._last_relogin_attempt
+        if elapsed < RELOGIN_COOLDOWN_SEC:
+            self._last_error = "empty_response_cooldown"
+            remaining = int(RELOGIN_COOLDOWN_SEC - elapsed)
+            print(
+                f"[EG4Client] {reason_label} — "
+                f"in cooldown, skipping re-login (next eligible in {remaining}s)"
+            )
+            return None
+
+        self._last_error = "empty_response_relogin_pending"
+        print(f"[EG4Client] {reason_label} — attempting re-login")
+        self._last_relogin_attempt = time.monotonic()
+        try:
+            await self._api.login(ignore_ssl=True)
+        except Exception as e:
+            self._last_error = f"Re-login failed: {e}"
+            print(
+                f"[EG4Client] Re-login attempted but still no data — "
+                f"next retry in {RELOGIN_COOLDOWN_SEC}s"
+            )
+            return None
+
+        # Re-select inverter — the binding is lost on session expiry.
+        # Non-fatal if it errors; subsequent fetches may still succeed.
+        try:
+            invs = self._api.get_inverters()
+            if invs:
+                self._api.set_selected_inverter(inverterIndex=0)
+        except Exception as e:
+            print(f"[EG4Client] Re-select inverter failed (non-fatal): {e}")
+
         batt = await self._api.get_inverter_battery_async()
         runtime = await self._api.get_inverter_runtime_async()
-
-        # Empty-response handling: detect silent session expiry (HTTP 200 with
-        # success=False or data=None) and attempt cooldown-gated re-login.
-        # The freshness gate in BatteryService stops the miner if the snapshot
-        # ts does not advance, so it is safe to return early without merging.
-        batt_empty = _is_empty_response(batt)
-        runtime_empty = _is_empty_response(runtime)
-        if batt_empty or runtime_empty:
-            which = []
-            if batt_empty:
-                which.append("battery")
-            if runtime_empty:
-                which.append("runtime")
-            endpoints_desc = "+".join(which)
-
-            elapsed = time.monotonic() - self._last_relogin_attempt
-            if elapsed < RELOGIN_COOLDOWN_SEC:
-                self._last_error = "empty_response_cooldown"
-                remaining = int(RELOGIN_COOLDOWN_SEC - elapsed)
-                print(
-                    f"[EG4Client] Empty response from {endpoints_desc} — "
-                    f"in cooldown, skipping re-login (next eligible in {remaining}s)"
-                )
-                return
-
+        if _is_empty_response(batt) or _is_empty_response(runtime):
             self._last_error = "empty_response_relogin_pending"
             print(
-                f"[EG4Client] Empty response from {endpoints_desc} — "
-                f"attempting re-login"
+                f"[EG4Client] Re-login attempted but still no data — "
+                f"next retry in {RELOGIN_COOLDOWN_SEC}s"
             )
-            self._last_relogin_attempt = time.monotonic()
-            try:
-                await self._api.login(ignore_ssl=True)
-            except Exception as e:
-                self._last_error = f"Re-login failed: {e}"
-                print(
-                    f"[EG4Client] Re-login attempted but still no data — "
-                    f"next retry in {RELOGIN_COOLDOWN_SEC}s"
-                )
-                return
+            return None
+        print("[EG4Client] Recovered — session re-established, data flowing")
+        return (batt, runtime)
 
-            # Re-fetch after re-login
-            batt = await self._api.get_inverter_battery_async()
-            runtime = await self._api.get_inverter_runtime_async()
-            if _is_empty_response(batt) or _is_empty_response(runtime):
-                self._last_error = "empty_response_relogin_pending"
-                print(
-                    f"[EG4Client] Re-login attempted but still no data — "
-                    f"next retry in {RELOGIN_COOLDOWN_SEC}s"
-                )
-                return
-            print("[EG4Client] Recovered — session re-established, data flowing")
-            # Fall through to normal merge path; _last_error cleared by outer try/except
-
+    def _merge_response(self, batt, runtime) -> Dict[str, Any]:
+        """Translate raw EG4 battery + runtime objects into the merged snapshot."""
         b = _to_plain(batt)
         r = _to_plain(runtime)
 
@@ -292,7 +326,7 @@ class EG4Client:
             try: pack_current = float(b["currentText"])
             except: pass
 
-        merged = {
+        return {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "soc_percent": soc_pct,
             "pack_voltage_v": pack_voltage,
@@ -309,11 +343,58 @@ class EG4Client:
             ]
         }
 
+    async def _poll_once(self):
+        assert self._api is not None
+        # Fetch battery & runtime via async endpoints
+        batt = await self._api.get_inverter_battery_async()
+        runtime = await self._api.get_inverter_runtime_async()
+
+        # Path 1: structurally empty raw response (success=False / data=None /
+        # falsy). Classic silent session expiry — handled by _attempt_recovery.
+        batt_empty = _is_empty_response(batt)
+        runtime_empty = _is_empty_response(runtime)
+        if batt_empty or runtime_empty:
+            which = []
+            if batt_empty:
+                which.append("battery")
+            if runtime_empty:
+                which.append("runtime")
+            endpoints_desc = "+".join(which)
+            recovered = await self._attempt_recovery(
+                f"Empty response from {endpoints_desc}"
+            )
+            if recovered is None:
+                return  # cooldown or re-login still empty; freshness gate handles safety
+            batt, runtime = recovered
+
+        merged = self._merge_response(batt, runtime)
+
+        # Path 2: "zombie session" — raw response was structurally valid but
+        # every meaningful field is None/0 after merge. Typically caused by a
+        # lost inverter-selection binding after server-side session expiry.
+        # _attempt_recovery re-logs in AND re-selects the inverter.
+        if _is_merged_snapshot_empty(merged):
+            recovered = await self._attempt_recovery("Zombie session (merged snapshot all-null)")
+            if recovered is None:
+                return
+            batt, runtime = recovered
+            merged = self._merge_response(batt, runtime)
+            if _is_merged_snapshot_empty(merged):
+                self._last_error = "merged_snapshot_empty_after_recovery"
+                print(
+                    f"[EG4Client] Re-login attempted but data still all-null — "
+                    f"next retry in {RELOGIN_COOLDOWN_SEC}s"
+                )
+                return
+
         with self._lock:
             self._latest = merged
             self.history.append(merged)
 
         # Terse one-line poll summary (replaces the prior verbose dumps)
+        soc_pct = merged.get("soc_percent")
+        pv_power_w = merged.get("pv_power_w")
+        load_power_w = merged.get("load_power_w")
         soc_s = f"{soc_pct}%" if soc_pct is not None else "?"
         pv_s = f"{int(pv_power_w)}w" if pv_power_w is not None else "?"
         load_s = f"{int(load_power_w)}w" if load_power_w is not None else "?"
