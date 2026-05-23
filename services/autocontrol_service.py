@@ -527,24 +527,38 @@ class AutoControlService:
 
         Used by /api/weather/evaluate_now. Returns the gate's snapshot after
         running. If no weather_gate is wired, returns an empty dict with a note.
+
+        Forces a fresh EG4 PV-predict refresh before evaluating so the operator
+        gets the latest portal reading, not whatever was cached.
         """
         if self.weather_gate is None or self.weather is None:
             return {"error": "weather_gate_not_configured"}
 
-        # Bypass the once-per-day guard so the operator can re-run the
-        # decision on demand.
+        # Bypass the once-per-day guard and the disabled shortcut so the
+        # operator gets a full re-evaluation, not just the recovery check.
         self.weather_gate.evaluated_date = None
+        self.weather_gate.disabled = False
         soc = None
         try:
             snap = self.battery.get_status()
             soc = snap.get("soc_percent")
         except Exception:
             pass
+        # Force a fresh EG4 prediction so the operator sees the current portal
+        # reading drive this evaluation. Errors are swallowed — the cached
+        # value (if any) still serves as input; otherwise the gate falls
+        # through to solar_model.
+        try:
+            if hasattr(self.weather, "refresh_eg4_prediction"):
+                self.weather.refresh_eg4_prediction(force=True)
+        except Exception as exc:
+            print(f"[AutoControl] EG4 refresh during evaluate_now failed: {exc}")
         forecast = self.weather.get_today_forecast()
         outcome = self.weather_gate.evaluate(
             soc_pct=soc,
             battery_fresh=self.battery.is_fresh(),
             forecast=forecast,
+            force=True,
         )
         state = self.weather_gate.get_state()
         state["outcome"] = outcome
@@ -866,11 +880,14 @@ class AutoControlService:
             self.weather_gate.get_state() if self.weather_gate is not None else None
         )
 
+        last_seen_soc = self.tier_promotion.last_seen_soc
+        if last_seen_soc is None:
+            last_seen_soc = (self.battery.get_status() or {}).get("soc_percent")
         tier_promotion_state = {
             "tier": self.tier_promotion.tier,
             "cooldown_remaining_90_sec": self.tier_promotion.cooldown_remaining_90_sec(),
             "cooldown_remaining_100_sec": self.tier_promotion.cooldown_remaining_100_sec(),
-            "last_seen_soc": self.tier_promotion.last_seen_soc,
+            "last_seen_soc": last_seen_soc,
         }
 
         return {

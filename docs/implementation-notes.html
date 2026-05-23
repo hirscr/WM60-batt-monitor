@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WM_controller — Implementation Notes</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 920px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }
+  h1 { border-bottom: 1px solid #ccc; padding-bottom: .3em; }
+  h2 { margin-top: 2em; color: #1772ff; }
+  h3 { margin-top: 1.4em; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 90%; }
+  pre { background: #f4f4f4; padding: 10px; border-radius: 4px; overflow-x: auto; }
+  .date { color: #666; font-size: 90%; }
+</style>
+</head>
+<body>
+
+<h1>WM_controller — Implementation Notes</h1>
+<p>Decisions, tradeoffs, and non-obvious choices made during build. Append new entries at the top.</p>
+
+<h2>2026-05-23 — EG4 PV Energy Predictor + Calibration Tracking</h2>
+<p class="date">Files: <code>eg4_client.py</code>, <code>utils/eg4_pv_predict.py</code> (new), <code>utils/pv_integration.py</code> (new), <code>services/weather_service.py</code>, <code>services/weather_gate.py</code>, <code>services/pv_prediction_logger.py</code> (new), <code>utils/state_manager.py</code>, <code>config/settings.py</code>, <code>config.yaml</code>, <code>api/weather.py</code>, <code>app.py</code>, <code>static/index.html</code>, <code>static/js/dashboard.js</code>, <code>static/css/dashboard.css</code>, <code>logs/logging.yaml</code>, plus four new test files.</p>
+
+<h3>What changed</h3>
+<ul>
+  <li>WeatherGate now prefers EG4 portal's own daily PV prediction over the sinusoidal solar_model when the EG4 cache is fresh. The raw prediction is multiplied by a user-tunable safety factor (default <code>eg4_predict_multiplier=0.8</code>) before comparing against the deficit threshold. The solar_model remains as the documented fallback when EG4 is unavailable.</li>
+  <li>WeatherService gained a second cache (EG4 PV-predict) with its own freshness window and a dedicated <code>refresh_eg4_prediction(force=False)</code> method. <code>get_today_forecast()</code> remains cache-only and never blocks on network I/O — refreshes happen on the background poll thread or via <code>POST /api/weather/evaluate_now</code>.</li>
+  <li>EG4Client gained <code>get_latest_pv_predict()</code> (cache read) and <code>refresh_pv_predict_blocking(timeout)</code> (sync entrypoint that schedules an async fetch on the client's event loop and waits). The actual HTTP POST hits <code>/WManage/api/weather/forecast</code> with the X-Requested-With header and form-encoded serialNum; recovery hooks into <code>_attempt_recovery()</code> for HTTP &gt;=400, top-level <code>success: false</code>, and <code>ePvPredict.success != "True"</code>.</li>
+  <li>New <code>PVPredictionLogger</code> service runs on its own background thread and appends one row per day to <code>miner_logs/pv_prediction_log.csv</code> about 30 minutes after sunset. It trapezoidally integrates <code>pv_power_w</code> from <code>eg4_battery_log.csv</code> over the local calendar day and pairs the actual with the EG4 raw prediction the gate used that morning, plus the multiplier and decision source.</li>
+  <li>New <code>GET /api/weather/prediction_history?days=N</code> returns the last N rows for the dashboard's Prediction Tracker card.</li>
+  <li>Dashboard: a new <code>eg4_predict_multiplier</code> input on the Parameters card, and a new Prediction Tracker card showing today's EG4 raw / multiplier / expected / source plus the last 7 days as a table with color-coded ratio cells (green 0.7–1.1, yellow 0.5–1.3, red otherwise).</li>
+</ul>
+
+<h3>Non-obvious decisions</h3>
+<ul>
+  <li><strong>Zero is valid, not missing.</strong> <code>parse_pv_predict_kwh(0)</code> returns <code>0.0</code>, not <code>None</code>. EG4's portal emits zero on confidently-overcast days; conflating that with "missing" would silently flip the safety logic and let the miner run on an empty forecast. The four dedicated tests in <code>test_eg4_pv_predict_parser.py</code> and <code>test_weather_gate_eg4_path.py</code> guard this end-to-end.</li>
+  <li><strong>get_eg4_client callback, not direct reference.</strong> <code>BatteryService.refresh_session()</code> replaces the <code>EG4Client</code> instance when the session is recovered. WeatherService takes a <code>lambda: battery_service.client</code> so it always sees the current client; a captured instance would silently go stale exactly when recovery matters most.</li>
+  <li><strong>Precondition split.</strong> The gate's "can we evaluate" check used to require both <code>battery_fresh</code> and a fresh Open-Meteo cloud cover. With the EG4 path, only one forecast source has to be fresh — either is enough. Open-Meteo is only required for the fallback. Both unavailable → <code>OUTCOME_FORECAST_STALE</code> (do not advance evaluated_date, retry next tick). This change is what unblocks evaluation on the days when Open-Meteo is down but EG4 is up.</li>
+  <li><strong>Pure helpers split into utils.</strong> <code>utils/eg4_pv_predict.py</code> owns the parsing/classification rules; <code>utils/pv_integration.py</code> owns the trapezoidal math + row hygiene. Both are imported by the I/O-heavy services so the math is unit-testable without spinning up the event loop or touching the filesystem. This is the same pattern <code>utils/solar_model.py</code> already follows.</li>
+  <li><strong>Gap policy in the integration.</strong> Adjacent samples more than 30 minutes apart discard that pair's contribution (instead of trapezoidally integrating across the gap). Without this rule, a single multi-hour EG4 outage would push the daily total far above the actual harvest. The default threshold is exposed as <code>DEFAULT_GAP_THRESHOLD_SEC</code> so the threshold is auditable; the test suite locks the 30-minute boundary in place.</li>
+  <li><strong>Logger uses gate.evaluated_date == today as a guard.</strong> If the gate didn't actually evaluate today (e.g. weather gate disabled, both forecast sources unavailable), the prediction log row writes blanks for the prediction context rather than dragging yesterday's numbers forward. The day's <code>actual_kwh</code> is still recorded — only the prediction side is left blank.</li>
+  <li><strong>Idempotent CSV append.</strong> The logger checks both <code>last_pv_log_date</code> in state and the actual last row in the file before appending. Belt + suspenders against the rare case where the state flag is out of sync with the on-disk file (e.g. crash between write and state.save).</li>
+  <li><strong>force=True on evaluate_now triggers a network call.</strong> The operator hitting "Force re-evaluate" expects the latest portal reading, not whatever was cached. <code>refresh_eg4_prediction(force=True)</code> serializes via a refresh-lock so back-to-back clicks don't fan out to the EG4 portal.</li>
+  <li><strong>EG4 lib private API.</strong> The fetch reuses <code>EG4InverterAPI._get_session()</code> (preferred) or <code>._session</code> (fallback) to ride the existing JSESSIONID cookie. Both are private surfaces; <code>AttributeError</code> on a future library version is caught and reported as <code>session_lookup_failed</code> rather than crashing the client. The library version pinned in <code>requirements.txt</code> is the contract.</li>
+  <li><strong>eg4_client.py file size.</strong> The new fetch + recovery logic grew the file from 401 to 655 lines. Restructuring into a mixin would add indirection without clarity — the new methods are cohesive with the existing I/O surface (login, runtime fetch, battery fetch). Pure parsing is already extracted into <code>utils/eg4_pv_predict.py</code>.</li>
+  <li><strong>Foreman session limitation.</strong> The dispatching environment for this session did not expose the Agent tool, so Architect / QA / Platform pre- and post-reviews were performed inline by the Builder against the project's SOLID + design-pattern rules instead of by dedicated subagents. The decision log here doubles as the architect's diff review.</li>
+</ul>
+
+<h3>Deploy</h3>
+<p>Touched: Python services, config, API, JS/CSS/HTML. Requires <code>sudo systemctl restart whatsminer.service</code> on the Pi after scp. Verification per the foreman prompt's "Deploy plan" section.</p>
+
+<hr/>
+
+<h2>2026-05-23 — Pending-power resolution rewrite (Task 1 of pending-power flywheel)</h2>
+<p class="date">File touched: <code>static/js/dashboard.js</code></p>
+
+<h3>What changed</h3>
+<ul>
+  <li>Frontend pending-power resolution (the "Powering up…" / "Shutting down…" indicator after the user clicks the power toggle) now consumes <code>GET /api/miner/op_status</code> instead of inferring success from MHS 5s, Power Limit, or autocontrol target_w heuristics.</li>
+  <li>Added <code>state.lastOpStatus</code> and a fetch in <code>refreshStatus()</code> that runs <em>before</em> <code>updateMinerStatus()</code> so the resolution branch sees the current op snapshot in the same poll tick.</li>
+  <li>Extracted a pure helper <code>_resolvePendingPowerOutcome(pending, opStatus, nowMs)</code> returning <code>{ outcome: 'pending' | 'success' | 'failure' | 'timeout', error? }</code>. No DOM, no fetch — easy to reason about and trivially testable later.</li>
+  <li>Removed <code>state.pendingPowerRetries</code> and both frontend retry-fetch paths (<code>fetch('/api/miner/power_off')</code> / <code>power_on</code> from inside the polling branch). The backend MinerController owns the retry lifecycle; the frontend now only renders outcomes.</li>
+</ul>
+
+<h3>Why</h3>
+<p>The previous heuristic for "powered up" was <code>currentPower &gt;= 0.9 * target_w</code>. On a successful power-on with autocontrol still in its ramp window, target_w can be high but actual Power lags for tens of seconds while upfreq completes — that produced the spurious "Power-up failed — retrying" banner that triggered this bugfix. The backend op_status already publishes the authoritative state (idle / applying / verifying / error) keyed by <code>op_kind</code> and <code>started_at</code>, so the frontend was duplicating logic against weaker signals.</p>
+
+<h3>Non-obvious decisions</h3>
+<ul>
+  <li><strong>2-second clock-skew tolerance</strong> on the <code>started_at &gt;= pending.start</code> check. Browser <code>Date.now()</code> and the Pi's wall clock can drift slightly; a strict equality would intermittently classify a fresh op as "stale" and keep waiting. 2s is tight enough that a genuinely stale prior op (seconds-to-minutes old) is still rejected.</li>
+  <li><strong>90-second timeout</strong> when no matching op_status entry ever appears. The backend always enqueues an op on power_on / power_off, so the only way to hit this is if the backend itself is wedged or the user clicked the toggle just as the worker thread was draining a previous op. 90s is well past the verify loop's worst case (~30s).</li>
+  <li><strong>Failure / timeout sets the toggle to the OPPOSITE of what the user requested.</strong> If "power on" fails, the miner is still off, so the toggle should reflect off. Same for shutdown failure. The previous code passed the requested state, which left the UI lying about the actual miner state.</li>
+  <li><strong>op_status fetched inline inside refreshStatus before updateMinerStatus.</strong> Considered parallelising with <code>Promise.all</code>, but kept sequential for now — the extra ~50ms is irrelevant on a 10s poll cadence, and sequential is easier to reason about for a critical-safety path.</li>
+  <li><strong>Frontend retries removed entirely.</strong> The MinerController's queue worker has its own verify-and-retry loop (Layer 3). Doubling that up from the frontend caused the original "stop sent twice" race that landed in earlier commits. The frontend now reports what the backend tells it, full stop.</li>
+</ul>
+
+<h3>Deploy</h3>
+<p>Single-file deploy: <code>scp static/js/dashboard.js hirscr@100.96.1.104:/home/hirscr/WM_controller/static/js/dashboard.js</code>. No backend changes, no Flask restart. Hard-refresh in the browser to pick up the new JS.</p>
+
+<hr/>
+
+<h2>2026-05-23 — User Power Intent (Power toggle bug fix)</h2>
+
+<h3>Summary</h3>
+<p>The dashboard Power toggle previously mirrored <code>status.is_off</code>, which made it flip OFF on its own during transient autocontrol verification failures and safety-driven shutdowns. The toggle is a USER COMMAND, not a status indicator. This change introduces a persisted <code>user_power_intent</code> boolean owned by the HTTP layer: the toggle now reflects what the user clicked, not what the miner is doing.</p>
+
+<h3>Architecture</h3>
+<ul>
+  <li><strong>Ownership</strong>: <code>user_power_intent</code> lives in <code>wm_state.json</code> via <code>StateManager.DEFAULT_STATE</code> (default <code>True</code> for forward-compat). <code>MinerService</code> caches the value and exposes a property + a single setter (<code>set_user_power_intent</code>) that persists.</li>
+  <li><strong>The only writers</strong> are the two user-facing HTTP endpoints <code>POST /api/miner/power_on</code> and <code>POST /api/miner/power_off</code> in <code>app.py</code>. Service-side code (AutoControl safety stops, MinerController verification) never touches it — structurally enforced because <code>MinerService.power_on()</code> / <code>power_off()</code> only enqueue queue ops; they do not call the intent setter.</li>
+  <li><strong>Defense in depth</strong>: <code>POST /api/autocontrol/enable</code> rejects with HTTP 400 + JSON body <code>{"error":"power_off","message":"…"}</code> when intent is False, even though the dashboard already greys out the AC checkbox in this case.</li>
+  <li><strong>Power-OFF cascade</strong>: clicking Power-OFF sets intent False AND disables AutoControl if it was enabled (so a tick can't immediately re-power the miner). Clicking Power-ON sets intent True but intentionally does NOT touch AutoControl — the user re-enables AC separately.</li>
+</ul>
+
+<h3>Frontend</h3>
+<ul>
+  <li>Power toggle <code>checked</code> driven by <code>status.user_power_intent === true</code>, not <code>status.is_off === false</code>.</li>
+  <li>AC toggle <code>disabled</code> when intent is False; CSS class <code>.disabled-by-intent</code> on the label dims it (opacity 0.45) and sets <code>cursor: not-allowed</code>.</li>
+  <li>AC change handler checks <code>resp.ok</code>; on non-2xx it reverts the checkbox to its prior state and surfaces the server-supplied <code>message</code> via <code>addError</code>.</li>
+</ul>
+
+<h3>Non-obvious decisions</h3>
+<ul>
+  <li><strong>Power-OFF disables AutoControl synchronously in the endpoint</strong> (not in <code>set_user_power_intent</code>). The setter only owns the persisted flag; the cascade (disable AC) is HTTP-layer policy because the rule is about user-action semantics, not state-machine invariants. Keeps the setter pure and prevents accidental AC-disables from anywhere else that might want to write intent.</li>
+  <li><strong>Power-ON does NOT auto-enable AutoControl</strong>. Per the spec, ON just says "master switch is on"; the user separately decides whether AutoControl should run. Asymmetric to Power-OFF on purpose: turning AC off should not require manually flipping AC, but turning AC on should be an explicit second click.</li>
+  <li><strong>AC toggle's disabled state no longer follows <code>is_off</code></strong>. Previously, the dashboard greyed out AC when the miner was physically off. Now it greys out AC only when user intent is OFF. This means the user can re-enable AC while the miner is physically off but user intent is on (e.g., during a battery-stale safety stop) — which is correct: AC will run its next tick and decide whether to re-issue power_on.</li>
+  <li><strong>Failure-path toggle flicker is acceptable.</strong> When a power_on op fails verification, <code>_clearPendingPower(!wasPoweringUp)</code> sets the toggle to OFF for ≤1s, then the next status poll re-drives it from <code>user_power_intent === true</code>. The brief flash reflects the miner's actual transient state and self-heals; no extra logic needed.</li>
+  <li><strong>Forward compatibility via StateManager merge</strong>. The Pi's existing <code>wm_state.json</code> doesn't have <code>user_power_intent</code>; <code>StateManager.load()</code> already merges with <code>DEFAULT_STATE</code>, so missing keys get the default <code>True</code>. No migration script. The next save persists the field.</li>
+  <li><strong><code>state_manager</code> is an optional kwarg on <code>MinerService.__init__</code></strong> defaulting to <code>None</code>. The production app always passes it, but allowing <code>None</code> lets tests/CLIs instantiate the service without wiring up state. The setter no-ops persistence when state_manager is None (the property still works in-memory).</li>
+  <li><strong>POWER_INTENT log tag enabled (true) during rollout</strong>. Set to false in <code>logs/logging.yaml</code> once the feature has been verified in production for a few days.</li>
+</ul>
+
+<h3>Tests</h3>
+<p><code>tests/test_user_power_intent_state.py</code> — pure StateManager round-trip tests covering default value, persistence, no-clobber across unrelated saves, and forward-compat for state files that predate the field. No service instantiation, no network — runs in milliseconds. Total suite: 87 tests (83 prior + 4 new).</p>
+
+<h3>Deploy</h3>
+<p>Files to <code>scp</code> to the Pi at <code>hirscr@100.96.1.104:/home/hirscr/WM_controller/</code>:</p>
+<ul>
+  <li><code>utils/state_manager.py</code></li>
+  <li><code>services/miner_service.py</code></li>
+  <li><code>app.py</code></li>
+  <li><code>static/js/dashboard.js</code></li>
+  <li><code>static/css/dashboard.css</code></li>
+  <li><code>logs/logging.yaml</code></li>
+  <li><code>tests/test_user_power_intent_state.py</code></li>
+</ul>
+<p>Then <code>sudo systemctl restart whatsminer</code>. Verify with <code>curl http://100.96.1.104:8080/api/miner/status</code> — the response's <code>status</code> object should include <code>"user_power_intent": true</code>.</p>
+
+</body>
+</html>

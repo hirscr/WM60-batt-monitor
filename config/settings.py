@@ -80,10 +80,10 @@ class WeatherGateConfig:
     battery_total_kwh: float = 75.0
     summer_max_kwh: float = 75.0
     winter_max_kwh: float = 30.0
-    safety_factor: float = 1.1
     pre_sunrise_window_minutes: int = 30
     recovery_soc_threshold_pct: int = 90
     recovery_min_hours_before_sunset: float = 3.0
+    eg4_predict_multiplier: float = 0.8
     forecast_refresh_seconds: int = 3600
     forecast_freshness_seconds: int = 7200
 
@@ -237,15 +237,20 @@ def load_settings(config_path: Optional[str] = None) -> Settings:
         if 'weather_gate' in data:
             wg = data['weather_gate'] or {}
             d = settings.weather_gate
+            eg4_mult = float(wg.get('eg4_predict_multiplier', d.eg4_predict_multiplier))
+            if eg4_mult <= 0:
+                raise ValueError(
+                    f"weather_gate.eg4_predict_multiplier must be > 0, got {eg4_mult}"
+                )
             settings.weather_gate = WeatherGateConfig(
                 enabled=wg.get('enabled', d.enabled),
                 battery_total_kwh=float(wg.get('battery_total_kwh', d.battery_total_kwh)),
                 summer_max_kwh=float(wg.get('summer_max_kwh', d.summer_max_kwh)),
                 winter_max_kwh=float(wg.get('winter_max_kwh', d.winter_max_kwh)),
-                safety_factor=float(wg.get('safety_factor', d.safety_factor)),
                 pre_sunrise_window_minutes=int(wg.get('pre_sunrise_window_minutes', d.pre_sunrise_window_minutes)),
                 recovery_soc_threshold_pct=int(wg.get('recovery_soc_threshold_pct', d.recovery_soc_threshold_pct)),
                 recovery_min_hours_before_sunset=float(wg.get('recovery_min_hours_before_sunset', d.recovery_min_hours_before_sunset)),
+                eg4_predict_multiplier=eg4_mult,
                 forecast_refresh_seconds=int(wg.get('forecast_refresh_seconds', d.forecast_refresh_seconds)),
                 forecast_freshness_seconds=int(wg.get('forecast_freshness_seconds', d.forecast_freshness_seconds)),
             )

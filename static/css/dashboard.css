@@ -258,6 +258,19 @@ h2 {
   cursor: pointer;
 }
 
+/* Auto-Control label is greyed out when the Power master switch is OFF.
+   The checkbox's native :disabled state covers the box itself; this rule
+   dims the surrounding label text and shows not-allowed on hover so the
+   user understands the click is intentionally blocked. */
+.control-group label.disabled-by-intent {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.control-group label.disabled-by-intent input[type="checkbox"] {
+  cursor: not-allowed;
+}
+
 .control-group input[type="number"] {
   width: 80px;
   padding: 6px;
@@ -707,5 +720,64 @@ h2 {
 #weatherParamsCard .weather-save-status {
   font-size: 0.88em;
   color: #555;
+}
+
+/* --- Prediction Tracker card (EG4 forecast vs. actual harvest, last 7 days) --- */
+#predictionTrackerCard h2 {
+  margin-top: 0;
+}
+#predictionTrackerCard .prediction-today {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  background: #f7f9fc;
+  border-radius: 4px;
+}
+#predictionTrackerCard .prediction-today-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 16px;
+  row-gap: 4px;
+  font-size: 0.92em;
+}
+#predictionTrackerCard .prediction-today-grid > div:nth-child(odd) {
+  color: #555;
+}
+#predictionTrackerCard .prediction-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+#predictionTrackerCard .prediction-table th,
+#predictionTrackerCard .prediction-table td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid #eee;
+}
+#predictionTrackerCard .prediction-table th {
+  background: #f0f3f7;
+  font-weight: 600;
+}
+#predictionTrackerCard .prediction-empty {
+  color: #888;
+  text-align: center;
+  font-style: italic;
+}
+/* Ratio cell color bands. The ratio is actual_kwh / eg4_raw_kwh; 1.0 means
+   EG4 was spot-on. Bands are intentionally generous (0.7–1.1 green) because
+   the calibration log is meant to surface chronic bias, not single-day noise. */
+#predictionTrackerCard .ratio-good {
+  background: #e6f7e6;
+  color: #1c6b1c;
+  font-weight: 600;
+}
+#predictionTrackerCard .ratio-warn {
+  background: #fff5e0;
+  color: #855e00;
+  font-weight: 600;
+}
+#predictionTrackerCard .ratio-bad {
+  background: #fde0e0;
+  color: #8a1f1f;
+  font-weight: 600;
 }
 

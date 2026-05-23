@@ -17,9 +17,20 @@ from typing import Any, Dict, Optional
 
 from eg4_inverter_api import EG4InverterAPI
 
+from utils.eg4_pv_predict import (
+    classify_pv_predict_response,
+    extract_inverter_serial,
+    parse_pv_predict_kwh,
+)
+from utils.log_config import log
+
 # Half the 600s battery-freshness gate, so at least one recovery attempt is
 # possible before the staleness threshold fires and autocontrol stops the miner.
 RELOGIN_COOLDOWN_SEC = 300
+
+# EG4 portal context-path prefix. The bare /api/weather/forecast is a 404 —
+# the Tomcat app is mounted under /WManage. Probed 2026-05-23.
+_PV_PREDICT_PATH = "/WManage/api/weather/forecast"
 
 
 def _is_empty_response(resp) -> bool:
@@ -119,6 +130,27 @@ class EG4Client:
         # Monotonic timestamp of last re-login attempt; 0.0 = eligible immediately.
         self._last_relogin_attempt: float = 0.0
 
+        # PV-predict cache. Populated by refresh_pv_predict_blocking() via the
+        # background event loop; the shape mirrors the parsed forecast snapshot:
+        #   {
+        #     "today_kwh": float | None,
+        #     "tomorrow_kwh": float | None,
+        #     "for_date": str | None,            # localDate, e.g. "2026/05/23"
+        #     "tomorrow_date": str | None,
+        #     "fetched_at": datetime | None,     # UTC, when the response landed
+        #     "last_error": str | None,
+        #   }
+        # The whole dict is replaced on every successful refresh; partial
+        # mutation would be racy under the GIL-but-multi-thread aiohttp loop.
+        self._pv_predict: Dict[str, Any] = {
+            "today_kwh": None,
+            "tomorrow_kwh": None,
+            "for_date": None,
+            "tomorrow_date": None,
+            "fetched_at": None,
+            "last_error": None,
+        }
+
         if not self.username or not self.password:
             raise RuntimeError("EG4 creds not set (EG4_USER / EG4_PASS).")
 
@@ -143,6 +175,57 @@ class EG4Client:
     def get_latest(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self._latest) if self._latest else {}
+
+    def get_latest_pv_predict(self) -> Dict[str, Any]:
+        """Return the most recent EG4 PV prediction snapshot (sync, cache-only).
+
+        Never triggers network I/O. Callers needing a fresh value must invoke
+        refresh_pv_predict_blocking() first. The returned dict is a copy of
+        the internal cache so callers can mutate it safely.
+
+        Shape (always all keys present, values default to None until first
+        refresh succeeds)::
+
+            {
+                "today_kwh": float | None,
+                "tomorrow_kwh": float | None,
+                "for_date": str | None,
+                "tomorrow_date": str | None,
+                "fetched_at": datetime | None,
+                "last_error": str | None,
+            }
+        """
+        with self._lock:
+            return dict(self._pv_predict)
+
+    def refresh_pv_predict_blocking(self, timeout: float = 30.0) -> Dict[str, Any]:
+        """Synchronously refresh the PV-predict cache by scheduling the fetch
+        on the EG4Client's event loop and waiting for it to complete.
+
+        Returns the updated snapshot (same shape as get_latest_pv_predict()).
+        On any exception (loop not running, timeout, AttributeError on the
+        library's private session, network error), the snapshot is updated
+        with `last_error` set and the other fields preserved; the method
+        returns the snapshot rather than raising — callers are expected to
+        check `last_error` and fall back gracefully.
+        """
+        if self._loop is None or not self._loop.is_running():
+            with self._lock:
+                self._pv_predict = dict(self._pv_predict, last_error="loop_not_running")
+                return dict(self._pv_predict)
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._refresh_pv_predict_async(), self._loop
+            )
+            future.result(timeout=timeout)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"[:200]
+            with self._lock:
+                self._pv_predict = dict(self._pv_predict, last_error=err)
+            if __debug__:
+                log("EG4_PREDICT", f"refresh failed: {err}")
+        return self.get_latest_pv_predict()
 
     def get_history(self, limit: int = 120) -> list[Dict[str, Any]]:
         with self._lock:
@@ -399,3 +482,175 @@ class EG4Client:
         pv_s = f"{int(pv_power_w)}w" if pv_power_w is not None else "?"
         load_s = f"{int(load_power_w)}w" if load_power_w is not None else "?"
         print(f"[EG4Client] poll ok SOC={soc_s} PV={pv_s} load={load_s}")
+
+    # ---------- PV-predict (EG4 portal /api/weather/forecast) ----------
+
+    async def _refresh_pv_predict_async(self) -> None:
+        """Fetch the EG4 forecast endpoint and update the PV-predict cache.
+
+        Triggers _attempt_recovery on session-expiry symptoms (HTTP >= 400,
+        top-level success=false, ePvPredict missing or success != "True").
+        On recovery success, retries the fetch once. The cache is updated
+        whether the call succeeds or fails — failure stamps `last_error`
+        while leaving the previous good values intact so consumers can decide
+        for themselves whether to trust the (potentially stale) snapshot.
+
+        Library dependency: this method depends on the eg4_inverter_api
+        library exposing an awaitable `_get_session()` that returns an
+        aiohttp ClientSession with the JSESSIONID cookie already set. If the
+        method is unavailable on a future library version, the cache is
+        stamped with an AttributeError and the method returns cleanly.
+        """
+        # Run one fetch attempt; classify; recover once if needed.
+        result = await self._pv_predict_one_attempt()
+        if result["needs_recovery"]:
+            recovered = await self._attempt_recovery(
+                f"PV predict refresh: {result['reason']}"
+            )
+            if recovered is None:
+                # Cooldown still active or recovery failed; cache the error.
+                self._update_pv_predict_cache(last_error=result["error"] or result["reason"])
+                return
+            # Recovery succeeded — retry once. A second failure is reported
+            # as the live error; the cooldown timer in _attempt_recovery
+            # prevents an infinite retry loop.
+            result = await self._pv_predict_one_attempt()
+            if result["needs_recovery"]:
+                self._update_pv_predict_cache(last_error=result["error"] or result["reason"])
+                return
+
+        if result["error"] is not None:
+            self._update_pv_predict_cache(last_error=result["error"])
+            return
+
+        self._update_pv_predict_cache(
+            today_kwh=result["today_kwh"],
+            tomorrow_kwh=result["tomorrow_kwh"],
+            for_date=result["for_date"],
+            tomorrow_date=result["tomorrow_date"],
+            fetched_at=datetime.now(timezone.utc),
+            last_error=None,
+        )
+        if __debug__:
+            log(
+                "EG4_PREDICT",
+                f"refresh ok today={result['today_kwh']} "
+                f"tomorrow={result['tomorrow_kwh']} "
+                f"for_date={result['for_date']}",
+            )
+
+    async def _pv_predict_one_attempt(self) -> Dict[str, Any]:
+        """Single HTTP attempt against /WManage/api/weather/forecast.
+
+        Returns a dict with these keys (always all present)::
+
+            {
+                "today_kwh": float | None,
+                "tomorrow_kwh": float | None,
+                "for_date": str | None,
+                "tomorrow_date": str | None,
+                "needs_recovery": bool,   # True iff caller should re-login + retry
+                "reason": str,            # short label suitable for log lines
+                "error": str | None,      # non-recoverable error to cache
+            }
+        """
+        empty = {
+            "today_kwh": None,
+            "tomorrow_kwh": None,
+            "for_date": None,
+            "tomorrow_date": None,
+            "needs_recovery": False,
+            "reason": "",
+            "error": None,
+        }
+
+        if self._api is None:
+            return {**empty, "error": "api_not_initialized"}
+
+        # Find an inverter serial. The library exposes get_inverters() as a
+        # sync method that returns the cached list from the last login.
+        try:
+            invs = self._api.get_inverters() or []
+        except Exception as exc:
+            return {**empty, "error": f"get_inverters failed: {exc}"[:200]}
+
+        serial = None
+        for inv in invs:
+            serial = extract_inverter_serial(inv)
+            if serial:
+                break
+        if not serial:
+            return {**empty, "error": "no_inverter_serial"}
+
+        # Pull the authenticated aiohttp session. We prefer _get_session()
+        # because it lazily creates the session if needed; if that helper is
+        # not exposed by this library version we fall back to the raw
+        # _session attribute. Both are private — see method docstring.
+        try:
+            get_session_fn = getattr(self._api, "_get_session", None)
+            if callable(get_session_fn):
+                session = await get_session_fn()
+            else:
+                session = getattr(self._api, "_session", None)
+        except Exception as exc:
+            return {**empty, "error": f"session_lookup_failed: {exc}"[:200]}
+
+        if session is None:
+            return {**empty, "error": "no_session_available"}
+
+        url = f"{self.base_url}{_PV_PREDICT_PATH}"
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        }
+
+        try:
+            async with session.post(
+                url,
+                data={"serialNum": serial},
+                headers=headers,
+                ssl=False,
+            ) as resp:
+                status = resp.status
+                body_text = await resp.text()
+        except Exception as exc:
+            return {**empty, "error": f"http_error: {exc}"[:200]}
+
+        try:
+            parsed = json.loads(body_text)
+        except (TypeError, ValueError):
+            parsed = None
+
+        verdict, reason = classify_pv_predict_response(status, parsed)
+        if verdict == "recovery":
+            return {**empty, "needs_recovery": True, "reason": reason}
+        if verdict == "error":
+            return {**empty, "error": reason}
+
+        # verdict == "ok" — parsed is guaranteed to be a dict with a valid
+        # ePvPredict block per classify_pv_predict_response.
+        predict = parsed["ePvPredict"]
+        today_kwh = parse_pv_predict_kwh(predict.get("todayPvEnergy"))
+        tomorrow_kwh = parse_pv_predict_kwh(predict.get("tomorrowPvEnergy"))
+        for_date = parsed.get("localDate")
+        tomorrow_date = parsed.get("localTomorrowDate")
+
+        return {
+            "today_kwh": today_kwh,
+            "tomorrow_kwh": tomorrow_kwh,
+            "for_date": for_date if isinstance(for_date, str) else None,
+            "tomorrow_date": tomorrow_date if isinstance(tomorrow_date, str) else None,
+            "needs_recovery": False,
+            "reason": "ok",
+            "error": None,
+        }
+
+    def _update_pv_predict_cache(self, **fields) -> None:
+        """Replace the PV-predict cache atomically under the instance lock.
+
+        Only keys present in `fields` are updated; the rest are preserved.
+        """
+        with self._lock:
+            merged = dict(self._pv_predict)
+            merged.update(fields)
+            self._pv_predict = merged

@@ -18,11 +18,13 @@ const state = {
   // Cache for stop-reason banner evaluation + cross-card reads (weather)
   lastMinerStatus: null,
   lastAutocontrolStatus: null,
+  lastManualPct: null,          // last % the user manually applied (AC-off display source)
   lastBatteryStatus: null,
   // Pending power action state for transitional UI (Layer 8)
   pendingPowerAction: null,    // null | 'shutting_down' | 'powering_up'
   pendingPowerStart: 0,
-  pendingPowerRetries: 0,
+  // Latest snapshot of /api/miner/op_status — drives pending-power resolution
+  lastOpStatus: null,
 };
 
 // Debug console functions
@@ -870,6 +872,23 @@ async function refreshStatus() {
     const minerRes = await fetch('/api/miner/status');
     const minerData = await minerRes.json();
     console.log('[RefreshStatus] Miner data received:', minerData);
+
+    // Miner op_status — drives pending-power resolution. Fetch before
+    // updateMinerStatus so the pending-resolution branch sees the latest op.
+    try {
+      const opRes = await fetch('/api/miner/op_status', { cache: 'no-store' });
+      if (opRes.ok) {
+        state.lastOpStatus = await opRes.json();
+        console.log('[RefreshStatus] op_status received:', state.lastOpStatus);
+      } else {
+        state.lastOpStatus = null;
+        console.warn('[RefreshStatus] op_status HTTP', opRes.status);
+      }
+    } catch (opErr) {
+      state.lastOpStatus = null;
+      console.warn('[RefreshStatus] op_status fetch failed:', opErr.message);
+    }
+
     updateMinerStatus(minerData);
 
     // Battery status
@@ -903,6 +922,16 @@ async function refreshStatus() {
   }
 }
 
+// Returns the best available manual power percentage for display when AC is off.
+// Prefers the in-session commanded value; falls back to Power Limit rounded to
+// the nearest whole percent (normalises firmware imprecision, e.g. 1789→50%).
+function _manualTargetPct() {
+  if (state.lastManualPct != null) return state.lastManualPct;
+  const ms = state.lastMinerStatus;
+  if (ms && ms['Power Limit'] > 0) return Math.round(ms['Power Limit'] / 3600 * 100);
+  return null;
+}
+
 // Update miner status
 function updateMinerStatus(data) {
   console.log('[UpdateMinerStatus] Received data:', data);
@@ -911,6 +940,16 @@ function updateMinerStatus(data) {
 
   // Cache for banner evaluation
   state.lastMinerStatus = status;
+
+  // When AC is off, keep target power display in sync with the commanded value
+  const acStatus = state.lastAutocontrolStatus;
+  if (acStatus && !acStatus.enabled) {
+    const pct = _manualTargetPct();
+    const targetPowerDisplay = document.getElementById('minerTargetPower');
+    if (pct != null && targetPowerDisplay) {
+      targetPowerDisplay.textContent = `${Math.round(3600 * (pct / 100))} W (${pct}%)`;
+    }
+  }
 
   addDebugLog(`[Frontend] Received miner update: connected=${connection.connected}`, 'info');
 
@@ -952,51 +991,61 @@ function updateMinerStatus(data) {
     document.getElementById('minerFan').textContent = fanSpeed + ' RPM';
   }
 
-  // Update power toggle — use is_off (backend field); is_mining doesn't exist
+  // Update power toggle from USER INTENT (status.user_power_intent), not the
+  // miner's observed on/off state. The miner can be physically off due to a
+  // transient safety stop while the user still wants it available — in that
+  // case the toggle stays checked (user did not click anything). The
+  // stop-reason banner + live Power/Hashrate readings show the actual state.
+  // Pending-power-action flow (set by the toggle click handler) freezes the
+  // toggle visually until the backend resolves the op.
   const powerToggle = document.getElementById('minerPowerToggle');
   if (!state.pendingPowerAction) {
-    powerToggle.checked = status.is_off === false;
+    powerToggle.checked = status.user_power_intent === true;
     powerToggle.disabled = false;
   }
 
-  // Resolve pending power actions based on real miner state
-  if (state.pendingPowerAction === 'shutting_down') {
-    const verifiedOff = status.is_off === true || (status['Power Limit'] == 0 && status['MHS 5s'] == 0);
-    if (verifiedOff) {
-      _clearPendingPower(false);
-    } else {
-      const elapsed = Date.now() - state.pendingPowerStart;
-      if (elapsed > 60000) {
-        if ((state.pendingPowerRetries || 0) < 3) {
-          state.pendingPowerRetries = (state.pendingPowerRetries || 0) + 1;
-          fetch('/api/miner/power_off', { method: 'POST' }).catch(() => {});
-          state.pendingPowerStart = Date.now();
-          _setPendingPowerIndicator('Shutdown failed — retrying', '#dc3545');
-        } else {
-          _clearPendingPower(false, 'Shutdown failed after 3 retries');
-        }
-      }
+  // AC toggle is disabled (and visually greyed) when user intent is OFF.
+  // This is the frontend half of the constraint — the backend also rejects
+  // POST /api/autocontrol/enable with HTTP 400 when intent is false.
+  const acToggle = document.getElementById('autoControlToggle');
+  const acLabel = acToggle ? acToggle.closest('label') : null;
+  const targetPowerDisplay = document.getElementById('minerTargetPower');
+  const intentOff = status.user_power_intent === false;
+  if (acToggle) {
+    acToggle.disabled = intentOff;
+    if (acLabel) acLabel.classList.toggle('disabled-by-intent', intentOff);
+  }
+  if (intentOff && targetPowerDisplay && !state.pendingPowerAction) {
+    targetPowerDisplay.textContent = '0 W (0%)';
+  }
+
+  // Resolve pending power actions by consuming /api/miner/op_status.
+  // Authoritative backend op-state replaces the old MHS/Power heuristics
+  // and the frontend retry loop. No retry fetches here — the backend owns
+  // the lifecycle; the frontend only renders the outcome.
+  if (state.pendingPowerAction) {
+    const pending = {
+      action: state.pendingPowerAction,
+      start: state.pendingPowerStart,
+    };
+    const result = _resolvePendingPowerOutcome(
+      pending,
+      state.lastOpStatus,
+      Date.now()
+    );
+    const wasPoweringUp = state.pendingPowerAction === 'powering_up';
+    if (result.outcome === 'success') {
+      _clearPendingPower(wasPoweringUp);
+    } else if (result.outcome === 'failure') {
+      const label = wasPoweringUp ? 'Power-up failed' : 'Shutdown failed';
+      // On failure the toggle should reflect the actual end state, which is
+      // the OPPOSITE of what the user requested (resume failed => still off).
+      _clearPendingPower(!wasPoweringUp, `${label}: ${result.error}`);
+    } else if (result.outcome === 'timeout') {
+      const label = wasPoweringUp ? 'Power-up timed out' : 'Shutdown timed out';
+      _clearPendingPower(!wasPoweringUp, label);
     }
-  } else if (state.pendingPowerAction === 'powering_up') {
-    const autoStatus = state.lastAutocontrolStatus || {};
-    const targetW = autoStatus.target_w || 0;
-    const currentPower = parseFloat(status['Power'] || 0);
-    const poweredUp = targetW > 0 ? currentPower >= 0.9 * targetW : status.is_off === false;
-    if (poweredUp) {
-      _clearPendingPower(true);
-    } else {
-      const elapsed = Date.now() - state.pendingPowerStart;
-      if (elapsed > 120000) {
-        if ((state.pendingPowerRetries || 0) < 3) {
-          state.pendingPowerRetries = (state.pendingPowerRetries || 0) + 1;
-          fetch('/api/miner/power_on', { method: 'POST' }).catch(() => {});
-          state.pendingPowerStart = Date.now();
-          _setPendingPowerIndicator('Power-up failed — retrying', '#dc3545');
-        } else {
-          _clearPendingPower(true, 'Power-up failed after 3 retries');
-        }
-      }
-    }
+    // outcome === 'pending' → leave indicator/toggle as-is
   }
 
   updateMinerStopReasonBanner();
@@ -1059,14 +1108,20 @@ function updateAutoControlStatus(data) {
   autoToggle.checked = enabled;
 
   // Update target power display
-  if (target_w !== null && target_w !== undefined) {
-    targetPowerDisplay.textContent = `${target_w} W (${target_pct || 0}%)`;
-  } else if (target_pct !== null && target_pct !== undefined) {
-    // Calculate watts from percentage (max 3600W)
-    const targetWatts = Math.round(3600 * (target_pct / 100));
-    targetPowerDisplay.textContent = `${targetWatts} W (${target_pct}%)`;
+  if (enabled) {
+    if (target_w !== null && target_w !== undefined) {
+      targetPowerDisplay.textContent = `${target_w} W (${target_pct || 0}%)`;
+    } else if (target_pct !== null && target_pct !== undefined) {
+      const targetWatts = Math.round(3600 * (target_pct / 100));
+      targetPowerDisplay.textContent = `${targetWatts} W (${target_pct}%)`;
+    } else {
+      targetPowerDisplay.textContent = '— W';
+    }
   } else {
-    targetPowerDisplay.textContent = '— W';
+    const pct = _manualTargetPct();
+    if (pct != null) {
+      targetPowerDisplay.textContent = `${Math.round(3600 * (pct / 100))} W (${pct}%)`;
+    }
   }
 
   // Update power input and button state
@@ -1325,6 +1380,52 @@ function updateNetworkDevices(data) {
   }
 }
 
+// Resolve a pending power action against the latest /api/miner/op_status
+// snapshot. Pure helper — no DOM, no fetch. Outcome:
+//   { outcome: 'pending' }                       — keep waiting
+//   { outcome: 'success' }                       — terminal op_state=idle
+//   { outcome: 'failure', error }                — terminal op_state=error
+//   { outcome: 'timeout' }                       — >90s with no matching op
+//
+// pending: { action: 'powering_up'|'shutting_down', start: epoch_ms }
+// opStatus: latest /api/miner/op_status JSON (or null)
+// nowMs: current time in ms (injectable for testability)
+function _resolvePendingPowerOutcome(pending, opStatus, nowMs) {
+  if (!pending || !pending.action) return { outcome: 'pending' };
+
+  const expectedKind = pending.action === 'powering_up' ? 'resume' : 'stop';
+  const elapsed = nowMs - pending.start;
+
+  // Terminal-state matching: an op_status entry counts as "matching" only if
+  // its op_kind agrees with the pending action AND its started_at is at or
+  // after the pending.start (with a 2s clock-skew tolerance). Otherwise we
+  // treat it as stale/unrelated and keep waiting.
+  const opMatches = opStatus
+    && opStatus.op_kind === expectedKind
+    && typeof opStatus.started_at === 'number'
+    && (opStatus.started_at * 1000) >= (pending.start - 2000);
+
+  if (!opMatches) {
+    // A different op is running/completed that started after our click.
+    // The queue is FIFO — our op must have already completed for the next
+    // one to start. Treat this as success rather than letting it time out.
+    const newerOpRan = opStatus
+      && typeof opStatus.started_at === 'number'
+      && (opStatus.started_at * 1000) >= (pending.start - 2000)
+      && (opStatus.op_state === 'idle' || opStatus.op_state === 'applying');
+    if (newerOpRan) return { outcome: 'success' };
+
+    if (elapsed > 90000) return { outcome: 'timeout' };
+    return { outcome: 'pending' };
+  }
+
+  if (opStatus.op_state === 'idle') return { outcome: 'success' };
+  if (opStatus.op_state === 'error') {
+    return { outcome: 'failure', error: opStatus.error || 'unknown error' };
+  }
+  return { outcome: 'pending' };
+}
+
 // Pending power action helpers (Layer 8 transitional UI)
 function _setPendingPowerIndicator(text, color) {
   let el = document.getElementById('powerActionIndicator');
@@ -1342,7 +1443,6 @@ function _setPendingPowerIndicator(text, color) {
 function _clearPendingPower(checkedState, errorMsg) {
   state.pendingPowerAction = null;
   state.pendingPowerStart = 0;
-  state.pendingPowerRetries = 0;
   const toggle = document.getElementById('minerPowerToggle');
   if (toggle) {
     toggle.checked = checkedState;
@@ -1364,7 +1464,6 @@ function setupEventListeners() {
     const endpoint = intendOn ? '/api/miner/power_on' : '/api/miner/power_off';
     state.pendingPowerAction = intendOn ? 'powering_up' : 'shutting_down';
     state.pendingPowerStart = Date.now();
-    state.pendingPowerRetries = 0;
     e.target.disabled = true;
     _setPendingPowerIndicator(intendOn ? 'Powering up…' : 'Shutting down…', '#6c757d');
     try {
@@ -1375,12 +1474,29 @@ function setupEventListeners() {
     }
   });
 
-  // Auto-control toggle
+  // Auto-control toggle.
+  // The /enable endpoint can refuse (HTTP 400) when user_power_intent is OFF.
+  // In that case revert the checkbox to its prior state and surface the
+  // server-supplied message so the user sees why the click was rejected.
   document.getElementById('autoControlToggle').addEventListener('change', async (e) => {
-    const endpoint = e.target.checked ? '/api/autocontrol/enable' : '/api/autocontrol/disable';
+    const wantEnable = e.target.checked;
+    const endpoint = wantEnable ? '/api/autocontrol/enable' : '/api/autocontrol/disable';
     try {
-      await fetch(endpoint, { method: 'POST' });
+      const resp = await fetch(endpoint, { method: 'POST' });
+      if (!resp.ok) {
+        // Revert the toggle — the backend refused.
+        e.target.checked = !wantEnable;
+        let msg = `Auto-control ${wantEnable ? 'enable' : 'disable'} failed (HTTP ${resp.status})`;
+        try {
+          const body = await resp.json();
+          if (body && body.message) msg = body.message;
+          else if (body && body.error) msg += `: ${body.error}`;
+        } catch (_) { /* non-JSON body — keep default msg */ }
+        addError(msg);
+      }
     } catch (err) {
+      // Network failure — revert and report.
+      e.target.checked = !wantEnable;
       addError('Auto-control toggle error: ' + err.message);
     }
   });
@@ -1423,6 +1539,7 @@ async function applyPowerPct() {
 
     if (result.ok) {
       addDebugLog(`[Manual Control] ✓ Power set to ${percent}%`, 'success');
+      state.lastManualPct = percent;
 
       // Immediately update target power display
       const targetWatts = Math.round(3600 * (percent / 100));
@@ -1603,9 +1720,78 @@ async function refreshWeatherCard() {
     if (!res.ok) return;
     const data = await res.json();
     renderWeatherCard(data);
+    // Refresh the prediction tracker on the same cycle. Failures are
+    // logged but do not prevent the main weather card from rendering.
+    renderPredictionTrackerToday(data);
+    try {
+      const history = await fetchPredictionHistory(7);
+      renderPredictionHistoryRows(history);
+    } catch (e) {
+      console.error('[Weather] prediction_history fetch failed:', e);
+    }
   } catch (e) {
     console.error('[Weather] status fetch failed:', e);
   }
+}
+
+async function fetchPredictionHistory(days) {
+  const res = await fetch(`/api/weather/prediction_history?days=${days}`, { cache: 'no-store' });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return Array.isArray(data.rows) ? data.rows : [];
+}
+
+function renderPredictionTrackerToday(data) {
+  const forecast = data.forecast || {};
+  const gate = data.gate || {};
+
+  // EG4 raw today (forecast carries the cache; gate carries the value used).
+  setText('predTodayRaw',
+    (forecast.eg4_today_kwh != null) ? forecast.eg4_today_kwh.toFixed(2) + ' kWh' : '—');
+  setText('predTodayMultiplier',
+    (gate.multiplier_applied != null) ? gate.multiplier_applied.toFixed(2) : '—');
+  setText('predTodayExpected', kwhOrDash(gate.expected_kwh));
+  setText('predTodaySource', gate.decision_source || '—');
+}
+
+function renderPredictionHistoryRows(rows) {
+  const tbody = document.getElementById('predictionHistoryBody');
+  if (!tbody) return;
+  if (!rows || rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="prediction-empty">No history yet.</td></tr>';
+    return;
+  }
+  const html = rows.map((r) => {
+    const dateStr = r.date || '—';
+    const rawStr = _kwhCellOrDash(r.eg4_today_kwh_raw);
+    const actualStr = _kwhCellOrDash(r.actual_kwh);
+    const ratioRaw = r.ratio_actual_to_eg4_raw;
+    let ratioStr = '—';
+    let ratioClass = '';
+    if (ratioRaw && ratioRaw !== '') {
+      const ratio = parseFloat(ratioRaw);
+      if (!Number.isNaN(ratio)) {
+        ratioStr = ratio.toFixed(2);
+        if (ratio >= 0.7 && ratio <= 1.1) ratioClass = 'ratio-good';
+        else if (ratio >= 0.5 && ratio <= 1.3) ratioClass = 'ratio-warn';
+        else ratioClass = 'ratio-bad';
+      }
+    }
+    return `<tr>
+      <td>${dateStr}</td>
+      <td>${rawStr}</td>
+      <td>${actualStr}</td>
+      <td class="${ratioClass}">${ratioStr}</td>
+    </tr>`;
+  }).join('');
+  tbody.innerHTML = html;
+}
+
+function _kwhCellOrDash(raw) {
+  if (raw === null || raw === undefined || raw === '') return '—';
+  const v = parseFloat(raw);
+  if (Number.isNaN(v)) return '—';
+  return v.toFixed(2);
 }
 
 function renderWeatherCard(data) {
@@ -1684,10 +1870,10 @@ function renderWeatherCard(data) {
     setNumber('weatherCfgBatteryKwh', cfg.battery_total_kwh);
     setNumber('weatherCfgSummerKwh', cfg.summer_max_kwh);
     setNumber('weatherCfgWinterKwh', cfg.winter_max_kwh);
-    setNumber('weatherCfgSafetyFactor', cfg.safety_factor);
     setNumber('weatherCfgPreSunriseMin', cfg.pre_sunrise_window_minutes);
     setNumber('weatherCfgRecoverySoc', cfg.recovery_soc_threshold_pct);
     setNumber('weatherCfgRecoveryHours', cfg.recovery_min_hours_before_sunset);
+    setNumber('weatherCfgEg4Mult', cfg.eg4_predict_multiplier);
     const enabledEl = document.getElementById('weatherCfgEnabled');
     if (enabledEl) enabledEl.checked = !!cfg.enabled;
     weatherCardLoaded = true;
@@ -1770,10 +1956,10 @@ async function saveWeatherConfig() {
     ['weatherCfgBatteryKwh', 'battery_total_kwh', parseFloat],
     ['weatherCfgSummerKwh', 'summer_max_kwh', parseFloat],
     ['weatherCfgWinterKwh', 'winter_max_kwh', parseFloat],
-    ['weatherCfgSafetyFactor', 'safety_factor', parseFloat],
     ['weatherCfgPreSunriseMin', 'pre_sunrise_window_minutes', parseInt],
     ['weatherCfgRecoverySoc', 'recovery_soc_threshold_pct', parseInt],
     ['weatherCfgRecoveryHours', 'recovery_min_hours_before_sunset', parseFloat],
+    ['weatherCfgEg4Mult', 'eg4_predict_multiplier', parseFloat],
   ];
   for (const [id, key, fn] of fields) {
     const el = document.getElementById(id);

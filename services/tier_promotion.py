@@ -80,7 +80,7 @@ class TierPromotion:
         last_demotion_from_90_ts: float = 0.0,
         last_demotion_from_100_ts: float = 0.0,
         last_seen_soc: Optional[float] = None,
-        now_monotonic=time.monotonic,
+        now_fn=time.time,
     ):
         if tier not in (None, 90, 100):
             raise ValueError(f"tier must be None, 90, or 100; got {tier!r}")
@@ -90,7 +90,7 @@ class TierPromotion:
         self.last_seen_soc: Optional[float] = (
             float(last_seen_soc) if last_seen_soc is not None else None
         )
-        self._now = now_monotonic
+        self._now = now_fn
 
     # ------------------------------------------------------------------
     # Public API

@@ -11,9 +11,19 @@ tags:
   EG4_SESSION: false
   NETWORK_SCAN: false
   POWER_COMMAND: false
+  # User-commanded master switch state changes (Power toggle clicks).
+  # Enabled while the user-power-intent feature is being verified in
+  # production; flip to false once the rollout is stable.
+  POWER_INTENT: true
   # Weather-gate feature — keep enabled while the feature is new so the
   # operator can observe the first few pre-sunrise evaluations.
   WEATHER: true
   WEATHER_GATE: true
   # Tier promotion — log only on state transitions (one-shot per change).
   TIER_PROMO: true
+  # EG4 PV-predict fetch (eg4_client.refresh_pv_predict_blocking and the
+  # underlying /WManage/api/weather/forecast call). Keep enabled while the
+  # feature is new so the operator can verify each daily refresh.
+  EG4_PREDICT: true
+  # PVPredictionLogger — daily post-sunset row write to pv_prediction_log.csv.
+  PV_LOG: true

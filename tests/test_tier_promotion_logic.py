@@ -54,7 +54,7 @@ def _new_tp(*, clock: FakeClock, tier=None, last90=0.0, last100=0.0, last_soc=No
         last_demotion_from_90_ts=last90,
         last_demotion_from_100_ts=last100,
         last_seen_soc=last_soc,
-        now_monotonic=clock,
+        now_fn=clock,
     )
 
 

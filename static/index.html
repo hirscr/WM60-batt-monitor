@@ -175,7 +175,7 @@
         <h3>Tier promotion</h3>
         <div class="weather-grid">
           <div>Current tier:</div><div id="tierPromoTier">—</div>
-          <div>Last seen SOC:</div><div id="tierPromoLastSoc">—</div>
+          <div>SOC at start of day:</div><div id="tierPromoLastSoc">—</div>
           <div>90% cooldown:</div><div id="tierPromoCooldown90">—</div>
           <div>100% cooldown:</div><div id="tierPromoCooldown100">—</div>
         </div>
@@ -203,8 +203,6 @@
         <input type="number" id="weatherCfgWinterKwh" step="0.1" min="0.1" />
       </div>
       <div class="params-row">
-        <label for="weatherCfgSafetyFactor">Safety factor (1.0–2.0)</label>
-        <input type="number" id="weatherCfgSafetyFactor" step="0.05" min="1.0" max="2.0" />
       </div>
       <div class="params-row">
         <label for="weatherCfgPreSunriseMin">Pre-sunrise window (min)</label>
@@ -218,11 +216,41 @@
         <label for="weatherCfgRecoveryHours">Min hours before sunset for recovery</label>
         <input type="number" id="weatherCfgRecoveryHours" step="0.25" min="0" max="12" />
       </div>
+      <div class="params-row">
+        <label for="weatherCfgEg4Mult">Prediction multiplier (0.1–1.0)</label>
+        <input type="number" id="weatherCfgEg4Mult" step="0.05" min="0.1" max="1.0" />
+      </div>
       <div class="weather-save-row">
         <button class="btn-small" onclick="saveWeatherConfig()">Save</button>
         <span id="weatherSaveStatus" class="weather-save-status"></span>
       </div>
     </div>
+  </div>
+
+  <!-- Prediction Tracker (EG4 prediction vs. actual harvest, last 7 days) -->
+  <div class="card" id="predictionTrackerCard">
+    <h2>Prediction Tracker</h2>
+    <div class="prediction-today">
+      <div class="prediction-today-grid">
+        <div>Today EG4 (raw):</div><div id="predTodayRaw">—</div>
+        <div>Multiplier:</div><div id="predTodayMultiplier">—</div>
+        <div>Expected used:</div><div id="predTodayExpected">—</div>
+        <div>Decision source:</div><div id="predTodaySource">—</div>
+      </div>
+    </div>
+    <table class="prediction-table" id="predictionHistoryTable">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>EG4 (raw)</th>
+          <th>Actual</th>
+          <th>Ratio</th>
+        </tr>
+      </thead>
+      <tbody id="predictionHistoryBody">
+        <tr><td colspan="4" class="prediction-empty">No history yet.</td></tr>
+      </tbody>
+    </table>
   </div>
 
   <!-- Network Devices -->

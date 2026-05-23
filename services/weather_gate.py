@@ -41,6 +41,12 @@ OUTCOME_BATTERY_STALE = "battery_stale"  # skip, don't advance date
 OUTCOME_FORECAST_STALE = "forecast_stale"  # skip, don't advance date
 OUTCOME_GATE_DISABLED = "gate_disabled"  # master switch off
 
+# Decision-source labels recorded on the decision dict and in persisted state.
+# "eg4_predict" wins when the EG4 portal prediction is fresh; otherwise we
+# fall back to the sinusoidal seasonal model attenuated by cloud cover.
+DECISION_SOURCE_EG4 = "eg4_predict"
+DECISION_SOURCE_FALLBACK = "solar_model_fallback"
+
 
 @dataclass
 class WeatherGateConfigSnapshot:
@@ -49,10 +55,13 @@ class WeatherGateConfigSnapshot:
     battery_total_kwh: float
     summer_max_kwh: float
     winter_max_kwh: float
-    safety_factor: float
     pre_sunrise_window_minutes: int
     recovery_soc_threshold_pct: int
     recovery_min_hours_before_sunset: float
+    # Conservative multiplier applied to EG4's portal-provided PV prediction.
+    # Default 0.8 — user-tunable from the dashboard so the multiplier can be
+    # calibrated against the daily prediction-vs-actual log.
+    eg4_predict_multiplier: float = 0.8
 
 
 class WeatherGate:
@@ -69,6 +78,11 @@ class WeatherGate:
     _KEY_MAX_FOR_DAY_KWH = "weather_gate_max_for_day_kwh"
     _KEY_EVALUATED_DATE = "weather_gate_evaluated_date"  # ISO string or None
     _KEY_EVALUATED_AT = "weather_gate_evaluated_at"  # ISO timestamp or None
+    # New decision-context keys — let the dashboard show "which source"
+    # produced the day's expected_kwh and what raw EG4 number fed it.
+    _KEY_EG4_TODAY_KWH_RAW = "weather_gate_eg4_today_kwh_raw"
+    _KEY_MULTIPLIER_APPLIED = "weather_gate_multiplier_applied"
+    _KEY_DECISION_SOURCE = "weather_gate_decision_source"
 
     def __init__(
         self,
@@ -95,6 +109,9 @@ class WeatherGate:
         self.deficit_kwh: Optional[float] = saved.get(self._KEY_DEFICIT_KWH)
         self.max_for_day_kwh: Optional[float] = saved.get(self._KEY_MAX_FOR_DAY_KWH)
         self.evaluated_at: Optional[str] = saved.get(self._KEY_EVALUATED_AT)
+        self.eg4_today_kwh_raw: Optional[float] = saved.get(self._KEY_EG4_TODAY_KWH_RAW)
+        self.multiplier_applied: Optional[float] = saved.get(self._KEY_MULTIPLIER_APPLIED)
+        self.decision_source: Optional[str] = saved.get(self._KEY_DECISION_SOURCE)
 
         evaluated_date_str = saved.get(self._KEY_EVALUATED_DATE)
         self.evaluated_date: Optional[date] = (
@@ -110,6 +127,7 @@ class WeatherGate:
         soc_pct: Optional[float],
         battery_fresh: bool,
         forecast: dict,
+        force: bool = False,
     ) -> str:
         """Run one tick of the gate. Returns one of the OUTCOME_* constants.
 
@@ -122,6 +140,8 @@ class WeatherGate:
             soc_pct: current battery SOC (0..100) or None when unknown.
             battery_fresh: True iff battery telemetry is fresh enough to trust.
             forecast: dict from WeatherService.get_today_forecast().
+            force: if True, bypass the window and disabled guards (operator
+                   re-evaluation via /api/weather/evaluate_now).
         """
         cfg = self._config_provider()
         if not cfg.enabled:
@@ -147,6 +167,8 @@ class WeatherGate:
         sunset_dt = forecast.get("sunset_dt")
         forecast_fresh = bool(forecast.get("is_fresh"))
         cloud_cover = forecast.get("cloud_cover_pct")
+        eg4_today_kwh = forecast.get("eg4_today_kwh")
+        eg4_is_fresh = bool(forecast.get("eg4_is_fresh"))
 
         # If we're already disabled, run the recovery check on every tick. It
         # cannot re-enable based on stale data, so freshness gates still apply.
@@ -171,7 +193,7 @@ class WeatherGate:
             return OUTCOME_OUTSIDE_WINDOW
 
         window_start = sunrise_dt - timedelta(minutes=cfg.pre_sunrise_window_minutes)
-        if not (window_start <= now_local <= sunrise_dt):
+        if not force and not (window_start <= now_local <= sunrise_dt):
             return OUTCOME_OUTSIDE_WINDOW
 
         # Inside the pre-sunrise window. Check freshness preconditions; if
@@ -181,17 +203,25 @@ class WeatherGate:
                 log("WEATHER_GATE", "skip eval: battery stale; will retry next tick")
             return OUTCOME_BATTERY_STALE
 
-        if not forecast_fresh or cloud_cover is None:
+        # The EG4 path requires only a fresh EG4 prediction; the solar_model
+        # fallback path requires fresh Open-Meteo cloud cover. We only need
+        # to declare "forecast stale" when BOTH sources are unavailable —
+        # otherwise the EG4 path can still produce a decision even on days
+        # when Open-Meteo is down.
+        eg4_path_ready = eg4_is_fresh and eg4_today_kwh is not None
+        fallback_path_ready = forecast_fresh and cloud_cover is not None
+        if not eg4_path_ready and not fallback_path_ready:
             if __debug__:
-                log("WEATHER_GATE", "skip eval: forecast stale; will retry next tick")
+                log("WEATHER_GATE", "skip eval: no fresh forecast source; will retry next tick")
             return OUTCOME_FORECAST_STALE
 
         # All preconditions met. Run the pure decision and commit.
         decision = self.decide_after_evaluation(
             soc_pct=soc_pct,
-            cloud_cover_pct=float(cloud_cover),
+            cloud_cover_pct=float(cloud_cover) if cloud_cover is not None else None,
             day_of_year=now_local.timetuple().tm_yday,
             cfg=cfg,
+            eg4_today_kwh=eg4_today_kwh if eg4_path_ready else None,
         )
         self._commit_evaluation(
             decision=decision,
@@ -202,6 +232,7 @@ class WeatherGate:
             log(
                 "WEATHER_GATE",
                 f"eval committed date={today_local} "
+                f"source={decision['decision_source']} "
                 f"expected_kwh={decision['expected_kwh']:.2f} "
                 f"deficit_kwh={decision['deficit_kwh']:.2f} "
                 f"ratio={decision['ratio']:.2f} "
@@ -216,9 +247,10 @@ class WeatherGate:
     @staticmethod
     def decide_after_evaluation(
         soc_pct: float,
-        cloud_cover_pct: float,
+        cloud_cover_pct: Optional[float],
         day_of_year: int,
         cfg: WeatherGateConfigSnapshot,
+        eg4_today_kwh: Optional[float] = None,
     ) -> dict:
         """Pure: given preconditions are met, decide on/off and return numbers.
 
@@ -230,26 +262,55 @@ class WeatherGate:
                 "deficit_kwh": float,
                 "max_for_day_kwh": float,
                 "ratio": float,
+                "decision_source": "eg4_predict" | "solar_model_fallback",
+                "eg4_today_kwh_raw": float | None,   # raw EG4 prediction (kWh) before multiplier
+                "multiplier_applied": float | None,  # multiplier in effect at decision time
             }
 
-        The conservative threshold is `expected_kwh >= deficit_kwh * safety_factor`.
-        Anything below that — including the boundary gap — is treated as
-        insufficient.
+        Source-selection rule:
+          - If eg4_today_kwh is not None, the decision uses
+            expected_kwh = eg4_today_kwh * cfg.eg4_predict_multiplier
+            and the source is "eg4_predict". Zero is a valid EG4 prediction
+            (pessimistic overcast day) and propagates to expected_kwh = 0.0.
+          - Otherwise, expected_kwh comes from the seasonal solar_model
+            attenuated by cloud_cover_pct, and the source is
+            "solar_model_fallback". This branch requires cloud_cover_pct to
+            be non-None; callers must not invoke it without one.
+
+        The threshold is `expected_kwh >= deficit_kwh`. The EG4 predict
+        multiplier already embeds the desired conservatism.
         """
         max_for_day = max_daily_energy_kwh(
             day_of_year, cfg.summer_max_kwh, cfg.winter_max_kwh
         )
-        expected = expected_energy_kwh(max_for_day, cloud_cover_pct)
+
+        if eg4_today_kwh is not None:
+            # EG4 path: raw prediction * conservative multiplier.
+            multiplier = float(cfg.eg4_predict_multiplier)
+            expected = float(eg4_today_kwh) * multiplier
+            decision_source = DECISION_SOURCE_EG4
+            eg4_today_kwh_raw = float(eg4_today_kwh)
+            multiplier_applied: Optional[float] = multiplier
+        else:
+            # Fallback path: solar_model attenuated by cloud cover.
+            if cloud_cover_pct is None:
+                raise ValueError(
+                    "decide_after_evaluation: cloud_cover_pct is required "
+                    "when eg4_today_kwh is not provided"
+                )
+            expected = expected_energy_kwh(max_for_day, cloud_cover_pct)
+            decision_source = DECISION_SOURCE_FALLBACK
+            eg4_today_kwh_raw = None
+            multiplier_applied = None
+
         deficit = (100.0 - max(0.0, min(100.0, soc_pct))) / 100.0 * cfg.battery_total_kwh
-        # ratio = expected / (deficit * safety_factor); guard div-by-zero
-        threshold = deficit * cfg.safety_factor
-        if threshold <= 0:
-            # Battery is already full (or oversized SOC). Treat as sufficient.
+        # guard div-by-zero; battery already full → always enable
+        if deficit <= 0:
             ratio = float("inf")
             outcome = OUTCOME_KEPT_ENABLED
         else:
-            ratio = expected / threshold
-            outcome = OUTCOME_KEPT_ENABLED if expected >= threshold else OUTCOME_DISABLED_FOR_DAY
+            ratio = expected / deficit
+            outcome = OUTCOME_KEPT_ENABLED if expected >= deficit else OUTCOME_DISABLED_FOR_DAY
 
         return {
             "outcome": outcome,
@@ -257,6 +318,9 @@ class WeatherGate:
             "deficit_kwh": deficit,
             "max_for_day_kwh": max_for_day,
             "ratio": ratio,
+            "decision_source": decision_source,
+            "eg4_today_kwh_raw": eg4_today_kwh_raw,
+            "multiplier_applied": multiplier_applied,
         }
 
     # ------------------------------------------------------------------
@@ -272,6 +336,9 @@ class WeatherGate:
             "max_for_day_kwh": self.max_for_day_kwh,
             "evaluated_at": self.evaluated_at,
             "evaluated_date": self.evaluated_date.isoformat() if self.evaluated_date else None,
+            "eg4_today_kwh_raw": self.eg4_today_kwh_raw,
+            "multiplier_applied": self.multiplier_applied,
+            "decision_source": self.decision_source,
         }
 
     # ------------------------------------------------------------------
@@ -327,6 +394,12 @@ class WeatherGate:
         self.max_for_day_kwh = float(decision["max_for_day_kwh"])
         self.evaluated_date = evaluated_date
         self.evaluated_at = evaluated_at
+        # Decision context — used by the dashboard and the prediction logger.
+        eg4_raw = decision.get("eg4_today_kwh_raw")
+        self.eg4_today_kwh_raw = float(eg4_raw) if eg4_raw is not None else None
+        mult = decision.get("multiplier_applied")
+        self.multiplier_applied = float(mult) if mult is not None else None
+        self.decision_source = decision.get("decision_source")
 
         self._persist_all()
 
@@ -347,5 +420,8 @@ class WeatherGate:
                 self._KEY_EVALUATED_DATE: (
                     self.evaluated_date.isoformat() if self.evaluated_date else None
                 ),
+                self._KEY_EG4_TODAY_KWH_RAW: self.eg4_today_kwh_raw,
+                self._KEY_MULTIPLIER_APPLIED: self.multiplier_applied,
+                self._KEY_DECISION_SOURCE: self.decision_source,
             }
         )

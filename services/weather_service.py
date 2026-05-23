@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from utils.log_config import log
@@ -50,6 +50,8 @@ class WeatherService:
         timezone_str: str,
         refresh_seconds: int = 3600,
         freshness_seconds: int = 7200,
+        get_eg4_client: Optional[Callable] = None,
+        eg4_freshness_seconds: Optional[int] = None,
     ):
         if refresh_seconds <= 0:
             raise ValueError("refresh_seconds must be positive")
@@ -72,6 +74,27 @@ class WeatherService:
         #         "hourly_times": list[datetime], "hourly_cloud_cover": list[float]}
         self._snapshot: Optional[dict] = None
         self._last_error: Optional[str] = None
+
+        # EG4 PV-predict cache. Separate from the Open-Meteo snapshot so a
+        # failure on either side doesn't poison the other. The callback
+        # pattern (rather than holding a direct EG4Client reference) is
+        # essential: BatteryService.refresh_session() replaces the EG4Client
+        # instance when the session is recovered, and a captured reference
+        # would silently go stale.
+        self._get_eg4_client = get_eg4_client
+        self._eg4_freshness_seconds = int(eg4_freshness_seconds or freshness_seconds)
+        self._eg4_lock = threading.Lock()
+        self._eg4_refresh_lock = threading.Lock()  # serializes refresh attempts
+        # Shape mirrors EG4Client.get_latest_pv_predict() plus a `for_date_obj`
+        # parsed once at refresh time so the freshness check doesn't reparse.
+        self._eg4_snapshot: dict = {
+            "today_kwh": None,
+            "tomorrow_kwh": None,
+            "for_date": None,
+            "tomorrow_date": None,
+            "fetched_at": None,
+            "last_error": None,
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -126,6 +149,8 @@ class WeatherService:
             snap = dict(self._snapshot) if self._snapshot else None
             err = self._last_error
 
+        eg4 = self._eg4_view()
+
         if snap is None:
             return {
                 "cloud_cover_pct": None,
@@ -137,6 +162,7 @@ class WeatherService:
                 "age_seconds": None,
                 "is_fresh": False,
                 "last_error": err,
+                **eg4,
             }
 
         age = self._age_seconds_from(snap.get("fetched_at"))
@@ -155,6 +181,30 @@ class WeatherService:
             "age_seconds": age,
             "is_fresh": age is not None and age <= self._freshness_seconds,
             "last_error": err,
+            **eg4,
+        }
+
+    def _eg4_view(self) -> dict:
+        """Project the EG4 prediction cache into the get_today_forecast shape.
+
+        Returns a dict with these keys (always present):
+          eg4_today_kwh, eg4_tomorrow_kwh, eg4_fetched_at, eg4_is_fresh,
+          eg4_last_error, eg4_for_date, eg4_tomorrow_date.
+        """
+        with self._eg4_lock:
+            snap = dict(self._eg4_snapshot)
+        age = self._age_seconds_from(snap.get("fetched_at"))
+        return {
+            "eg4_today_kwh": snap.get("today_kwh"),
+            "eg4_tomorrow_kwh": snap.get("tomorrow_kwh"),
+            "eg4_fetched_at": snap.get("fetched_at"),
+            "eg4_is_fresh": (
+                age is not None and age <= self._eg4_freshness_seconds
+                and snap.get("today_kwh") is not None
+            ),
+            "eg4_last_error": snap.get("last_error"),
+            "eg4_for_date": snap.get("for_date"),
+            "eg4_tomorrow_date": snap.get("tomorrow_date"),
         }
 
     def is_fresh(self) -> bool:
@@ -172,6 +222,7 @@ class WeatherService:
             log("WEATHER", "poll loop started")
         # Refresh immediately so the cache is warm before the first autocontrol tick.
         self._do_refresh()
+        self._maybe_refresh_eg4_prediction()
         while self._running:
             for _ in range(self._refresh_seconds):
                 if not self._running:
@@ -180,8 +231,112 @@ class WeatherService:
             if not self._running:
                 break
             self._do_refresh()
+            self._maybe_refresh_eg4_prediction()
         if __debug__:
             log("WEATHER", "poll loop exiting")
+
+    def _maybe_refresh_eg4_prediction(self) -> None:
+        """Refresh the EG4 cache on each poll pass when stale.
+
+        "Stale" means: no successful fetch yet, OR the cache's fetched_at is
+        older than _eg4_freshness_seconds. Once-per-pass is enough because
+        the poll loop already runs at the Open-Meteo cadence (default 1h)
+        which is well below the freshness window (default 2h).
+        """
+        if self._get_eg4_client is None:
+            return
+        view = self._eg4_view()
+        if view.get("eg4_is_fresh"):
+            return
+        try:
+            self.refresh_eg4_prediction()
+        except Exception as exc:
+            # Defensive: refresh_eg4_prediction() already swallows errors, but
+            # keep the poll loop alive even if something unexpected escapes.
+            print(f"[WeatherService] EG4 refresh raised: {exc}")
+            if __debug__:
+                log("WEATHER", f"eg4 refresh exception: {exc}")
+
+    def refresh_eg4_prediction(self, force: bool = False) -> dict:
+        """Synchronously refresh the EG4 PV-predict cache and return the view.
+
+        This is the ONLY public path that performs the EG4 network call.
+        Safe to call from any thread; serializes via _eg4_refresh_lock so
+        concurrent callers don't pile up on the EG4 portal.
+
+        Args:
+            force: When True, refresh even if the cache is currently fresh.
+                Used by /api/weather/evaluate_now so the operator can re-run
+                the gate against the latest EG4 reading on demand.
+
+        Returns the same dict shape as _eg4_view().
+        """
+        if self._get_eg4_client is None:
+            if __debug__:
+                log("WEATHER", "eg4 refresh skipped: no client callback wired")
+            return self._eg4_view()
+
+        if not force:
+            view = self._eg4_view()
+            if view.get("eg4_is_fresh"):
+                return view
+
+        # Serialize concurrent refreshes. Using a lock here (not just on the
+        # snapshot) so the network round-trip doesn't fan out — the EG4
+        # portal has rate-limits we don't want to test.
+        acquired = self._eg4_refresh_lock.acquire(blocking=False)
+        if not acquired:
+            if __debug__:
+                log("WEATHER", "eg4 refresh skipped: another refresh in flight")
+            return self._eg4_view()
+
+        try:
+            client = self._get_eg4_client()
+            if client is None:
+                self._update_eg4_snapshot(last_error="eg4_client_unavailable")
+                return self._eg4_view()
+            try:
+                fresh = client.refresh_pv_predict_blocking()
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"[:200]
+                self._update_eg4_snapshot(last_error=err)
+                if __debug__:
+                    log("WEATHER", f"eg4 refresh failed: {err}")
+                return self._eg4_view()
+
+            # client.refresh_pv_predict_blocking returns a dict snapshot with
+            # the same keys we cache. Copy them through; fetched_at may be
+            # None on failure — in that case keep our last good fetched_at
+            # so freshness math doesn't suddenly flip just because the most
+            # recent refresh hit an error.
+            update = {
+                "today_kwh": fresh.get("today_kwh"),
+                "tomorrow_kwh": fresh.get("tomorrow_kwh"),
+                "for_date": fresh.get("for_date"),
+                "tomorrow_date": fresh.get("tomorrow_date"),
+                "last_error": fresh.get("last_error"),
+            }
+            if fresh.get("fetched_at") is not None:
+                update["fetched_at"] = fresh["fetched_at"]
+            self._update_eg4_snapshot(**update)
+            if __debug__:
+                log(
+                    "WEATHER",
+                    f"eg4 refresh ok today_kwh={update['today_kwh']} "
+                    f"tomorrow_kwh={update['tomorrow_kwh']} "
+                    f"for_date={update['for_date']} "
+                    f"last_error={update.get('last_error')}",
+                )
+            return self._eg4_view()
+        finally:
+            self._eg4_refresh_lock.release()
+
+    def _update_eg4_snapshot(self, **fields) -> None:
+        """Atomic replacement of the EG4 snapshot under _eg4_lock."""
+        with self._eg4_lock:
+            merged = dict(self._eg4_snapshot)
+            merged.update(fields)
+            self._eg4_snapshot = merged
 
     def _do_refresh(self) -> None:
         try:

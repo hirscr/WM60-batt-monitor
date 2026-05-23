@@ -13,6 +13,7 @@ from typing import Dict, Any, Optional
 from pyasic.rpc.btminer import BTMinerRPCAPI
 from models.device import ConnectionStatus
 from utils.nc_miner_api import NCMinerAPI
+from utils.log_config import log as debug_log
 
 
 class MinerController:
@@ -280,7 +281,7 @@ class MinerController:
 class MinerService:
     """Service for miner polling and control."""
 
-    def __init__(self, host: str, password: str, poll_seconds: int, log_interval_sec: int, log_file: str = None):
+    def __init__(self, host: str, password: str, poll_seconds: int, log_interval_sec: int, log_file: str = None, state_manager=None):
         # Always use NCMinerAPI for both polling and privileged commands.
         # NCMinerAPI uses nc (subprocess) which closes the TCP connection immediately
         # after each command, avoiding the miner's "over max connect" limit.
@@ -307,6 +308,24 @@ class MinerService:
 
         # is_off: True until confirmed hashing. Starts conservative (safe default).
         self._is_off: bool = True
+
+        # User-commanded master switch state. Loaded from persisted state at init
+        # so the dashboard toggle reflects the user's last explicit choice across
+        # restarts. Only the user-facing HTTP endpoints (power_on / power_off)
+        # write to this — service-side code (AutoControl, MinerController) MUST
+        # NOT touch it. See docstring for set_user_power_intent.
+        self._state_mgr = state_manager
+        if state_manager is not None:
+            try:
+                persisted = state_manager.load()
+                intent = persisted.get("user_power_intent")
+                self._user_power_intent: bool = True if intent is None else bool(intent)
+            except Exception as e:
+                print(f"[MinerService] Could not load user_power_intent from state ({e}); defaulting to True")
+                self._user_power_intent = True
+        else:
+            # No state manager (e.g. test instantiation) — default to True.
+            self._user_power_intent = True
 
         # Connection status tracking
         self.connection_status = ConnectionStatus(connected=False)
@@ -488,8 +507,15 @@ class MinerService:
             time.sleep(self.poll_seconds)
 
     def get_status(self) -> dict:
-        """Get current miner status."""
-        return self.latest.copy() if self.latest else {}
+        """Get current miner status.
+
+        Includes `user_power_intent`, the persisted user-commanded master switch
+        state. The dashboard's Power toggle is driven by this field (NOT `is_off`,
+        which is observed miner state and flips during transient safety stops).
+        """
+        snapshot = self.latest.copy() if self.latest else {}
+        snapshot["user_power_intent"] = self._user_power_intent
+        return snapshot
 
     def get_history(self) -> list:
         """Get history."""
@@ -543,6 +569,39 @@ class MinerService:
     def is_off(self) -> bool:
         """True if miner is confirmed off (conservative: defaults to True until first poll)."""
         return self._is_off
+
+    @property
+    def user_power_intent(self) -> bool:
+        """User-commanded master switch state.
+
+        True means the user wants the miner available (default).
+        False means the user has explicitly clicked Power-OFF.
+
+        This is USER INTENT, not observed miner state. The two can diverge:
+        if AutoControl issues a safety-driven shutdown, the miner physically
+        powers down (is_off becomes True) but user_power_intent stays True
+        because the user did not click anything. The dashboard's Power toggle
+        is driven by this field.
+        """
+        return self._user_power_intent
+
+    def set_user_power_intent(self, value: bool) -> None:
+        """Set the user-commanded master switch state and persist it.
+
+        ONLY HTTP endpoints triggered by user clicks should call this. Service-
+        side code (AutoControl, MinerController, verification loops) MUST NOT
+        call this — they manipulate miner power via power_on()/power_off() which
+        do not touch intent.
+        """
+        new_value = bool(value)
+        self._user_power_intent = new_value
+        if __debug__:
+            debug_log("POWER_INTENT", f"user_power_intent set to {new_value}")
+        if self._state_mgr is not None:
+            try:
+                self._state_mgr.save(user_power_intent=new_value)
+            except Exception as e:
+                print(f"[MinerService] Failed to persist user_power_intent: {e}")
 
     # Helper methods
     def _now_iso(self):

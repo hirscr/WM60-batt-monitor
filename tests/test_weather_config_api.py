@@ -33,10 +33,10 @@ def _settings_with_defaults():
         battery_total_kwh=75.0,
         summer_max_kwh=75.0,
         winter_max_kwh=30.0,
-        safety_factor=1.1,
         pre_sunrise_window_minutes=30,
         recovery_soc_threshold_pct=90,
         recovery_min_hours_before_sunset=3.0,
+        eg4_predict_multiplier=0.8,
         forecast_refresh_seconds=3600,
         forecast_freshness_seconds=7200,
     )
@@ -74,20 +74,18 @@ def test_valid_partial_update_applies_and_persists(client):
 
     resp = test_client.post(
         "/api/weather/config",
-        json={"battery_total_kwh": 100.0, "safety_factor": 1.25},
+        json={"battery_total_kwh": 100.0, "eg4_predict_multiplier": 0.9},
     )
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["ok"] is True
-    # In-memory settings updated
     assert settings.weather_gate.battery_total_kwh == 100.0
-    assert settings.weather_gate.safety_factor == 1.25
-    # File written
+    assert settings.weather_gate.eg4_predict_multiplier == 0.9
     assert local_yaml.exists()
     with local_yaml.open() as f:
         data = yaml.safe_load(f)
     assert data["weather_gate"]["battery_total_kwh"] == 100.0
-    assert data["weather_gate"]["safety_factor"] == 1.25
+    assert data["weather_gate"]["eg4_predict_multiplier"] == 0.9
 
 
 def test_bool_master_switch_round_trips(client):
@@ -144,18 +142,18 @@ def test_rejects_negative_battery_kwh(client):
     assert resp.status_code == 400
 
 
-def test_rejects_safety_factor_above_range(client):
+def test_rejects_multiplier_above_range(client):
     test_client, _, _ = client
     resp = test_client.post(
-        "/api/weather/config", json={"safety_factor": 3.0}
+        "/api/weather/config", json={"eg4_predict_multiplier": 1.5}
     )
     assert resp.status_code == 400
 
 
-def test_rejects_safety_factor_below_range(client):
+def test_rejects_multiplier_below_range(client):
     test_client, _, _ = client
     resp = test_client.post(
-        "/api/weather/config", json={"safety_factor": 0.5}
+        "/api/weather/config", json={"eg4_predict_multiplier": 0.0}
     )
     assert resp.status_code == 400
 
@@ -212,14 +210,14 @@ def test_persist_merges_with_existing_local_yaml(tmp_path, monkeypatch, client):
     }))
 
     resp = test_client.post(
-        "/api/weather/config", json={"safety_factor": 1.3}
+        "/api/weather/config", json={"eg4_predict_multiplier": 0.7}
     )
     assert resp.status_code == 200
 
     with local_yaml.open() as f:
         data = yaml.safe_load(f)
     assert data["miner"]["host"] == "10.0.0.5"  # untouched
-    assert data["weather_gate"]["safety_factor"] == 1.3
+    assert data["weather_gate"]["eg4_predict_multiplier"] == 0.7
     assert data["weather_gate"]["battery_total_kwh"] == 50.0  # preserved
 
 
@@ -249,6 +247,80 @@ def test_evaluate_now_delegates_to_service(client):
     assert resp.get_json() == {"outcome": "kept_enabled"}
 
 
+def test_prediction_history_returns_503_without_logger(client):
+    """The blueprint defaults to no pv_prediction_logger — endpoint must
+    fail loudly with 503 in that case rather than crash with a 500."""
+    test_client, _, _ = client
+    resp = test_client.get("/api/weather/prediction_history?days=7")
+    assert resp.status_code == 503
+    body = resp.get_json()
+    assert "error" in body
+
+
+def test_prediction_history_with_logger_returns_rows(tmp_path, monkeypatch):
+    """When wired, the endpoint returns the logger's read_recent_rows output."""
+    from unittest.mock import MagicMock
+    from flask import Flask
+    from api import weather as weather_api
+
+    settings = _settings_with_defaults()
+    weather_service = MagicMock()
+    weather_service.get_today_forecast.return_value = {}
+    autocontrol_service = MagicMock()
+    autocontrol_service.weather_gate.get_state.return_value = {"disabled": False}
+    pv_logger = MagicMock()
+    pv_logger.read_recent_rows.return_value = [
+        {"date": "2026-05-22", "actual_kwh": "40.0", "eg4_today_kwh_raw": "50.0",
+         "ratio_actual_to_eg4_raw": "0.8", "decision_source": "eg4_predict"},
+    ]
+
+    app = Flask(__name__)
+    app.register_blueprint(
+        weather_api.create_blueprint(
+            weather_service, autocontrol_service, settings,
+            pv_prediction_logger=pv_logger,
+        )
+    )
+    test_client = app.test_client()
+    resp = test_client.get("/api/weather/prediction_history?days=7")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["days"] == 7
+    assert len(body["rows"]) == 1
+    pv_logger.read_recent_rows.assert_called_once_with(7)
+
+
+def test_prediction_history_clamps_days(tmp_path):
+    """days outside [1, 365] is clamped, not rejected."""
+    from unittest.mock import MagicMock
+    from flask import Flask
+    from api import weather as weather_api
+
+    settings = _settings_with_defaults()
+    weather_service = MagicMock()
+    autocontrol_service = MagicMock()
+    pv_logger = MagicMock()
+    pv_logger.read_recent_rows.return_value = []
+
+    app = Flask(__name__)
+    app.register_blueprint(
+        weather_api.create_blueprint(
+            weather_service, autocontrol_service, settings,
+            pv_prediction_logger=pv_logger,
+        )
+    )
+    tc = app.test_client()
+    # Out of range high
+    tc.get("/api/weather/prediction_history?days=9999")
+    pv_logger.read_recent_rows.assert_called_with(365)
+    # Out of range low
+    tc.get("/api/weather/prediction_history?days=0")
+    pv_logger.read_recent_rows.assert_called_with(1)
+    # Bad input -> default 14
+    tc.get("/api/weather/prediction_history?days=garbage")
+    pv_logger.read_recent_rows.assert_called_with(14)
+
+
 # ----------------------------------------------------------------------
 # Smoke test: AutoControlService.get_state() includes tier_promotion block.
 #
@@ -276,6 +348,7 @@ def test_autocontrol_state_includes_tier_promotion(tmp_path, monkeypatch):
     battery = MagicMock()
     battery.is_fresh.return_value = True
     battery.get_battery_age_seconds.return_value = 5.0
+    battery.get_status.return_value = {"soc_percent": None}
 
     weather_service = MagicMock()
     weather_service.get_today_forecast.return_value = {

@@ -31,6 +31,7 @@ from services.network_scanner import NetworkScanner
 from services.braiins_service import BraiinsService
 from services.weather_service import WeatherService
 from services.weather_gate import WeatherGate, WeatherGateConfigSnapshot
+from services.pv_prediction_logger import PVPredictionLogger
 from api.weather import create_blueprint as create_weather_blueprint
 
 # ========== LOG BUFFER ==========
@@ -132,7 +133,8 @@ miner_service = MinerService(
     host=settings.miner.host,
     password=settings.miner.password,
     poll_seconds=settings.miner.poll_seconds,
-    log_interval_sec=settings.data.log_interval_sec
+    log_interval_sec=settings.data.log_interval_sec,
+    state_manager=state_mgr,
 )
 
 # Battery service
@@ -148,12 +150,18 @@ battery_service = BatteryService(
 # Weather service — Open-Meteo forecast cache, refreshed hourly. Polls the
 # free keyless endpoint with the autocontrol location coordinates so the
 # weather gate can decide whether the day's expected solar harvest is enough.
+#
+# get_eg4_client is a callback rather than a direct EG4Client instance because
+# BatteryService.refresh_session() replaces the underlying EG4Client when the
+# session is rebuilt; capturing a reference here would silently go stale.
 weather_service = WeatherService(
     latitude=settings.autocontrol.location.latitude,
     longitude=settings.autocontrol.location.longitude,
     timezone_str=settings.autocontrol.location.timezone,
     refresh_seconds=settings.weather_gate.forecast_refresh_seconds,
     freshness_seconds=settings.weather_gate.forecast_freshness_seconds,
+    get_eg4_client=lambda: battery_service.client,
+    eg4_freshness_seconds=settings.weather_gate.forecast_freshness_seconds,
 )
 
 
@@ -169,10 +177,10 @@ def _weather_gate_config_snapshot() -> WeatherGateConfigSnapshot:
         battery_total_kwh=wg.battery_total_kwh,
         summer_max_kwh=wg.summer_max_kwh,
         winter_max_kwh=wg.winter_max_kwh,
-        safety_factor=wg.safety_factor,
         pre_sunrise_window_minutes=wg.pre_sunrise_window_minutes,
         recovery_soc_threshold_pct=wg.recovery_soc_threshold_pct,
         recovery_min_hours_before_sunset=wg.recovery_min_hours_before_sunset,
+        eg4_predict_multiplier=wg.eg4_predict_multiplier,
     )
 
 
@@ -180,6 +188,17 @@ weather_gate = WeatherGate(
     state_manager=state_mgr,
     timezone_str=settings.autocontrol.location.timezone,
     config_provider=_weather_gate_config_snapshot,
+)
+
+# PV prediction logger — appends one row per day to pv_prediction_log.csv
+# about 30 minutes after sunset, comparing EG4's raw forecast against the
+# day's actual harvest. State (last logged date) is persisted in wm_state.json.
+pv_prediction_logger = PVPredictionLogger(
+    state_manager=state_mgr,
+    weather_service=weather_service,
+    battery_log_path=os.path.abspath(os.path.join("miner_logs", "eg4_battery_log.csv")),
+    prediction_log_path=os.path.abspath(os.path.join("miner_logs", "pv_prediction_log.csv")),
+    timezone_str=settings.autocontrol.location.timezone,
 )
 
 # Auto-control service
@@ -206,9 +225,14 @@ autocontrol_service = AutoControlService(
     sunset_minute=settings.autocontrol.sunset_minute
 )
 
-# Register the weather blueprint now that its three collaborators exist.
+# Register the weather blueprint now that its collaborators exist.
 app.register_blueprint(
-    create_weather_blueprint(weather_service, autocontrol_service, settings)
+    create_weather_blueprint(
+        weather_service,
+        autocontrol_service,
+        settings,
+        pv_prediction_logger=pv_prediction_logger,
+    )
 )
 
 # Network scanner
@@ -361,7 +385,14 @@ def set_miner_power_pct():
 
 @app.post("/api/miner/power_on")
 def miner_power_on():
-    """Turn miner on."""
+    """User clicked the Power toggle ON.
+
+    Sets `user_power_intent = True` (persisted) and commands the miner on.
+    AutoControl state is intentionally NOT touched here — the user is just
+    saying "the master switch is on"; they can separately decide whether to
+    re-enable AutoControl.
+    """
+    miner_service.set_user_power_intent(True)
     def _on_verified():
         state_mgr.save(miner_power_state="running")
     miner_service.power_on(on_verified=_on_verified)
@@ -369,7 +400,15 @@ def miner_power_on():
 
 @app.post("/api/miner/power_off")
 def miner_power_off():
-    """Turn miner off."""
+    """User clicked the Power toggle OFF.
+
+    Sets `user_power_intent = False` (persisted). If AutoControl is currently
+    enabled, disables it first so a tick can't immediately re-power the miner.
+    Then commands the miner off.
+    """
+    miner_service.set_user_power_intent(False)
+    if autocontrol_service.enabled:
+        autocontrol_service.disable()
     def _on_verified():
         state_mgr.save(miner_power_state="stopped")
     miner_service.power_off(on_verified=_on_verified)
@@ -657,7 +696,19 @@ def autocontrol_status():
 
 @app.post("/api/autocontrol/enable")
 def autocontrol_enable():
-    """Enable auto-control."""
+    """Enable auto-control.
+
+    Refuses (HTTP 400) when the user has set Power to OFF — AutoControl cannot
+    run while the master switch is off. The UI also visually disables the
+    AutoControl checkbox in this case; this is the defense-in-depth backend
+    rejection.
+    """
+    if not miner_service.user_power_intent:
+        return jsonify({
+            "ok": False,
+            "error": "power_off",
+            "message": "Cannot enable Auto Control while Power is off."
+        }), 400
     autocontrol_service.enable()
     return jsonify({"ok": True, "enabled": True})
 
@@ -834,6 +885,7 @@ if __name__ == "__main__":
     battery_service.start()
     weather_service.start()
     autocontrol_service.start()
+    pv_prediction_logger.start()
     network_scanner.start_background_scan()
     if _braiins_enabled:
         print("[APP] Starting Braiins Pool service...")

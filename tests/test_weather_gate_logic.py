@@ -54,7 +54,6 @@ def _cfg(**overrides) -> WeatherGateConfigSnapshot:
         battery_total_kwh=75.0,
         summer_max_kwh=75.0,
         winter_max_kwh=30.0,
-        safety_factor=1.1,
         pre_sunrise_window_minutes=30,
         recovery_soc_threshold_pct=90,
         recovery_min_hours_before_sunset=3.0,
@@ -92,38 +91,20 @@ def _forecast(
 
 
 def test_pure_decision_sufficient_solar_keeps_enabled():
-    # Summer day, low cloud, low deficit -> expected >> deficit * factor
-    cfg = _cfg(safety_factor=1.1)
+    cfg = _cfg()
     res = WeatherGate.decide_after_evaluation(
         soc_pct=70.0, cloud_cover_pct=10.0, day_of_year=SUMMER_DAY_OF_YEAR, cfg=cfg
     )
     assert res["outcome"] == OUTCOME_KEPT_ENABLED
-    assert res["expected_kwh"] > res["deficit_kwh"] * cfg.safety_factor
+    assert res["expected_kwh"] >= res["deficit_kwh"]
 
 
 def test_pure_decision_strictly_insufficient_disables():
-    # Heavy cloud + low SOC -> expected far below deficit
-    cfg = _cfg(safety_factor=1.1)
+    cfg = _cfg()
     res = WeatherGate.decide_after_evaluation(
         soc_pct=30.0, cloud_cover_pct=95.0, day_of_year=SUMMER_DAY_OF_YEAR, cfg=cfg
     )
     assert res["outcome"] == OUTCOME_DISABLED_FOR_DAY
-
-
-def test_pure_decision_gap_zone_disables_conservatively():
-    # Tune inputs so expected is between deficit and deficit*safety_factor.
-    # SOC=50, total=75 -> deficit=37.5 kWh. summer/winter both 75 -> max=75.
-    # Pick cloud_cover so expected lands just above deficit but below threshold.
-    # expected = 75 * (1 - c/100); threshold = 37.5 * 1.5 = 56.25.
-    # Want 37.5 < expected < 56.25 -> 18.75 < (1-c/100)*75 < 56.25.
-    # Take c=40 -> expected=45, threshold=56.25 -> in gap zone.
-    cfg = _cfg(safety_factor=1.5)
-    res = WeatherGate.decide_after_evaluation(
-        soc_pct=50.0, cloud_cover_pct=40.0, day_of_year=SUMMER_DAY_OF_YEAR, cfg=cfg
-    )
-    assert res["outcome"] == OUTCOME_DISABLED_FOR_DAY
-    assert res["expected_kwh"] > res["deficit_kwh"]  # would be enough WITHOUT safety
-    assert res["expected_kwh"] < res["deficit_kwh"] * cfg.safety_factor
 
 
 def test_pure_decision_full_battery_treats_as_sufficient():

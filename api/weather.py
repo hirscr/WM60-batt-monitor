@@ -31,10 +31,10 @@ EDITABLE_KEYS: dict = {
     "battery_total_kwh":                (float, lambda v: None if v > 0 else "must be > 0"),
     "summer_max_kwh":                   (float, lambda v: None if v > 0 else "must be > 0"),
     "winter_max_kwh":                   (float, lambda v: None if v > 0 else "must be > 0"),
-    "safety_factor":                    (float, lambda v: None if 1.0 <= v <= 2.0 else "must be in [1.0, 2.0]"),
     "pre_sunrise_window_minutes":       (int,   lambda v: None if 0 <= v <= 240 else "must be in [0, 240]"),
     "recovery_soc_threshold_pct":       (int,   lambda v: None if 0 <= v <= 100 else "must be in [0, 100]"),
     "recovery_min_hours_before_sunset": (float, lambda v: None if 0.0 <= v <= 12.0 else "must be in [0.0, 12.0]"),
+    "eg4_predict_multiplier":           (float, lambda v: None if 0.1 <= v <= 1.0 else "must be in [0.1, 1.0]"),
 }
 
 # Keys present in the dataclass but explicitly forbidden via the UI.
@@ -43,8 +43,17 @@ FORBIDDEN_KEYS = {"forecast_refresh_seconds", "forecast_freshness_seconds"}
 LOCAL_CONFIG_FILENAME = "config.local.yaml"
 
 
-def create_blueprint(weather_service, autocontrol_service, settings) -> Blueprint:
-    """Build the /api/weather/* blueprint bound to the given collaborators."""
+def create_blueprint(weather_service, autocontrol_service, settings, pv_prediction_logger=None) -> Blueprint:
+    """Build the /api/weather/* blueprint bound to the given collaborators.
+
+    Args:
+        weather_service: WeatherService instance (forecast cache).
+        autocontrol_service: AutoControlService (owns the gate).
+        settings: project Settings — used to read config defaults and persist edits.
+        pv_prediction_logger: Optional PVPredictionLogger. When wired,
+            GET /api/weather/prediction_history is registered; otherwise the
+            endpoint responds with 503.
+    """
     bp = Blueprint("weather", __name__)
 
     @bp.get("/api/weather/status")
@@ -117,6 +126,10 @@ def create_blueprint(weather_service, autocontrol_service, settings) -> Blueprin
         for key, value in coerced.items():
             setattr(settings.weather_gate, key, value)
 
+        # Re-evaluate the gate so expected_kwh reflects the new config
+        # immediately — the caller shouldn't need a separate evaluate_now.
+        autocontrol_service.force_evaluate_weather_gate()
+
         wg = settings.weather_gate
         return jsonify({
             "ok": True,
@@ -127,6 +140,23 @@ def create_blueprint(weather_service, autocontrol_service, settings) -> Blueprin
     def evaluate_now():
         result = autocontrol_service.force_evaluate_weather_gate()
         return jsonify(result)
+
+    @bp.get("/api/weather/prediction_history")
+    def prediction_history():
+        """Return the most recent N rows of pv_prediction_log.csv.
+
+        Query string: days=N (default 14, clamped to [1, 365]).
+        Rows are returned reverse-chronological (most recent first).
+        """
+        if pv_prediction_logger is None:
+            return jsonify({"error": "pv_prediction_logger_not_configured"}), 503
+        try:
+            days = int(request.args.get("days", 14))
+        except (TypeError, ValueError):
+            days = 14
+        days = max(1, min(365, days))
+        rows = pv_prediction_logger.read_recent_rows(days)
+        return jsonify({"days": days, "rows": rows})
 
     return bp
 
@@ -158,6 +188,14 @@ def _serialize_forecast(forecast: dict) -> dict:
         "age_seconds": forecast.get("age_seconds"),
         "is_fresh": forecast.get("is_fresh", False),
         "last_error": forecast.get("last_error"),
+        # EG4 portal PV-predict fields. Cache-only — no network triggered.
+        "eg4_today_kwh": forecast.get("eg4_today_kwh"),
+        "eg4_tomorrow_kwh": forecast.get("eg4_tomorrow_kwh"),
+        "eg4_for_date": forecast.get("eg4_for_date"),
+        "eg4_tomorrow_date": forecast.get("eg4_tomorrow_date"),
+        "eg4_fetched_at": _iso(forecast.get("eg4_fetched_at")),
+        "eg4_is_fresh": forecast.get("eg4_is_fresh", False),
+        "eg4_last_error": forecast.get("eg4_last_error"),
     }
 
 

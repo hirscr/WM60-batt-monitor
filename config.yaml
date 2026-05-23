@@ -63,9 +63,9 @@ weather_gate:
   battery_total_kwh: 75.0             # nominal pack capacity (kWh) used for deficit calc
   summer_max_kwh: 75.0                # cloud-free harvest on/around summer solstice
   winter_max_kwh: 30.0                # cloud-free harvest on/around winter solstice
-  safety_factor: 1.1                  # expected_kwh must clear deficit * this to keep on
   pre_sunrise_window_minutes: 30      # evaluate during this window before sunrise
   recovery_soc_threshold_pct: 90      # re-enable autocontrol when SOC reaches this
   recovery_min_hours_before_sunset: 3.0  # only recover if at least this much daylight remains
+  eg4_predict_multiplier: 0.8           # multiplier on EG4 portal's daily prediction (0.1..1.0)
   forecast_refresh_seconds: 3600      # how often to poll Open-Meteo (config-only)
   forecast_freshness_seconds: 7200    # snapshot older than this is considered stale
