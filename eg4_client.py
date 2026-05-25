@@ -105,6 +105,29 @@ def _num(x):
     except (TypeError, ValueError):
         return None
 
+
+def _validate_today_yielding(raw: Any) -> Optional[float]:
+    """Validate a raw todayYielding value and convert tenths-of-kWh -> kWh.
+
+    Returns None for None/non-numeric/negative inputs. Returns a float
+    (including 0.0) for 0 or positive numeric inputs. Pure function so the
+    blocking method stays thin and the conversion is unit-testable
+    without an event loop.
+    """
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        if __debug__:
+            log("EG4_PREDICT", f"today_yielding non-numeric: {raw!r}")
+        return None
+    if value < 0:
+        if __debug__:
+            log("EG4_PREDICT", f"today_yielding negative, rejected: {value}")
+        return None
+    return value / 10.0
+
 class EG4Client:
     def __init__(self,
                  username: Optional[str] = None,
@@ -226,6 +249,75 @@ class EG4Client:
             if __debug__:
                 log("EG4_PREDICT", f"refresh failed: {err}")
         return self.get_latest_pv_predict()
+
+    def get_today_yielding_kwh_blocking(self, timeout: float = 30.0) -> Optional[float]:
+        """Synchronously fetch the inverter's cumulative todayYielding in kWh.
+
+        Schedules a single call to the library's get_inverter_energy_async()
+        on the EG4Client event loop, extracts EnergyData.todayYielding (which
+        the EG4 portal reports in tenths of kWh), validates the raw value,
+        and converts to kWh by dividing by 10.
+
+        Validation rules — these intentionally accept 0.0 as a real reading
+        because a fully cloudy day legitimately yields no PV. Only None,
+        non-numeric, or negative values are rejected:
+          - None or missing attribute -> return None
+          - non-numeric (cannot float()) -> return None
+          - negative -> return None (impossible reading)
+          - 0 or positive numeric -> return value / 10.0
+
+        Returns None on any failure (loop not running, timeout, API response
+        is APIResponse(success=False), exception, validation reject). Never
+        raises. Failures are logged via the EG4_PREDICT tag.
+
+        The caller is the PVPredictionLogger post-sunset trigger; callers
+        must check for None explicitly so that a real 0.0 is not mistaken
+        for a missing value and is not used to trigger a CSV fallback.
+        """
+        if self._loop is None or not self._loop.is_running():
+            if __debug__:
+                log("EG4_PREDICT", "today_yielding fetch skipped: loop_not_running")
+            return None
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._fetch_today_yielding_async(), self._loop
+            )
+            raw = future.result(timeout=timeout)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"[:200]
+            if __debug__:
+                log("EG4_PREDICT", f"today_yielding fetch failed: {err}")
+            return None
+
+        return _validate_today_yielding(raw)
+
+    async def _fetch_today_yielding_async(self) -> Any:
+        """Call get_inverter_energy_async() and return raw todayYielding.
+
+        Returns whatever the library hands back for the todayYielding
+        attribute (typically int/float/None). On any path that doesn't
+        produce a usable EnergyData (api not initialized, APIResponse
+        with success=False, exception), returns None. Validation and the
+        tenths-of-kWh conversion happen in the sync caller.
+        """
+        if self._api is None:
+            return None
+        try:
+            energy = await self._api.get_inverter_energy_async()
+        except Exception as exc:
+            if __debug__:
+                log("EG4_PREDICT", f"get_inverter_energy_async raised: {exc}")
+            return None
+        if energy is None:
+            return None
+        # The library returns APIResponse(success=False, ...) on failure.
+        if getattr(energy, "success", True) is False:
+            err = getattr(energy, "error_message", None)
+            if __debug__:
+                log("EG4_PREDICT", f"energy response not successful: {err}")
+            return None
+        return getattr(energy, "todayYielding", None)
 
     def get_history(self, limit: int = 120) -> list[Dict[str, Any]]:
         with self._lock:

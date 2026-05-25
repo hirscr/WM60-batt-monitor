@@ -193,12 +193,20 @@ weather_gate = WeatherGate(
 # PV prediction logger — appends one row per day to pv_prediction_log.csv
 # about 30 minutes after sunset, comparing EG4's raw forecast against the
 # day's actual harvest. State (last logged date) is persisted in wm_state.json.
+#
+# get_eg4_client is a callback (not a direct EG4Client reference) because
+# BatteryService.refresh_session() replaces the underlying EG4Client when the
+# session is rebuilt; capturing a reference here would silently go stale.
+# The logger uses the live client to fetch the inverter's authoritative
+# todayYielding as the primary source for actual_kwh, with CSV trapezoidal
+# integration as fallback when EG4 is unreachable.
 pv_prediction_logger = PVPredictionLogger(
     state_manager=state_mgr,
     weather_service=weather_service,
     battery_log_path=os.path.abspath(os.path.join("miner_logs", "eg4_battery_log.csv")),
     prediction_log_path=os.path.abspath(os.path.join("miner_logs", "pv_prediction_log.csv")),
     timezone_str=settings.autocontrol.location.timezone,
+    get_eg4_client=lambda: battery_service.client,
 )
 
 # Auto-control service
