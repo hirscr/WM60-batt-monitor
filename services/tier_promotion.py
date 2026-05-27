@@ -254,12 +254,17 @@ class TierPromotion:
         return self._cooldown_remaining(self.last_demotion_from_100_ts)
 
     def to_state_dict(self) -> dict:
-        """Persistable snapshot for state_manager.save()."""
+        """Persistable snapshot for state_manager.save().
+
+        Note: last_seen_soc is intentionally NOT persisted. A stale persisted
+        value across a restart could trigger a false upward-crossing promotion.
+        It is reset to None on every process start (see __init__ in
+        AutoControlService) so the first tick re-initializes from live SOC.
+        """
         return {
             "weather_promotion_tier": self.tier,
             "last_demotion_from_90_ts": self.last_demotion_from_90_ts,
             "last_demotion_from_100_ts": self.last_demotion_from_100_ts,
-            "last_seen_soc": self.last_seen_soc,
         }
 
     # ------------------------------------------------------------------

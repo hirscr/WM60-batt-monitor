@@ -1892,10 +1892,10 @@ function renderTierPromotion() {
   else if (tier === 90) tierLabel = '90%';
   setText('tierPromoTier', tierLabel);
 
-  const lastSoc = tp.last_seen_soc;
+  const baselineSoc = tp.tier_baseline_soc;
   setText(
-    'tierPromoLastSoc',
-    (typeof lastSoc === 'number') ? lastSoc.toFixed(1) + '%' : '—'
+    'tierPromoTierBaseline',
+    (typeof baselineSoc === 'number') ? baselineSoc.toFixed(1) + '%' : '—'
   );
 
   setText('tierPromoCooldown90', formatCooldown(tp.cooldown_remaining_90_sec));

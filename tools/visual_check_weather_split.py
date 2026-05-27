@@ -40,7 +40,7 @@ EXPECTED_IDS = [
     "weatherCfgRecoveryHours",
     "weatherSaveStatus",
     "tierPromoTier",
-    "tierPromoLastSoc",
+    "tierPromoTierBaseline",
     "tierPromoCooldown90",
     "tierPromoCooldown100",
     "tierPromoDetail",

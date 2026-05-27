@@ -400,4 +400,6 @@ def test_to_state_dict_contains_persistable_fields():
     assert snap["weather_promotion_tier"] == 100
     assert snap["last_demotion_from_90_ts"] == 10.0
     assert snap["last_demotion_from_100_ts"] == 20.0
-    assert snap["last_seen_soc"] == 99.9
+    # last_seen_soc is intentionally NOT in to_state_dict — a stale persisted
+    # value across restart could trigger a false upward-crossing promotion.
+    assert "last_seen_soc" not in snap

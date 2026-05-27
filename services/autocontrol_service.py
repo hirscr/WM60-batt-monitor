@@ -113,6 +113,12 @@ class AutoControlService:
         self.emergency_active: bool = bool(saved_state.get("emergency_active", False))
         self.emergency_verified_off: bool = False
         self.emergency_attempts_this_latch: int = 0
+        # Wallclock timestamp the emergency latch was tripped. Surfaced via
+        # get_state() for observability; not displayed in the dashboard.
+        persisted_latch_ts = saved_state.get("emergency_latch_set_at")
+        self.emergency_latch_set_at: Optional[float] = (
+            float(persisted_latch_ts) if isinstance(persisted_latch_ts, (int, float)) else None
+        )
 
         # Tier-promotion service. State persists across restarts via state_manager.
         # last_seen_soc starts as None so the very first tick after restart will
@@ -465,7 +471,14 @@ class AutoControlService:
             self.emergency_active = True
             self.emergency_verified_off = False
             self.emergency_attempts_this_latch = 0
-            self.state.save(emergency_active=True)
+            self.emergency_latch_set_at = time.time()
+            try:
+                self.state.save(
+                    emergency_active=True,
+                    emergency_latch_set_at=self.emergency_latch_set_at,
+                )
+            except Exception as e:
+                print(f"[AutoControl] WARNING: failed to persist emergency latch state: {e}")
             print(f"[AutoControl] Emergency latch SET")
 
         print(f"[AutoControl] Draining queue and sending emergency power off...")
@@ -500,7 +513,11 @@ class AutoControlService:
         # Clear latch only when: verified-off succeeded this latch period AND SOC >= 90%
         if self.emergency_verified_off and soc >= 90:
             self.emergency_active = False
-            self.state.save(emergency_active=False)
+            self.emergency_latch_set_at = None
+            self.state.save(
+                emergency_active=False,
+                emergency_latch_set_at=None,
+            )
             print(f"[AutoControl] Emergency latch CLEARED (SOC={soc:.1f}% >= 90% and verified off)")
 
     # ---- Weather gate helpers ----
@@ -884,14 +901,14 @@ class AutoControlService:
             self.weather_gate.get_state() if self.weather_gate is not None else None
         )
 
-        last_seen_soc = self.tier_promotion.last_seen_soc
-        if last_seen_soc is None:
-            last_seen_soc = (self.battery.get_status() or {}).get("soc_percent")
+        # tier_baseline_soc reads directly from the internal last_seen_soc with
+        # no fallback to live battery SOC. Returns None when the baseline is
+        # unset (the very first tick after a restart, before SOC is observed).
         tier_promotion_state = {
             "tier": self.tier_promotion.tier,
             "cooldown_remaining_90_sec": self.tier_promotion.cooldown_remaining_90_sec(),
             "cooldown_remaining_100_sec": self.tier_promotion.cooldown_remaining_100_sec(),
-            "last_seen_soc": last_seen_soc,
+            "tier_baseline_soc": self.tier_promotion.last_seen_soc,
         }
 
         return {
@@ -913,6 +930,7 @@ class AutoControlService:
             "emergency_active": self.emergency_active,
             "emergency_verified_off": self.emergency_verified_off,
             "emergency_attempts_this_latch": self.emergency_attempts_this_latch,
+            "emergency_latch_set_at": self.emergency_latch_set_at,
             "weather_gate": weather_gate_state,
             "tier_promotion": tier_promotion_state,
         }

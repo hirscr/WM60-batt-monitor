@@ -16,10 +16,16 @@ DEFAULT_STATE = {
     # are monotonic-clock samples; only meaningful within a single process.
     # They are persisted to avoid spurious post-restart promotions, even though
     # the cooldown math compares against the new monotonic clock.
+    # NOTE: last_seen_soc is deliberately NOT persisted — see
+    # services/tier_promotion.py::to_state_dict.
     "weather_promotion_tier": None,        # None | 90 | 100
     "last_demotion_from_90_ts": 0.0,
     "last_demotion_from_100_ts": 0.0,
-    "last_seen_soc": None,                 # float | None
+    # Emergency latch state. emergency_active is the latch boolean (was already
+    # persisted via state.save calls). emergency_latch_set_at is the wallclock
+    # timestamp the latch was tripped — used for observability via get_state().
+    "emergency_active": False,             # bool — latch state
+    "emergency_latch_set_at": None,        # float | None — time.time() when latch tripped
     # Weather gate auxiliary fields — populated by WeatherGate when an
     # evaluation commits. The gate already persists its primary decision
     # fields (disabled, reason, expected_kwh, deficit_kwh, evaluated_date)

@@ -385,9 +385,75 @@ def test_autocontrol_state_includes_tier_promotion(tmp_path, monkeypatch):
         "tier",
         "cooldown_remaining_90_sec",
         "cooldown_remaining_100_sec",
-        "last_seen_soc",
+        "tier_baseline_soc",
     }
     assert tp["tier"] is None
     assert tp["cooldown_remaining_90_sec"] == 0
     assert tp["cooldown_remaining_100_sec"] == 0
-    assert tp["last_seen_soc"] is None
+    assert tp["tier_baseline_soc"] is None
+
+
+# ----------------------------------------------------------------------
+# Regression: tier_baseline_soc never falls back to live battery SOC.
+#
+# An earlier implementation papered over a None tier baseline by reading
+# live battery SOC. That fallback was misleading — it surfaced a live
+# reading as if it were the recorded tier baseline. The current contract
+# is: tier_baseline_soc is exactly self.tier_promotion.last_seen_soc, or
+# None. Never a substitute.
+# ----------------------------------------------------------------------
+
+
+def test_tier_baseline_soc_returns_none_when_unset_even_with_live_soc(tmp_path):
+    """When TierPromotion.last_seen_soc is None (first tick after restart),
+    tier_baseline_soc must be None — even if live battery SOC is available.
+    """
+    from services.autocontrol_service import AutoControlService
+    from utils.state_manager import StateManager
+
+    state_file = tmp_path / "wm_state.json"
+    state_mgr = StateManager(path=str(state_file))
+
+    miner = MagicMock()
+    miner.is_off = False
+    miner.get_status.return_value = {"upfreq_complete": 1}
+    battery = MagicMock()
+    battery.is_fresh.return_value = True
+    battery.get_battery_age_seconds.return_value = 5.0
+    # Live SOC IS available — but tier_baseline_soc must NOT use it.
+    battery.get_status.return_value = {"soc_percent": 55.0}
+
+    weather_service = MagicMock()
+    weather_service.get_today_forecast.return_value = {
+        "cloud_cover_remaining_daylight_pct": None,
+        "is_fresh": False,
+        "sunset_dt": None,
+    }
+
+    svc = AutoControlService(
+        miner_service=miner,
+        battery_service=battery,
+        state_manager=state_mgr,
+        base_watts=4000,
+        min_interval_sec=60,
+        mode="away",
+        away_config={
+            "emergency_soc": 30,
+            "max_pv_power": 3600,
+            "after_sunset_min_soc": 40,
+        },
+        location_config={
+            "latitude": 40.0,
+            "longitude": -74.0,
+            "timezone": "America/New_York",
+        },
+        weather_service=weather_service,
+        weather_gate=None,
+    )
+
+    state = svc.get_state()
+    tp = state["tier_promotion"]
+    # Must be None — no fallback to live battery SOC.
+    assert tp["tier_baseline_soc"] is None
+    # The old key must not appear on the external surface.
+    assert "last_seen_soc" not in tp
