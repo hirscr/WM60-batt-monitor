@@ -578,3 +578,512 @@ def test_tick_does_not_advance_flag_when_row_stays_incomplete(tmp_path, monkeypa
     assert len(rows) == 1
     assert float(rows[0]["actual_kwh"]) == pytest.approx(0.0, abs=1e-9)
     assert sm.load().get("last_pv_log_date") is None
+
+
+# ----------------------------------------------------------------------
+# Morning prediction-column write (Part 1)
+# ----------------------------------------------------------------------
+
+def test_morning_write_populates_only_prediction_columns(tmp_path, monkeypatch):
+    """Pre-sunset tick: when the gate has committed today's decision and
+    today's row is missing prediction columns, the morning write upserts
+    exactly the four prediction columns. actual_kwh stays blank — the
+    dashboard's Actual cell must continue to render '—' until sunset+30min.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    # 09:00 local — well before sunset.
+    frozen_now = _dt(2026, 5, 27, 9, 0, tzinfo=tz)
+
+    logger, path, sm = _build_logger_for_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        eg4_value=42.0,  # if a sunset write fires, this would be written
+        frozen_now=frozen_now,
+    )
+
+    # State: gate has evaluated today, full prediction context present.
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    # Freeze "now" so the sunset+30min gate definitely has NOT fired.
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["date"] == today_local.isoformat()
+    # Prediction columns populated.
+    assert float(row["eg4_today_kwh_raw"]) == pytest.approx(11.1, abs=1e-3)
+    assert float(row["multiplier_applied"]) == pytest.approx(0.9, abs=1e-3)
+    assert float(row["expected_kwh_used"]) == pytest.approx(9.99, abs=1e-3)
+    assert row["decision_source"] == "eg4_predict"
+    # actual_kwh, ratio, end_reason all blank.
+    assert (row.get("actual_kwh") or "").strip() == ""
+    assert (row.get("ratio_actual_to_eg4_raw") or "").strip() == ""
+    assert (row.get("actual_end_reason") or "").strip() == ""
+    # last_pv_log_date NOT advanced — the day isn't done.
+    assert sm.load().get("last_pv_log_date") is None
+
+
+def test_morning_write_is_idempotent(tmp_path, monkeypatch):
+    """A second morning-tick on the same day must be a no-op when today's
+    row already has decision_source populated. The on-disk file bytes are
+    identical before and after.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = _dt(2026, 5, 27, 9, 0, tzinfo=tz)
+
+    logger, path, sm = _build_logger_for_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        eg4_value=None,
+        frozen_now=frozen_now,
+    )
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+    with open(path, "rb") as f:
+        bytes_after_first = f.read()
+
+    # Mutate state to a value the morning write would normally pick up;
+    # if the idempotency guard fails, the row will be rewritten with these
+    # new numbers and the file bytes will differ.
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=999.0,
+        weather_gate_multiplier_applied=0.5,
+        weather_gate_expected_kwh=500.0,
+        weather_gate_decision_source="solar_model_fallback",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    logger._tick()
+    with open(path, "rb") as f:
+        bytes_after_second = f.read()
+
+    assert bytes_after_first == bytes_after_second, (
+        "Second tick rewrote the row — morning write is not idempotent."
+    )
+    # And the row content reflects only the first state, not the second.
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert float(rows[0]["eg4_today_kwh_raw"]) == pytest.approx(11.1, abs=1e-3)
+
+
+def test_sunset_write_preserves_morning_prediction_columns(tmp_path, monkeypatch):
+    """When the morning write has already populated prediction columns
+    on disk, the sunset write must NOT overwrite them — even if state
+    has been mutated to different values in the meantime.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = sunset_dt + timedelta(minutes=45)  # past sunset+30min
+
+    logger, path, sm = _build_logger_for_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        eg4_value=10.5,
+        frozen_now=frozen_now,
+    )
+
+    # Pre-seed the on-disk row as if a morning write had already run.
+    ctx_morning = {
+        "eg4_today_kwh_raw": 11.1,
+        "multiplier_applied": 0.9,
+        "expected_kwh_used": 9.99,
+        "decision_source": "eg4_predict",
+    }
+    logger._upsert_row_partial(today_local, {
+        "eg4_today_kwh_raw": "11.1000",
+        "multiplier_applied": "0.9000",
+        "expected_kwh_used": "9.9900",
+        "decision_source": "eg4_predict",
+    })
+
+    # Mutate state to a different prediction context — sunset write should
+    # IGNORE it (fallback fill only applies when the column is blank).
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=99.0,
+        weather_gate_multiplier_applied=0.5,
+        weather_gate_expected_kwh=49.5,
+        weather_gate_decision_source="solar_model_fallback",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    row = rows[0]
+    # Morning prediction columns preserved verbatim.
+    assert float(row["eg4_today_kwh_raw"]) == pytest.approx(11.1, abs=1e-3)
+    assert float(row["multiplier_applied"]) == pytest.approx(0.9, abs=1e-3)
+    assert float(row["expected_kwh_used"]) == pytest.approx(9.99, abs=1e-3)
+    assert row["decision_source"] == "eg4_predict"
+    # Sunset write filled actual_kwh + ratio.
+    assert float(row["actual_kwh"]) == pytest.approx(10.5, abs=1e-3)
+    assert float(row["ratio_actual_to_eg4_raw"]) == pytest.approx(
+        10.5 / 11.1, abs=1e-3
+    )
+
+
+def test_no_placeholder_actual_kwh_zero_written_before_sunset(tmp_path, monkeypatch):
+    """Pre-sunset ticks must NEVER write actual_kwh — even when the
+    underlying _resolve_actual_kwh path would return 0.0. The signature
+    bug being fixed: today's row used to appear with date + actual_kwh=0
+    and all other columns blank before sunset+30min ever happened.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    # Midday — well before sunset+30min.
+    frozen_now = _dt(2026, 5, 27, 12, 0, tzinfo=tz)
+
+    # EG4 client returns 0.0 — what used to produce the placeholder row.
+    logger, path, sm = _build_logger_for_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        eg4_value=0.0,
+        frozen_now=frozen_now,
+    )
+
+    # No gate context — morning write also won't fire. Tick should be a
+    # complete no-op: no row written at all.
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    # File must not exist (no writes happened). The morning write would
+    # have created the file only with a populated gate decision_source.
+    if os.path.exists(path):
+        with open(path, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert rows == [], (
+            "Pre-sunset tick wrote rows when it should have been a no-op."
+        )
+
+    # Reinforce: even when run repeatedly, no placeholder row appears.
+    logger._tick()
+    if os.path.exists(path):
+        with open(path, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        assert rows == []
+
+
+# ----------------------------------------------------------------------
+# actual_end_reason classifier (Part 2)
+# ----------------------------------------------------------------------
+
+
+def _write_battery_log_with_soc(path: str, samples: list[tuple[datetime, float]]) -> None:
+    """Write a battery log with the columns the classifier reads.
+
+    Schema mirrors the production eg4_battery_log.csv: ts + soc_percent
+    (plus pv_power_w to keep the parser happy if some other code reads it).
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ts", "soc_percent", "pv_power_w"])
+        for ts, soc in samples:
+            writer.writerow([ts.isoformat(), soc, 0])
+
+
+def test_classifier_returns_sunset_when_no_full_window(tmp_path):
+    """A typical day: SOC climbs but never sustains >=99% for 30 min
+    before sunset. Classification: sunset."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from services.pv_prediction_logger import classify_end_reason
+
+    tz = ZoneInfo("America/New_York")
+    day = date(2026, 5, 27)
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+
+    battery_path = str(tmp_path / "miner_logs" / "eg4_battery_log.csv")
+    # SOC climbs from 50% to 95% across the day, never crossing 99%.
+    samples = [
+        (_dt(2026, 5, 27, h, 0, tzinfo=tz), 50.0 + h * 2.5)
+        for h in range(8, 20)
+    ]
+    _write_battery_log_with_soc(battery_path, samples)
+
+    reason = classify_end_reason(
+        battery_log_path=battery_path,
+        day=day,
+        sunset_dt=sunset_dt,
+        tz=tz,
+    )
+    assert reason == "sunset"
+
+
+def test_classifier_returns_battery_full_for_long_window_before_sunset(tmp_path):
+    """SOC sits at >=99% for >30 minutes ending more than an hour before
+    sunset. Classification: battery_full (curtailment)."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from services.pv_prediction_logger import classify_end_reason
+
+    tz = ZoneInfo("America/New_York")
+    day = date(2026, 5, 27)
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+
+    battery_path = str(tmp_path / "miner_logs" / "eg4_battery_log.csv")
+    # Climb to 100 by 14:00, stay there through 17:00 (3-hour window),
+    # then drop slightly. Window ends 3 hours before sunset.
+    samples = []
+    for h in range(8, 14):
+        samples.append((_dt(2026, 5, 27, h, 0, tzinfo=tz), 70.0))
+    # Long contiguous SOC>=99% window.
+    for minute_offset in range(0, 180, 10):  # 14:00 through 17:00, every 10 min
+        ts = _dt(2026, 5, 27, 14, 0, tzinfo=tz) + timedelta(minutes=minute_offset)
+        samples.append((ts, 100.0))
+    # Then SOC declines into evening.
+    for h in range(17, 20):
+        samples.append((_dt(2026, 5, 27, h, 30, tzinfo=tz), 90.0))
+    _write_battery_log_with_soc(battery_path, samples)
+
+    reason = classify_end_reason(
+        battery_log_path=battery_path,
+        day=day,
+        sunset_dt=sunset_dt,
+        tz=tz,
+    )
+    assert reason == "battery_full"
+
+
+def test_classifier_returns_unknown_when_no_battery_log(tmp_path):
+    """No file -> unknown. (And: no exception.)"""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from services.pv_prediction_logger import classify_end_reason
+
+    tz = ZoneInfo("America/New_York")
+    day = date(2026, 5, 27)
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    missing_path = str(tmp_path / "miner_logs" / "does_not_exist.csv")
+
+    reason = classify_end_reason(
+        battery_log_path=missing_path,
+        day=day,
+        sunset_dt=sunset_dt,
+        tz=tz,
+    )
+    assert reason == "unknown"
+
+
+def test_classifier_returns_unknown_when_no_samples_in_day(tmp_path):
+    """File exists but has no rows in the target day's window -> unknown."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from services.pv_prediction_logger import classify_end_reason
+
+    tz = ZoneInfo("America/New_York")
+    day = date(2026, 5, 27)
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+
+    battery_path = str(tmp_path / "miner_logs" / "eg4_battery_log.csv")
+    # All samples are from a DIFFERENT day.
+    samples = [
+        (_dt(2026, 5, 20, 12, 0, tzinfo=tz), 100.0),
+        (_dt(2026, 5, 20, 13, 0, tzinfo=tz), 100.0),
+    ]
+    _write_battery_log_with_soc(battery_path, samples)
+
+    reason = classify_end_reason(
+        battery_log_path=battery_path,
+        day=day,
+        sunset_dt=sunset_dt,
+        tz=tz,
+    )
+    assert reason == "unknown"
+
+
+def test_classifier_treats_full_window_ending_at_sunset_as_sunset(tmp_path):
+    """A SOC>=99% window whose end is at (or after) sunset is NOT
+    curtailment — the battery sat full because the day was ending,
+    which is normal. Must classify as sunset."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from services.pv_prediction_logger import classify_end_reason
+
+    tz = ZoneInfo("America/New_York")
+    day = date(2026, 5, 27)
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+
+    battery_path = str(tmp_path / "miner_logs" / "eg4_battery_log.csv")
+    samples = [
+        (_dt(2026, 5, 27, 12, 0, tzinfo=tz), 80.0),
+        # Long >=99% window ending right at sunset.
+        (_dt(2026, 5, 27, 19, 0, tzinfo=tz), 100.0),
+        (_dt(2026, 5, 27, 19, 30, tzinfo=tz), 100.0),
+        (_dt(2026, 5, 27, 19, 59, tzinfo=tz), 100.0),
+        (_dt(2026, 5, 27, 20, 0, tzinfo=tz), 100.0),
+    ]
+    _write_battery_log_with_soc(battery_path, samples)
+
+    reason = classify_end_reason(
+        battery_log_path=battery_path,
+        day=day,
+        sunset_dt=sunset_dt,
+        tz=tz,
+    )
+    assert reason == "sunset"
+
+
+# ----------------------------------------------------------------------
+# CSV header migration (Part 2)
+# ----------------------------------------------------------------------
+
+
+def test_header_migration_adds_actual_end_reason_column_to_legacy_csv(tmp_path):
+    """A legacy 6-column CSV must be upgraded in place to 7 columns,
+    preserving every existing row's data. The new column is blank for
+    legacy rows."""
+    from services.pv_prediction_logger import (
+        CSV_FIELDNAMES, _LEGACY_CSV_FIELDNAMES_V1, PVPredictionLogger
+    )
+
+    logger, path, _ = _make_logger(tmp_path)
+    # Write a legacy CSV: 6-column header + two real data rows.
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_LEGACY_CSV_FIELDNAMES_V1)
+        writer.writerow([
+            "2026-05-18", "50.0000", "0.8000", "40.0000", "42.0000",
+            "0.8400", "eg4_predict",
+        ])
+        writer.writerow([
+            "2026-05-19", "55.0000", "0.8000", "44.0000", "39.5000",
+            "0.7182", "eg4_predict",
+        ])
+
+    # Reconcile (this is what start() runs).
+    logger._reconcile_csv_schema()
+
+    # File still exists at the canonical path.
+    assert os.path.exists(path)
+    with open(path, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+
+    # Header upgraded.
+    assert header == CSV_FIELDNAMES
+    # Both legacy rows preserved with the new column blank.
+    assert len(rows) == 2
+    assert rows[0][:7] == [
+        "2026-05-18", "50.0000", "0.8000", "40.0000", "42.0000",
+        "0.8400", "eg4_predict",
+    ]
+    assert rows[0][7] == ""  # actual_end_reason blank for legacy row
+    assert rows[1][:7] == [
+        "2026-05-19", "55.0000", "0.8000", "44.0000", "39.5000",
+        "0.7182", "eg4_predict",
+    ]
+    assert rows[1][7] == ""
+
+
+def test_header_migration_writes_canonical_header_for_new_row_after_migration(tmp_path):
+    """After legacy migration, a fresh upsert under the new schema must
+    work — the canonical header on disk is honored end-to-end."""
+    from services.pv_prediction_logger import _LEGACY_CSV_FIELDNAMES_V1, CSV_FIELDNAMES
+
+    logger, path, _ = _make_logger(tmp_path)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_LEGACY_CSV_FIELDNAMES_V1)
+        writer.writerow([
+            "2026-05-18", "50.0000", "0.8000", "40.0000", "42.0000",
+            "0.8400", "eg4_predict",
+        ])
+
+    logger._reconcile_csv_schema()
+    # Write a new row via the partial upsert with end_reason populated.
+    logger._upsert_row_partial(date(2026, 5, 19), {
+        "actual_kwh": "44.0000",
+        "actual_end_reason": "battery_full",
+    })
+
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        header = reader.fieldnames
+
+    assert header == CSV_FIELDNAMES
+    assert len(rows) == 2
+    # Legacy row untouched.
+    assert rows[0]["date"] == "2026-05-18"
+    assert rows[0]["actual_end_reason"] == ""
+    # New row written through with end_reason.
+    assert rows[1]["date"] == "2026-05-19"
+    assert rows[1]["actual_kwh"] == "44.0000"
+    assert rows[1]["actual_end_reason"] == "battery_full"

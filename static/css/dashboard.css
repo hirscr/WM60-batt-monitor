@@ -780,4 +780,12 @@ h2 {
   color: #8a1f1f;
   font-weight: 600;
 }
+/* Curtailment indicator: applied to <tr> elements where the day ended
+   because the battery hit 100% before sunset. Soft yellow tint
+   communicates "this day was capped" while remaining readable against
+   the table's default white/light backgrounds. The hover tooltip on the
+   <tr> spells out the reason. */
+#predictionTrackerCard .prediction-table tr.prediction-row-curtailed td {
+  background: #fff8d4;
+}
 

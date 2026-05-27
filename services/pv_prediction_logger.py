@@ -1,26 +1,30 @@
 """Daily PV prediction-vs-actual logger.
 
-Background-thread service. Once per local day, about 30 minutes after sunset,
-this service:
+Background-thread service that writes one row per local day to
+miner_logs/pv_prediction_log.csv using two independent, idempotent writes:
 
-  1. Computes the day's actual PV energy harvest. EG4 inverter's cumulative
-     todayYielding is the primary source; trapezoidal integration of the
-     pv_power_w column in miner_logs/eg4_battery_log.csv is the fallback.
-  2. Reads the gate's persisted decision context (raw EG4 prediction, applied
-     multiplier, expected_kwh used, decision source).
-  3. UPSERTS one row keyed by date into miner_logs/pv_prediction_log.csv with
-     the canonical schema (date, eg4_today_kwh_raw, multiplier_applied,
-     expected_kwh_used, actual_kwh, ratio_actual_to_eg4_raw, decision_source).
-     Writes go through a temp-sibling + atomic rename so a crash mid-write
-     cannot truncate the log.
-  4. Updates last_pv_log_date in wm_state.json ONLY when today's row is
-     fully populated (non-blank, non-zero actual_kwh AND every gate-context
-     column whose wm_state counterpart is set today). An incomplete row
-     leaves the flag untouched, so the next tick after sunset+30min self-
-     heals the missing fields.
+  1. Morning write (prediction columns) — fires the first time the
+     weather gate has committed a decision for today and the on-disk row
+     is still missing prediction columns. Populates eg4_today_kwh_raw,
+     multiplier_applied, expected_kwh_used, decision_source. Does NOT
+     touch actual_kwh — the dashboard will show "Actual: —" for today
+     until sunset+30min.
+  2. Sunset write (actual columns) — fires once per day, about 30 minutes
+     after sunset. Computes actual_kwh from EG4's cumulative todayYielding
+     (with trapezoidal integration of pv_power_w as a fallback) and
+     classifies actual_end_reason (sunset / battery_full / unknown).
+     Preserves prediction columns when already populated by the morning
+     write; fills them in as a fallback if morning did not run.
 
-Side-effect free helpers live in utils/pv_integration.py; this file owns the
-file-system and threading concerns only.
+Updates last_pv_log_date in wm_state.json ONLY when today's row is fully
+populated (every prediction column present AND a strictly positive
+actual_kwh). An incomplete row leaves the flag untouched so the next
+tick after sunset+30min self-heals the missing fields.
+
+Writes go through a temp-sibling + atomic rename so a crash mid-write
+cannot truncate the log. Side-effect-free helpers live in
+utils/pv_integration.py; this file owns the file-system and threading
+concerns only.
 
 Logging follows the two-layer gate pattern with tag "PV_LOG".
 """
@@ -39,7 +43,8 @@ from utils.log_config import log
 from utils.pv_integration import parse_battery_row, trapezoidal_kwh
 
 # Canonical column order for the prediction log. Schema reconcile compares
-# the on-disk header to this list; mismatch -> archive + create fresh.
+# the on-disk header to this list; mismatch -> migrate-in-place (legacy 6-col
+# header) or archive + create fresh (any other mismatch).
 CSV_FIELDNAMES = [
     "date",
     "eg4_today_kwh_raw",
@@ -48,7 +53,37 @@ CSV_FIELDNAMES = [
     "actual_kwh",
     "ratio_actual_to_eg4_raw",
     "decision_source",
+    "actual_end_reason",
 ]
+
+# Legacy 6-column header (no actual_end_reason). Used for in-place migration
+# of pre-existing CSV files when the column is added. Any other header
+# mismatch still triggers archive-and-recreate.
+_LEGACY_CSV_FIELDNAMES_V1 = [
+    "date",
+    "eg4_today_kwh_raw",
+    "multiplier_applied",
+    "expected_kwh_used",
+    "actual_kwh",
+    "ratio_actual_to_eg4_raw",
+    "decision_source",
+]
+
+# Columns owned by the morning (prediction-context) write. The sunset write
+# preserves these when they are already non-blank on disk.
+_PREDICTION_COLUMNS = (
+    "eg4_today_kwh_raw",
+    "multiplier_applied",
+    "expected_kwh_used",
+    "decision_source",
+)
+
+# SOC threshold and minimum duration used by the actual_end_reason classifier.
+# SOC at or above _BATTERY_FULL_SOC_PCT for at least _BATTERY_FULL_MIN_SEC,
+# with the window ending strictly before sunset, classifies the day as
+# battery_full (curtailment).
+_BATTERY_FULL_SOC_PCT = 99.0
+_BATTERY_FULL_MIN_SEC = 30 * 60
 
 # How long to wait after sunset before logging the day. 30 minutes is enough
 # to capture late-day cleanup PV harvest without colliding with sunrise on
@@ -171,16 +206,25 @@ class PVPredictionLogger:
             log("PV_LOG", "loop exiting")
 
     def _tick(self) -> None:
-        """One pass: upsert today's row if it's time and the row is incomplete.
+        """One pass: morning + sunset writes, each independently gated.
 
-        Self-healing semantics: the tick does NOT early-return purely on the
-        last_pv_log_date flag. It re-runs after sunset+30min whenever today's
-        row is incomplete (missing/blank/zero actual_kwh, or any gate-context
-        column blank while the wm_state has a matching value for today). Only
-        once the row is fully populated AND last_pv_log_date == today does the
-        tick no-op. This lets a partially-written row self-correct on the next
-        sunset+30min pass — e.g. when the gate evaluated AFTER an earlier
-        premature log write, leaving the gate-context columns blank on disk.
+        The tick is split into two independent write paths, each idempotent:
+
+          1. Morning write — runs whenever the weather gate has committed a
+             decision for today (state.weather_gate_evaluated_date == today)
+             AND today's on-disk row is missing prediction columns. Writes
+             only the four prediction-context columns (eg4_today_kwh_raw,
+             multiplier_applied, expected_kwh_used, decision_source).
+             Does NOT touch actual_kwh.
+          2. Sunset write — runs only past sunset + post_sunset_seconds.
+             Writes actual_kwh, actual_end_reason, and recomputes
+             ratio_actual_to_eg4_raw. Preserves prediction columns when
+             they are already populated; only fills them in as a fallback
+             if the morning write somehow didn't run.
+
+        Self-healing semantics on the sunset path: the tick re-runs whenever
+        the row is incomplete (per _is_today_row_complete). last_pv_log_date
+        only advances once the row is fully populated.
         """
         now_local = datetime.now(self._tz)
         today_local = now_local.date()
@@ -189,9 +233,8 @@ class PVPredictionLogger:
         last_logged_str = saved.get("last_pv_log_date")
 
         # The "complete and done" no-op condition: row is fully populated
-        # AND the persisted flag matches today. We compute completeness
-        # before any sunset gating because if we're already done, no need
-        # to ask the weather service or do any work at all.
+        # AND the persisted flag matches today. Compute completeness before
+        # any sunset gating so we can skip both write paths entirely.
         row_complete = self._is_today_row_complete(today_local, saved)
         last_logged_is_today = False
         if last_logged_str:
@@ -204,38 +247,48 @@ class PVPredictionLogger:
         if row_complete and last_logged_is_today:
             return
 
-        # We need sunset to know when the day is "done". WeatherService
-        # exposes today's sunset via get_today_forecast(); this is cache-only.
+        # ----- Morning write -----
+        # Independent of sunset timing. As soon as the gate evaluates today,
+        # the prediction columns become visible on the dashboard.
+        self._maybe_write_morning_prediction(today_local, saved)
+
+        # ----- Sunset gate -----
         forecast = self._weather.get_today_forecast() if self._weather else {}
         sunset_dt = forecast.get("sunset_dt")
         if sunset_dt is None:
             if __debug__:
-                log("PV_LOG", "no sunset_dt yet; skip")
+                log("PV_LOG", "no sunset_dt yet; skip sunset write")
             return
 
-        # Only log once we are past sunset + post_sunset window.
         trigger_at = sunset_dt + timedelta(seconds=self._post_sunset_seconds)
         if now_local < trigger_at:
             return
 
-        # Compute the day's actual PV harvest and upsert the row. EG4
-        # todayYielding is the primary source; CSV trapezoidal integration
-        # is the fallback when EG4 is unavailable.
+        # ----- Sunset write (actual columns) -----
         actual_kwh, actual_source = self._resolve_actual_kwh(today_local)
+        end_reason = self._classify_end_reason(today_local, sunset_dt)
+        # Reload state in case the morning write or another writer touched it.
+        saved = self._state.load()
+        # Build the partial update: actual_kwh + end_reason + ratio.
+        # Prediction columns are filled in as a FALLBACK only if missing on
+        # disk and present in state (the morning write should have already
+        # taken care of them).
         decision_ctx = self._read_gate_decision_context(saved, today_local)
-        self._append_row(today_local, actual_kwh, decision_ctx)
+        self._write_actual_columns(
+            today_local,
+            actual_kwh=actual_kwh,
+            end_reason=end_reason,
+            fallback_ctx=decision_ctx,
+        )
 
         # Persist last_pv_log_date ONLY when the row is fully populated.
-        # An incomplete write (zero/missing actual, or gate ctx still blank
-        # while wm_state has it) leaves the flag at its previous value so
-        # the next tick re-attempts.
         if self._is_today_row_complete(today_local, saved):
             self._state.save(last_pv_log_date=today_local.isoformat())
             if __debug__:
                 log(
                     "PV_LOG",
                     f"logged date={today_local} actual_kwh={actual_kwh:.2f} "
-                    f"actual_source={actual_source} "
+                    f"actual_source={actual_source} end_reason={end_reason} "
                     f"raw={decision_ctx.get('eg4_today_kwh_raw')} "
                     f"source={decision_ctx.get('decision_source')} "
                     f"complete=True",
@@ -246,10 +299,113 @@ class PVPredictionLogger:
                     "PV_LOG",
                     f"upserted incomplete row date={today_local} "
                     f"actual_kwh={actual_kwh:.2f} actual_source={actual_source} "
+                    f"end_reason={end_reason} "
                     f"raw={decision_ctx.get('eg4_today_kwh_raw')} "
                     f"source={decision_ctx.get('decision_source')} "
                     f"flag_not_advanced",
                 )
+
+    def _maybe_write_morning_prediction(self, today: date, saved_state: dict) -> None:
+        """Morning prediction-column write. Idempotent.
+
+        Runs at most once per day. The trigger is:
+          - state.weather_gate_evaluated_date == today, AND
+          - today's row on disk is missing decision_source (i.e. the
+            morning write has not happened yet today).
+
+        Only the four prediction columns are written. actual_kwh and
+        actual_end_reason are NOT touched here — they remain blank until
+        the sunset+30min write. ratio_actual_to_eg4_raw is recomputed when
+        actual_kwh is already non-blank on disk (this is the only time the
+        ratio can be computed from prediction-column data alone).
+
+        No-op when the gate has not evaluated today, when state's gate
+        context is empty, or when the row already has decision_source.
+        """
+        ctx = self._read_gate_decision_context(saved_state, today)
+        # If the gate has not committed a decision for today, nothing to write.
+        if ctx.get("decision_source") is None:
+            return
+
+        # Idempotency guard: if today's on-disk row already has a non-blank
+        # decision_source, the morning write already ran. Do nothing.
+        existing = self._get_row(today)
+        if existing is not None:
+            on_disk_source = (existing.get("decision_source") or "").strip()
+            if on_disk_source:
+                return
+
+        updates: dict[str, str] = {
+            "eg4_today_kwh_raw": _fmt_num(ctx.get("eg4_today_kwh_raw")),
+            "multiplier_applied": _fmt_num(ctx.get("multiplier_applied")),
+            "expected_kwh_used": _fmt_num(ctx.get("expected_kwh_used")),
+            "decision_source": ctx.get("decision_source") or "",
+        }
+        # If actual_kwh is already on disk (e.g. a backfill ran first),
+        # recompute the ratio now using the new prediction value.
+        if existing is not None:
+            actual_str = (existing.get("actual_kwh") or "").strip()
+            if actual_str:
+                updates["ratio_actual_to_eg4_raw"] = _compute_ratio(
+                    actual_str, updates["eg4_today_kwh_raw"]
+                )
+
+        self._upsert_row_partial(today, updates)
+        if __debug__:
+            log(
+                "PV_LOG",
+                f"morning write date={today} source={ctx.get('decision_source')} "
+                f"raw={ctx.get('eg4_today_kwh_raw')} mult={ctx.get('multiplier_applied')} "
+                f"expected={ctx.get('expected_kwh_used')}",
+            )
+
+    def _write_actual_columns(
+        self,
+        today: date,
+        *,
+        actual_kwh: float,
+        end_reason: str,
+        fallback_ctx: dict,
+    ) -> None:
+        """Sunset-write path. Updates actual_kwh, actual_end_reason, and
+        ratio_actual_to_eg4_raw. Preserves prediction columns when already
+        populated on disk; only fills them from `fallback_ctx` when blank.
+        """
+        actual_str = f"{actual_kwh:.4f}"
+        updates: dict[str, str] = {
+            "actual_kwh": actual_str,
+            "actual_end_reason": end_reason or "",
+        }
+
+        existing = self._get_row(today)
+        # Recompute ratio from (effective) eg4_today_kwh_raw, which is whatever
+        # ends up on disk after this write (existing value, fallback, or blank).
+        existing_raw = (existing.get("eg4_today_kwh_raw") if existing else "") or ""
+
+        # Prediction-column fallback fill. Only fills disk cells that are
+        # currently blank — never overwrites a value the morning write put
+        # there. Skip when fallback_ctx has nothing to offer.
+        if fallback_ctx.get("decision_source") is not None:
+            fallback_map = {
+                "eg4_today_kwh_raw": _fmt_num(fallback_ctx.get("eg4_today_kwh_raw")),
+                "multiplier_applied": _fmt_num(fallback_ctx.get("multiplier_applied")),
+                "expected_kwh_used": _fmt_num(fallback_ctx.get("expected_kwh_used")),
+                "decision_source": fallback_ctx.get("decision_source") or "",
+            }
+            for col, fallback_val in fallback_map.items():
+                if not fallback_val:
+                    continue
+                on_disk_val = (existing.get(col) if existing else "") or ""
+                if not on_disk_val.strip():
+                    updates[col] = fallback_val
+                    if col == "eg4_today_kwh_raw":
+                        existing_raw = fallback_val
+
+        # Recompute ratio against whichever raw value will be on disk after
+        # this write — either the preserved morning value or the fallback fill.
+        updates["ratio_actual_to_eg4_raw"] = _compute_ratio(actual_str, existing_raw)
+
+        self._upsert_row_partial(today, updates)
 
     def _resolve_actual_kwh(self, day: date) -> tuple[float, str]:
         """Return (actual_kwh, source_label) for `day`.
@@ -373,18 +529,13 @@ class PVPredictionLogger:
         return trapezoidal_kwh(samples)
 
     def _append_row(self, day: date, actual_kwh: float, ctx: dict) -> None:
-        """Upsert today's row in pv_prediction_log.csv keyed by date.
+        """Full-row upsert. Writes every non-key column from the supplied
+        inputs, replacing any existing row for `day` in place.
 
-        Behavior:
-          - If a row for `day` exists, replace all six non-key fields in
-            place. Other rows are preserved untouched.
-          - Otherwise, append a new row at the tail.
-          - Write goes via a temp-sibling + atomic rename so a crash mid-
-            write never truncates the log.
-
-        The name "_append_row" is retained for backwards compatibility
-        with the test surface (tests call it directly to exercise the
-        write path in isolation). The semantic, however, is upsert.
+        Retained for backwards compatibility with the test surface — tests
+        call it directly to seed deterministic fixtures. Production code
+        paths now use _upsert_row_partial (morning + sunset writes) to
+        avoid clobbering columns that were written by the other path.
         """
         os.makedirs(os.path.dirname(self._prediction_log_path), exist_ok=True)
 
@@ -411,7 +562,9 @@ class PVPredictionLogger:
         """Build a row dict from the gate-context inputs.
 
         Recomputes ratio_actual_to_eg4_raw whenever both actual_kwh and a
-        positive eg4_today_kwh_raw are present; blank otherwise.
+        positive eg4_today_kwh_raw are present; blank otherwise. The
+        actual_end_reason column defaults to blank when not supplied via
+        ctx — _append_row callers (tests) need not provide it.
         """
         raw = ctx.get("eg4_today_kwh_raw")
         ratio: str = ""
@@ -426,7 +579,88 @@ class PVPredictionLogger:
             "actual_kwh": f"{actual_kwh:.4f}",
             "ratio_actual_to_eg4_raw": ratio,
             "decision_source": ctx.get("decision_source") or "",
+            "actual_end_reason": ctx.get("actual_end_reason") or "",
         }
+
+    def _upsert_row_partial(self, day: date, updates: dict[str, str]) -> None:
+        """Merge `updates` into today's row, preserving every column the
+        caller did not specify.
+
+        `updates` is a dict of column name -> formatted string value. Only
+        these columns are written into the merged row; existing non-blank
+        values for other columns are preserved verbatim.
+
+        If no row for `day` exists yet, one is created with `updates`
+        applied and all other columns blank.
+
+        Write goes via temp-sibling + atomic rename — same durability
+        guarantees as the full-row writer.
+        """
+        os.makedirs(os.path.dirname(self._prediction_log_path), exist_ok=True)
+
+        existing_rows = self._read_all_rows()
+        target_iso = day.isoformat()
+
+        replaced = False
+        merged_rows = []
+        for row in existing_rows:
+            if row.get("date") == target_iso:
+                merged = self._blank_row(day)
+                # Carry forward every column already on disk.
+                for col in CSV_FIELDNAMES:
+                    val = row.get(col, "")
+                    if val is None:
+                        val = ""
+                    merged[col] = val
+                # Apply the caller's updates over the top.
+                for col, val in updates.items():
+                    merged[col] = val if val is not None else ""
+                merged_rows.append(merged)
+                replaced = True
+            else:
+                merged_rows.append(row)
+        if not replaced:
+            new_row = self._blank_row(day)
+            for col, val in updates.items():
+                new_row[col] = val if val is not None else ""
+            merged_rows.append(new_row)
+
+        self._atomic_rewrite(merged_rows)
+        if __debug__:
+            cols = ",".join(sorted(updates.keys()))
+            action = "replaced" if replaced else "appended"
+            log("PV_LOG", f"partial {action} for {target_iso} cols=[{cols}]")
+
+    def _blank_row(self, day: date) -> dict:
+        """Return a fresh row dict with date set and all other columns blank."""
+        return {col: ("" if col != "date" else day.isoformat()) for col in CSV_FIELDNAMES}
+
+    def _get_row(self, day: date) -> Optional[dict]:
+        """Return today's on-disk row dict (or None if no row exists)."""
+        target_iso = day.isoformat()
+        for row in self._read_all_rows():
+            if row.get("date") == target_iso:
+                return row
+        return None
+
+    def _classify_end_reason(self, day: date, sunset_dt: datetime) -> str:
+        """Classify how the day's PV gathering ended.
+
+        Returns one of:
+          - "sunset" — PV gathering ended at sunset (normal).
+          - "battery_full" — SOC sat at >=99% for >=30 consecutive minutes
+            ending before sunset (curtailment).
+          - "unknown" — insufficient battery-log data to classify.
+
+        See module-level constants _BATTERY_FULL_SOC_PCT and
+        _BATTERY_FULL_MIN_SEC for the exact thresholds.
+        """
+        return classify_end_reason(
+            battery_log_path=self._battery_log_path,
+            day=day,
+            sunset_dt=sunset_dt,
+            tz=self._tz,
+        )
 
     def _read_all_rows(self) -> list[dict]:
         """Return every row from the prediction log as a list of dicts.
@@ -559,10 +793,17 @@ class PVPredictionLogger:
     def _reconcile_csv_schema(self) -> None:
         """Ensure the prediction log uses CSV_FIELDNAMES.
 
-        Same pattern as BatteryService._reconcile_csv_schema:
-          - file missing or empty -> nothing to do, first write creates it
-          - header matches -> keep using it
-          - header differs -> archive to a timestamped sibling and create fresh
+        Three cases:
+          - File missing or empty -> nothing to do; first write creates it.
+          - Header matches CSV_FIELDNAMES -> keep using it.
+          - Header matches a known legacy schema -> migrate in place,
+            preserving every existing data row. New columns default blank.
+          - Any other header mismatch -> archive to a timestamped sibling
+            and start a fresh canonical log.
+
+        The in-place migration path was added when actual_end_reason was
+        appended to the schema. It must be additive only — existing rows
+        keep every previous column unchanged.
         """
         path = self._prediction_log_path
         if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -576,6 +817,18 @@ class PVPredictionLogger:
                 header = []
 
         if header == CSV_FIELDNAMES:
+            return
+
+        # Known legacy schemas: migrate in place by reading all rows and
+        # atomically rewriting under the new header. New columns blank.
+        if header == _LEGACY_CSV_FIELDNAMES_V1:
+            existing_rows = self._read_all_rows()
+            self._atomic_rewrite(existing_rows)
+            print(
+                f"[PVPredictionLogger] Migrated legacy CSV in place: "
+                f"added column 'actual_end_reason' (default blank) to "
+                f"{len(existing_rows)} existing rows."
+            )
             return
 
         stem, ext = os.path.splitext(os.path.basename(path))
@@ -596,6 +849,141 @@ def _fmt_num(v) -> str:
         return f"{float(v):.4f}"
     except (TypeError, ValueError):
         return ""
+
+
+def _compute_ratio(actual_str: str, raw_str: str) -> str:
+    """Return ratio_actual_to_eg4_raw as a formatted string, or '' when
+    the division is impossible (missing/blank/non-positive raw)."""
+    actual_str = (actual_str or "").strip()
+    raw_str = (raw_str or "").strip()
+    if not actual_str or not raw_str:
+        return ""
+    try:
+        raw_val = float(raw_str)
+    except (TypeError, ValueError):
+        return ""
+    if raw_val <= 0.0:
+        return ""
+    try:
+        actual_val = float(actual_str)
+    except (TypeError, ValueError):
+        return ""
+    return f"{actual_val / raw_val:.4f}"
+
+
+def classify_end_reason(
+    *,
+    battery_log_path: str,
+    day: date,
+    sunset_dt: datetime,
+    tz: ZoneInfo,
+) -> str:
+    """Classify how PV gathering ended on `day`.
+
+    Scans miner_logs/eg4_battery_log.csv (path supplied) for rows in
+    `day`'s local calendar window. Returns:
+      - "sunset" — no contiguous SOC>=99% window of >=30 min ended before
+        sunset.
+      - "battery_full" — at least one contiguous SOC>=99% window of
+        >=30 min ended strictly before sunset.
+      - "unknown" — no battery-log coverage for the day, or no SOC samples
+        before sunset.
+
+    The classifier is pure (depends only on the supplied path and inputs)
+    and is shared between the in-process sunset write and the backfill
+    tool.
+
+    Implementation note: rows are streamed in disk order, then sorted by
+    parsed timestamp before window detection — the battery log can contain
+    out-of-order rows after a session-refresh re-fetches a historical
+    sample, and "longest contiguous window" only makes sense in time order.
+    """
+    if not os.path.exists(battery_log_path):
+        return "unknown"
+
+    day_start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+    day_end = day_start + timedelta(days=1)
+    sunset_local = sunset_dt.astimezone(tz)
+
+    samples: list[tuple[datetime, float]] = []
+    try:
+        with open(battery_log_path, "r", newline="") as f:
+            lines = _nul_stripped_lines(f)
+            reader = csv.DictReader(lines)
+            for raw_row in reader:
+                ts_str = raw_row.get("ts") or ""
+                soc_str = raw_row.get("soc_percent") or ""
+                if not ts_str or not soc_str:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=tz)
+                ts_local = dt.astimezone(tz)
+                if not (day_start <= ts_local < day_end):
+                    continue
+                try:
+                    soc = float(soc_str)
+                except (TypeError, ValueError):
+                    continue
+                samples.append((ts_local, soc))
+    except Exception:
+        # A read failure is indistinguishable from missing coverage for
+        # classification purposes.
+        return "unknown"
+
+    if not samples:
+        return "unknown"
+
+    samples.sort(key=lambda p: p[0])
+
+    # No SOC samples before sunset means we can't observe the end-of-day
+    # behavior at all.
+    pre_sunset = [s for s in samples if s[0] <= sunset_local]
+    if not pre_sunset:
+        return "unknown"
+
+    # Walk pre-sunset samples and find the longest contiguous SOC>=threshold
+    # window. "Contiguous" is defined by adjacent samples both crossing the
+    # threshold — gaps in the battery log do NOT split a window (gaps just
+    # mean we did not observe SOC during that interval; both endpoints
+    # already qualify).
+    longest_start: Optional[datetime] = None
+    longest_end: Optional[datetime] = None
+    longest_dur = 0.0
+    cur_start: Optional[datetime] = None
+    cur_end: Optional[datetime] = None
+    for ts, soc in pre_sunset:
+        if soc >= _BATTERY_FULL_SOC_PCT:
+            if cur_start is None:
+                cur_start = ts
+            cur_end = ts
+        else:
+            if cur_start is not None and cur_end is not None:
+                dur = (cur_end - cur_start).total_seconds()
+                if dur > longest_dur:
+                    longest_dur = dur
+                    longest_start = cur_start
+                    longest_end = cur_end
+            cur_start = None
+            cur_end = None
+    # Close the trailing window, if any.
+    if cur_start is not None and cur_end is not None:
+        dur = (cur_end - cur_start).total_seconds()
+        if dur > longest_dur:
+            longest_dur = dur
+            longest_start = cur_start
+            longest_end = cur_end
+
+    if (
+        longest_end is not None
+        and longest_dur >= _BATTERY_FULL_MIN_SEC
+        and longest_end < sunset_local
+    ):
+        return "battery_full"
+    return "sunset"
 
 
 def _nul_stripped_lines(iterable):

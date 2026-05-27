@@ -1777,7 +1777,17 @@ function renderPredictionHistoryRows(rows) {
         else ratioClass = 'ratio-bad';
       }
     }
-    return `<tr>
+    // Curtailment indicator: when the day ended because the battery hit
+    // 100% before sunset, paint the row yellow and surface the reason in
+    // a tooltip. Other end_reason values (sunset, unknown) get no special
+    // treatment — the row stays in its default style.
+    let rowClass = '';
+    let rowTitleAttr = '';
+    if (r.actual_end_reason === 'battery_full') {
+      rowClass = 'prediction-row-curtailed';
+      rowTitleAttr = ' title="Solar curtailed — battery hit 100% before sunset."';
+    }
+    return `<tr class="${rowClass}"${rowTitleAttr}>
       <td>${dateStr}</td>
       <td>${rawStr}</td>
       <td>${actualStr}</td>
