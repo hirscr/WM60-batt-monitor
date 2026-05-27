@@ -7,6 +7,11 @@ Promotion (one-shot, upward SOC crossing required):
   - prev<90 and new>=90, clear skies, >3h before sunset, no cooldown -> 90
   - At 90, prev<99 and new>=99, same conditions -> 100
 
+Unconditional full-power override:
+  - SOC >= 99% -> 100%, regardless of cloud cover, crossing, or time.
+    A full battery has nowhere to store more energy; run at full power.
+    Applies on the first tick too, bypassing the restart-safety init skip.
+
 Demotion (SOC-only):
   - At 100, SOC<99 -> 90, arms 100% cooldown
   - At 90,  SOC<90 -> None (fall through to decile), arms 90% cooldown
@@ -15,7 +20,7 @@ Fallbacks block promotion but never force demotion: missing cloud,
 stale forecast, past sunset, missing sunset_dt, weather unreachable.
 
 Restart safety: last_seen_soc starts as None; the first evaluate()
-records SOC and skips the crossing check.
+records SOC and skips the crossing check (except the SOC>=99 override).
 """
 from __future__ import annotations
 
@@ -128,6 +133,21 @@ class TierPromotion:
         if soc_pct is None:
             return self._unchanged(
                 description=self._describe(prev_tier, suffix=" (no SOC)"),
+                is_first_tick=is_first_tick,
+            )
+
+        # Full-battery override: SOC >= 99% means the battery can't absorb
+        # more energy, so run at full power unconditionally. Bypasses cloud
+        # cover, crossing requirement, time-before-sunset, and the first-tick
+        # init skip. Sets last_seen_soc so the init guard is satisfied for
+        # subsequent ticks.
+        if float(soc_pct) >= SOC_PROMOTE_100 and self.tier != 100:
+            self.last_seen_soc = float(soc_pct)
+            return TierEvaluation(
+                tier=100,
+                target_pct=100,
+                tier_changed=(prev_tier != 100),
+                description="Full power — battery full",
                 is_first_tick=is_first_tick,
             )
 

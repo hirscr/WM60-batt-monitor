@@ -127,7 +127,8 @@ def test_promote_to_100_from_90_with_clear_skies():
     assert result.tier_changed is True
 
 
-def test_promote_to_100_blocked_when_cloudy():
+def test_promote_to_100_unconditional_when_battery_full_even_if_cloudy():
+    """SOC >= 99% overrides cloud cover — full battery promotes regardless."""
     clock = FakeClock()
     tp = _new_tp(clock=clock, tier=90, last_soc=98.0)
     result = tp.evaluate(
@@ -137,7 +138,22 @@ def test_promote_to_100_blocked_when_cloudy():
         sunset_dt=_sunset(),
         now_local=_now_local(13),
     )
-    assert result.tier == 90  # unchanged
+    assert result.tier == 100
+    assert result.tier_changed is True
+
+
+def test_promote_to_100_crossing_still_blocked_when_cloudy_and_soc_below_99():
+    """Clouds still block the weather-gated crossing path when SOC < 99%."""
+    clock = FakeClock()
+    tp = _new_tp(clock=clock, tier=90, last_soc=97.5)
+    result = tp.evaluate(
+        soc_pct=98.5,  # below 99 — unconditional override does not fire
+        cloud_cover_remaining_pct=80.0,
+        forecast_fresh=True,
+        sunset_dt=_sunset(),
+        now_local=_now_local(13),
+    )
+    assert result.tier == 90  # unchanged — cloud blocks crossing-based path
     assert result.tier_changed is False
 
 
@@ -240,17 +256,19 @@ def test_recross_90_after_cooldown_promotes():
 
 
 def test_stale_cloud_cover_does_not_promote_or_force_demote():
+    """Stale forecast blocks the weather-gated crossing path (SOC < 99)
+    and does not force a demotion."""
     clock = FakeClock()
-    tp = _new_tp(clock=clock, tier=90, last_soc=98.0)
-    # Forecast missing entirely
+    tp = _new_tp(clock=clock, tier=90, last_soc=94.0)
+    # Forecast missing entirely; SOC below 99 so unconditional override skips.
     result = tp.evaluate(
-        soc_pct=99.5,
+        soc_pct=95.5,
         cloud_cover_remaining_pct=None,
         forecast_fresh=False,
         sunset_dt=None,
         now_local=_now_local(12),
     )
-    # No promote (cloud None blocks), no forced demote (SOC still high).
+    # Stale forecast blocks crossing-based promotion; no forced demote.
     assert result.tier == 90
     assert result.tier_changed is False
 
@@ -334,6 +352,24 @@ def test_second_tick_after_restart_needs_real_crossing():
     )
     assert result.tier is None
     assert result.tier_changed is False
+
+
+def test_first_tick_at_100_soc_promotes_immediately():
+    """SOC >= 99 on the very first tick after restart must promote unconditionally.
+    The restart-safety init skip does not apply to the full-battery override."""
+    clock = FakeClock()
+    tp = _new_tp(clock=clock, last_soc=None)  # fresh restart
+    result = tp.evaluate(
+        soc_pct=100.0,
+        cloud_cover_remaining_pct=None,  # no cloud data available
+        forecast_fresh=False,
+        sunset_dt=None,
+        now_local=_now_local(12),
+    )
+    assert result.tier == 100
+    assert result.tier_changed is True
+    assert result.is_first_tick is True
+    assert tp.last_seen_soc == 100.0
 
 
 def test_no_soc_returns_unchanged_without_clobbering_state():
