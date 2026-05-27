@@ -492,6 +492,10 @@ class AutoControlService:
                 self.stop_reason = "emergency_unverified"
         else:
             self.stop_reason = "emergency_soc"
+            # Miner is already confirmed off (either from the original trip or after a
+            # service restart with emergency_active persisted). Mark verified so the
+            # SOC-recovery check below can clear the latch.
+            self.emergency_verified_off = True
 
         # Clear latch only when: verified-off succeeded this latch period AND SOC >= 90%
         if self.emergency_verified_off and soc >= 90:
