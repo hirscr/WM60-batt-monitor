@@ -207,6 +207,16 @@ pv_prediction_logger = PVPredictionLogger(
     prediction_log_path=os.path.abspath(os.path.join("miner_logs", "pv_prediction_log.csv")),
     timezone_str=settings.autocontrol.location.timezone,
     get_eg4_client=lambda: battery_service.client,
+    # Start-of-day battery snapshot for pv_prediction_log.csv.
+    # battery_service.get_status() returns the latest BatteryService snapshot
+    # dict; is_fresh() gates capture so we never log a stale SOC.
+    # battery_total_kwh from weather_gate config is the rated pack capacity —
+    # already used for the gate's deficit calculation, so we reuse it as the
+    # single source of truth for kWh derivation. None branch (no config) yields
+    # a blank start_battery_kwh while start_soc_pct is still captured.
+    get_battery_status=lambda: battery_service.get_status(),
+    get_battery_is_fresh=lambda: battery_service.is_fresh(),
+    get_battery_capacity_kwh=lambda: settings.weather_gate.battery_total_kwh,
 )
 
 # Auto-control service

@@ -1087,3 +1087,787 @@ def test_header_migration_writes_canonical_header_for_new_row_after_migration(tm
     assert rows[1]["date"] == "2026-05-19"
     assert rows[1]["actual_kwh"] == "44.0000"
     assert rows[1]["actual_end_reason"] == "battery_full"
+
+
+# ----------------------------------------------------------------------
+# Start-of-day battery energy capture (this change)
+# ----------------------------------------------------------------------
+
+
+def _build_logger_for_start_energy_tick(
+    tmp_path,
+    *,
+    sunset_dt,
+    frozen_now,
+    eg4_value=None,
+    battery_status=None,
+    battery_is_fresh=True,
+    battery_capacity_kwh=75.0,
+):
+    """Construct a logger wired with battery callbacks for start-of-day tests.
+
+    battery_status is the dict returned by the get_battery_status callback.
+    Pass None to simulate "no snapshot available" (empty dict). Pass
+    battery_is_fresh=False to simulate stale telemetry. Pass
+    battery_capacity_kwh=None to simulate "no rated capacity configured".
+    """
+    from utils.state_manager import StateManager
+
+    state_path = str(tmp_path / "wm_state.json")
+    sm = StateManager(path=state_path)
+    battery_path = str(tmp_path / "miner_logs" / "eg4_battery_log.csv")
+    prediction_path = str(tmp_path / "miner_logs" / "pv_prediction_log.csv")
+    os.makedirs(os.path.dirname(prediction_path), exist_ok=True)
+
+    logger = PVPredictionLogger(
+        state_manager=sm,
+        weather_service=_FakeWeatherService(sunset_dt),
+        battery_log_path=battery_path,
+        prediction_log_path=prediction_path,
+        timezone_str="America/New_York",
+        get_eg4_client=lambda: _FakeEG4Client(eg4_value),
+        get_battery_status=lambda: (battery_status or {}),
+        get_battery_is_fresh=lambda: battery_is_fresh,
+        get_battery_capacity_kwh=lambda: battery_capacity_kwh,
+    )
+    return logger, prediction_path, sm
+
+
+def test_morning_write_captures_start_soc_and_kwh_when_fresh(tmp_path, monkeypatch):
+    """When SOC is fresh, both start columns are written together with the
+    prediction columns in a single upsert. kWh derives from soc/100 * capacity.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = _dt(2026, 5, 27, 5, 30, tzinfo=tz)  # pre-sunrise
+
+    logger, path, sm = _build_logger_for_start_energy_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        frozen_now=frozen_now,
+        battery_status={"soc_percent": 42.5},
+        battery_is_fresh=True,
+        battery_capacity_kwh=75.0,
+    )
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["date"] == today_local.isoformat()
+    # Prediction columns written.
+    assert float(row["eg4_today_kwh_raw"]) == pytest.approx(11.1, abs=1e-3)
+    assert row["decision_source"] == "eg4_predict"
+    # Start-of-day columns also written in the same upsert.
+    assert float(row["start_soc_pct"]) == pytest.approx(42.5, abs=1e-3)
+    expected_kwh = 42.5 / 100.0 * 75.0
+    assert float(row["start_battery_kwh"]) == pytest.approx(expected_kwh, abs=1e-3)
+
+
+def test_morning_write_leaves_start_columns_blank_when_stale(tmp_path, monkeypatch):
+    """When the battery freshness gate is False, both start columns must
+    be blank for that day — never synthesise a stale value. Prediction
+    columns are still populated.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = _dt(2026, 5, 27, 5, 30, tzinfo=tz)
+
+    logger, path, sm = _build_logger_for_start_energy_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        frozen_now=frozen_now,
+        battery_status={"soc_percent": 88.8},  # would be a valid SOC if fresh
+        battery_is_fresh=False,                 # but freshness gate says no
+        battery_capacity_kwh=75.0,
+    )
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    row = rows[0]
+    # Prediction columns present.
+    assert row["decision_source"] == "eg4_predict"
+    # Start columns blank.
+    assert (row.get("start_soc_pct") or "").strip() == ""
+    assert (row.get("start_battery_kwh") or "").strip() == ""
+
+
+def test_morning_write_leaves_start_columns_blank_when_soc_none(tmp_path, monkeypatch):
+    """When soc_percent is None (e.g. battery dict has the key but value
+    not yet populated), both start columns must be blank.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = _dt(2026, 5, 27, 5, 30, tzinfo=tz)
+
+    logger, path, sm = _build_logger_for_start_energy_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        frozen_now=frozen_now,
+        battery_status={"soc_percent": None},
+        battery_is_fresh=True,
+        battery_capacity_kwh=75.0,
+    )
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row.get("start_soc_pct") or "").strip() == ""
+    assert (row.get("start_battery_kwh") or "").strip() == ""
+
+
+def test_morning_write_start_columns_idempotent(tmp_path, monkeypatch):
+    """A second morning-write tick on the same day must NOT change the
+    captured start values, even if the live SOC has drifted in the
+    meantime. The morning write only fires once per day.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = _dt(2026, 5, 27, 5, 30, tzinfo=tz)
+
+    # Start the first tick with SOC=42.5.
+    battery_snapshot = {"soc_percent": 42.5}
+    logger, path, sm = _build_logger_for_start_energy_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        frozen_now=frozen_now,
+        battery_status=battery_snapshot,
+        battery_is_fresh=True,
+        battery_capacity_kwh=75.0,
+    )
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+    with open(path, "rb") as f:
+        bytes_after_first = f.read()
+
+    # Drift the live SOC and tick again — should be a no-op because the
+    # decision_source on disk is already populated (morning write idempotency).
+    battery_snapshot["soc_percent"] = 99.9
+
+    logger._tick()
+    with open(path, "rb") as f:
+        bytes_after_second = f.read()
+
+    assert bytes_after_first == bytes_after_second
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    # SOC frozen at first-tick value, not the drifted 99.9.
+    assert float(rows[0]["start_soc_pct"]) == pytest.approx(42.5, abs=1e-3)
+
+
+def test_morning_write_kwh_blank_when_capacity_unknown(tmp_path, monkeypatch):
+    """When capacity_kwh callable returns None, start_battery_kwh is
+    blank but start_soc_pct is still captured. The SOC column is the
+    authoritative one; kWh is derived context.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = _dt(2026, 5, 27, 5, 30, tzinfo=tz)
+
+    logger, path, sm = _build_logger_for_start_energy_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        frozen_now=frozen_now,
+        battery_status={"soc_percent": 60.0},
+        battery_is_fresh=True,
+        battery_capacity_kwh=None,
+    )
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    row = rows[0]
+    assert float(row["start_soc_pct"]) == pytest.approx(60.0, abs=1e-3)
+    assert (row.get("start_battery_kwh") or "").strip() == ""
+
+
+def test_morning_write_kwh_blank_when_capacity_non_positive(tmp_path, monkeypatch):
+    """Capacity values <= 0 are treated as 'unknown' — start_battery_kwh
+    blank, start_soc_pct captured.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today_local = date(2026, 5, 27)
+    tz = ZoneInfo("America/New_York")
+    sunset_dt = _dt(2026, 5, 27, 20, 0, tzinfo=tz)
+    frozen_now = _dt(2026, 5, 27, 5, 30, tzinfo=tz)
+
+    logger, path, sm = _build_logger_for_start_energy_tick(
+        tmp_path,
+        sunset_dt=sunset_dt,
+        frozen_now=frozen_now,
+        battery_status={"soc_percent": 60.0},
+        battery_is_fresh=True,
+        battery_capacity_kwh=0.0,
+    )
+    sm.save(
+        weather_gate_eg4_today_kwh_raw=11.1,
+        weather_gate_multiplier_applied=0.9,
+        weather_gate_expected_kwh=9.99,
+        weather_gate_decision_source="eg4_predict",
+        weather_gate_evaluated_date=today_local.isoformat(),
+    )
+
+    import services.pv_prediction_logger as pv_mod
+
+    class _FrozenDateTime(_dt):
+        @classmethod
+        def now(cls, tz_=None):
+            if tz_ is not None:
+                return frozen_now.astimezone(tz_)
+            return frozen_now
+    monkeypatch.setattr(pv_mod, "datetime", _FrozenDateTime)
+
+    logger._tick()
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert float(rows[0]["start_soc_pct"]) == pytest.approx(60.0, abs=1e-3)
+    assert (rows[0].get("start_battery_kwh") or "").strip() == ""
+
+
+# ----------------------------------------------------------------------
+# CSV header migration — 7/8/9-col legacy schemas (this change)
+# ----------------------------------------------------------------------
+
+
+def test_header_migration_v1_seven_to_ten(tmp_path):
+    """V1 = 7-col (no actual_end_reason, no start_*). Migration must keep
+    every row, add the three new columns blank, preserve order.
+    """
+    from services.pv_prediction_logger import (
+        CSV_FIELDNAMES, _LEGACY_CSV_FIELDNAMES_V1
+    )
+
+    logger, path, _ = _make_logger(tmp_path)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_LEGACY_CSV_FIELDNAMES_V1)
+        writer.writerow([
+            "2026-05-18", "50.0000", "0.8000", "40.0000",
+            "42.0000", "0.8400", "eg4_predict",
+        ])
+        writer.writerow([
+            "2026-05-19", "55.0000", "0.8000", "44.0000",
+            "39.5000", "0.7182", "eg4_predict",
+        ])
+
+    logger._reconcile_csv_schema()
+
+    with open(path, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+    assert header == CSV_FIELDNAMES
+    assert len(rows) == 2
+    # Existing values preserved.
+    assert rows[0][:7] == [
+        "2026-05-18", "50.0000", "0.8000", "40.0000",
+        "42.0000", "0.8400", "eg4_predict",
+    ]
+    # actual_end_reason, start_soc_pct, start_battery_kwh blank.
+    assert rows[0][7] == ""
+    assert rows[0][8] == ""
+    assert rows[0][9] == ""
+
+
+def test_header_migration_v2_eight_to_ten(tmp_path):
+    """V2 = 8-col (has actual_end_reason, no start_*). Migration must
+    preserve every existing column, add only the two start_* columns blank.
+    """
+    from services.pv_prediction_logger import (
+        CSV_FIELDNAMES, _LEGACY_CSV_FIELDNAMES_V2
+    )
+
+    logger, path, _ = _make_logger(tmp_path)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_LEGACY_CSV_FIELDNAMES_V2)
+        writer.writerow([
+            "2026-05-18", "50.0000", "0.8000", "40.0000",
+            "42.0000", "0.8400", "eg4_predict", "battery_full",
+        ])
+        writer.writerow([
+            "2026-05-19", "55.0000", "0.8000", "44.0000",
+            "39.5000", "0.7182", "eg4_predict", "sunset",
+        ])
+
+    logger._reconcile_csv_schema()
+
+    with open(path, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+    assert header == CSV_FIELDNAMES
+    assert len(rows) == 2
+    # Eight existing columns preserved verbatim.
+    assert rows[0][:8] == [
+        "2026-05-18", "50.0000", "0.8000", "40.0000",
+        "42.0000", "0.8400", "eg4_predict", "battery_full",
+    ]
+    # Two new columns blank.
+    assert rows[0][8] == ""
+    assert rows[0][9] == ""
+    assert rows[1][7] == "sunset"
+    assert rows[1][8] == ""
+    assert rows[1][9] == ""
+
+
+def test_header_migration_v3_nine_to_ten(tmp_path):
+    """V3 = 9-col (has actual_end_reason + start_soc_pct, missing
+    start_battery_kwh). Migration must keep start_soc_pct values and add
+    only start_battery_kwh blank.
+    """
+    from services.pv_prediction_logger import (
+        CSV_FIELDNAMES, _LEGACY_CSV_FIELDNAMES_V3
+    )
+
+    logger, path, _ = _make_logger(tmp_path)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(_LEGACY_CSV_FIELDNAMES_V3)
+        writer.writerow([
+            "2026-05-18", "50.0000", "0.8000", "40.0000",
+            "42.0000", "0.8400", "eg4_predict", "battery_full", "33.3000",
+        ])
+
+    logger._reconcile_csv_schema()
+
+    with open(path, "r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+    assert header == CSV_FIELDNAMES
+    assert len(rows) == 1
+    # start_soc_pct preserved.
+    assert rows[0][8] == "33.3000"
+    # start_battery_kwh blank (the only new column).
+    assert rows[0][9] == ""
+
+
+# ----------------------------------------------------------------------
+# read_recent_rows / API passthrough for start columns (this change)
+# ----------------------------------------------------------------------
+
+
+def test_read_recent_rows_includes_start_columns(tmp_path):
+    """read_recent_rows must surface start_soc_pct and start_battery_kwh
+    so /api/weather/prediction_history can pass them through unchanged.
+    """
+    logger, path, _ = _make_logger(tmp_path)
+    # Use the partial upsert to seed a row with both start columns populated.
+    logger._upsert_row_partial(date(2026, 5, 20), {
+        "eg4_today_kwh_raw": "50.0000",
+        "multiplier_applied": "0.8000",
+        "expected_kwh_used": "40.0000",
+        "actual_kwh": "42.0000",
+        "ratio_actual_to_eg4_raw": "0.8400",
+        "decision_source": "eg4_predict",
+        "actual_end_reason": "sunset",
+        "start_soc_pct": "37.5000",
+        "start_battery_kwh": "28.1250",
+    })
+
+    rows = logger.read_recent_rows(7)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["start_soc_pct"] == "37.5000"
+    assert r["start_battery_kwh"] == "28.1250"
+
+
+# ----------------------------------------------------------------------
+# Backfill tool (tools/backfill_start_energy.py)
+# ----------------------------------------------------------------------
+
+
+def _seed_battery_log(path: str, samples: list) -> None:
+    """Write a minimal eg4_battery_log.csv (ts + soc_percent + pv_power_w).
+
+    samples is a list of (datetime, soc) tuples. pv_power_w is set to 0.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ts", "soc_percent", "pv_power_w"])
+        for ts, soc in samples:
+            writer.writerow([ts.isoformat(), soc, 0])
+
+
+def _seed_prediction_log(path: str, rows: list[dict]) -> None:
+    """Write pv_prediction_log.csv at the current schema with the given
+    rows. Each row should be a dict keyed by CSV_FIELDNAMES."""
+    from services.pv_prediction_logger import CSV_FIELDNAMES as FIELDS
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            full = {col: "" for col in FIELDS}
+            full.update(row)
+            writer.writerow(full)
+
+
+def _import_backfill_module(tmp_path, monkeypatch):
+    """Import tools/backfill_start_energy.py with its PROJECT-relative paths
+    rerouted to tmp_path. Patches the module globals after import so the
+    real config / log files are never touched.
+    """
+    import importlib
+    # Force fresh import each test so global path patches don't leak.
+    import sys as _sys
+    if "backfill_start_energy" in _sys.modules:
+        del _sys.modules["backfill_start_energy"]
+    project_root = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), ".."
+    ))
+    tools_dir = os.path.join(project_root, "tools")
+    if tools_dir not in _sys.path:
+        _sys.path.insert(0, tools_dir)
+    mod = importlib.import_module("backfill_start_energy")
+
+    pred_log = str(tmp_path / "miner_logs" / "pv_prediction_log.csv")
+    batt_log = str(tmp_path / "miner_logs" / "eg4_battery_log.csv")
+    # Reroute the module's paths to the test sandbox.
+    monkeypatch.setattr(mod, "PREDICTION_LOG", pred_log)
+    monkeypatch.setattr(mod, "BATTERY_LOG", batt_log)
+    return mod, pred_log, batt_log
+
+
+def _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh):
+    """Bypass YAML loading. Force _load_location_and_capacity to return
+    fixed values and _compute_sunrise to return a fixed datetime, so the
+    backfill tests are independent of real config files.
+    """
+    tz = sunrise_dt.tzinfo
+    tz_name = str(tz)
+
+    def fake_load():
+        return 40.0, -74.0, tz_name, capacity_kwh
+    monkeypatch.setattr(mod, "_load_location_and_capacity", fake_load)
+
+    def fake_sunrise(day, lat, lon, tz_name_arg):
+        # Build sunrise on the requested day at the same time-of-day as
+        # the supplied reference. This lets the test fix one "sunrise"
+        # but still pass for whatever date the row carries.
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZoneInfo
+        return _dt(
+            day.year, day.month, day.day,
+            sunrise_dt.hour, sunrise_dt.minute, sunrise_dt.second,
+            tzinfo=_ZoneInfo(tz_name_arg),
+        )
+    monkeypatch.setattr(mod, "_compute_sunrise", fake_sunrise)
+
+
+def test_backfill_uses_row_at_exact_sunrise(tmp_path, monkeypatch):
+    """A battery-log row whose timestamp is exactly at sunrise on the
+    target day is used. Both columns are written.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    sunrise_dt = _dt(2026, 5, 20, 5, 30, 0, tzinfo=tz)
+
+    mod, pred_log, batt_log = _import_backfill_module(tmp_path, monkeypatch)
+    _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh=75.0)
+
+    _seed_battery_log(batt_log, [
+        (sunrise_dt, 42.5),
+        (sunrise_dt + timedelta(minutes=10), 43.0),
+    ])
+    _seed_prediction_log(pred_log, [
+        {"date": "2026-05-20", "actual_kwh": "30.0"},
+    ])
+
+    rc = mod.backfill(dry_run=False)
+    assert rc == 0
+
+    with open(pred_log, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert float(rows[0]["start_soc_pct"]) == pytest.approx(42.5, abs=1e-3)
+    expected_kwh = 42.5 / 100.0 * 75.0
+    assert float(rows[0]["start_battery_kwh"]) == pytest.approx(expected_kwh, abs=1e-3)
+
+
+def test_backfill_uses_row_within_30_min_after_sunrise(tmp_path, monkeypatch):
+    """If no row sits exactly at sunrise, the closest row within the
+    window is used. A row 20 minutes after sunrise is well within ±2h.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    sunrise_dt = _dt(2026, 5, 20, 5, 30, 0, tzinfo=tz)
+
+    mod, pred_log, batt_log = _import_backfill_module(tmp_path, monkeypatch)
+    _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh=75.0)
+
+    later = sunrise_dt + timedelta(minutes=20)
+    _seed_battery_log(batt_log, [(later, 41.0)])
+    _seed_prediction_log(pred_log, [
+        {"date": "2026-05-20", "actual_kwh": "30.0"},
+    ])
+
+    rc = mod.backfill(dry_run=False)
+    assert rc == 0
+
+    with open(pred_log, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert float(rows[0]["start_soc_pct"]) == pytest.approx(41.0, abs=1e-3)
+
+
+def test_backfill_skips_when_no_row_within_window(tmp_path, monkeypatch):
+    """A row >2h after sunrise (and no row before) leaves both columns
+    blank — the day is unobservable, no synthesised value.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    sunrise_dt = _dt(2026, 5, 20, 5, 30, 0, tzinfo=tz)
+
+    mod, pred_log, batt_log = _import_backfill_module(tmp_path, monkeypatch)
+    _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh=75.0)
+
+    # Only a sample 3 hours after sunrise — outside the ±2h window.
+    far = sunrise_dt + timedelta(hours=3)
+    _seed_battery_log(batt_log, [(far, 50.0)])
+    _seed_prediction_log(pred_log, [
+        {"date": "2026-05-20", "actual_kwh": "30.0"},
+    ])
+
+    rc = mod.backfill(dry_run=False)
+    assert rc == 0
+
+    with open(pred_log, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert (rows[0].get("start_soc_pct") or "").strip() == ""
+    assert (rows[0].get("start_battery_kwh") or "").strip() == ""
+
+
+def test_backfill_does_not_use_previous_day_late_night_reading(tmp_path, monkeypatch):
+    """A late-night reading from the previous day (well before the window
+    around sunrise) must NOT be used. The day is treated as unobservable.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    sunrise_dt = _dt(2026, 5, 20, 5, 30, 0, tzinfo=tz)
+
+    mod, pred_log, batt_log = _import_backfill_module(tmp_path, monkeypatch)
+    _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh=75.0)
+
+    # Reading at 22:00 on 5/19 — 7.5 hours before sunrise on 5/20. Far
+    # outside the ±2h window.
+    prev_night = _dt(2026, 5, 19, 22, 0, 0, tzinfo=tz)
+    _seed_battery_log(batt_log, [(prev_night, 88.0)])
+    _seed_prediction_log(pred_log, [
+        {"date": "2026-05-20", "actual_kwh": "30.0"},
+    ])
+
+    rc = mod.backfill(dry_run=False)
+    assert rc == 0
+
+    with open(pred_log, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert (rows[0].get("start_soc_pct") or "").strip() == ""
+
+
+def test_backfill_dry_run_does_not_write(tmp_path, monkeypatch):
+    """--dry-run must not touch the prediction log on disk."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    sunrise_dt = _dt(2026, 5, 20, 5, 30, 0, tzinfo=tz)
+
+    mod, pred_log, batt_log = _import_backfill_module(tmp_path, monkeypatch)
+    _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh=75.0)
+
+    _seed_battery_log(batt_log, [(sunrise_dt, 42.5)])
+    _seed_prediction_log(pred_log, [
+        {"date": "2026-05-20", "actual_kwh": "30.0"},
+    ])
+
+    with open(pred_log, "rb") as f:
+        before = f.read()
+    rc = mod.backfill(dry_run=True)
+    assert rc == 0
+    with open(pred_log, "rb") as f:
+        after = f.read()
+    assert before == after
+
+
+def test_backfill_skips_rows_already_populated(tmp_path, monkeypatch):
+    """A row that already has start_soc_pct must not be re-touched —
+    re-running is safe."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    sunrise_dt = _dt(2026, 5, 20, 5, 30, 0, tzinfo=tz)
+
+    mod, pred_log, batt_log = _import_backfill_module(tmp_path, monkeypatch)
+    _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh=75.0)
+
+    # SOC=42 on disk vs. SOC=80 in the battery log — backfill must NOT
+    # overwrite the 42.
+    _seed_battery_log(batt_log, [(sunrise_dt, 80.0)])
+    _seed_prediction_log(pred_log, [
+        {"date": "2026-05-20", "start_soc_pct": "42.0000",
+         "start_battery_kwh": "31.5000"},
+    ])
+
+    rc = mod.backfill(dry_run=False)
+    assert rc == 0
+
+    with open(pred_log, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert float(rows[0]["start_soc_pct"]) == pytest.approx(42.0, abs=1e-3)
+    assert float(rows[0]["start_battery_kwh"]) == pytest.approx(31.5, abs=1e-3)
+
+
+def test_backfill_kwh_blank_when_capacity_unknown(tmp_path, monkeypatch):
+    """When config has no usable battery_total_kwh, the tool still writes
+    start_soc_pct but leaves start_battery_kwh blank."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    sunrise_dt = _dt(2026, 5, 20, 5, 30, 0, tzinfo=tz)
+
+    mod, pred_log, batt_log = _import_backfill_module(tmp_path, monkeypatch)
+    _patch_location_and_capacity(monkeypatch, mod, sunrise_dt, capacity_kwh=None)
+
+    _seed_battery_log(batt_log, [(sunrise_dt, 42.5)])
+    _seed_prediction_log(pred_log, [
+        {"date": "2026-05-20", "actual_kwh": "30.0"},
+    ])
+
+    rc = mod.backfill(dry_run=False)
+    assert rc == 0
+
+    with open(pred_log, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert float(rows[0]["start_soc_pct"]) == pytest.approx(42.5, abs=1e-3)
+    assert (rows[0].get("start_battery_kwh") or "").strip() == ""

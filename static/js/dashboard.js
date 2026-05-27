@@ -1758,11 +1758,12 @@ function renderPredictionHistoryRows(rows) {
   const tbody = document.getElementById('predictionHistoryBody');
   if (!tbody) return;
   if (!rows || rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" class="prediction-empty">No history yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="prediction-empty">No history yet.</td></tr>';
     return;
   }
   const html = rows.map((r) => {
     const dateStr = r.date || '—';
+    const startStr = _startSocCell(r.start_soc_pct, r.start_battery_kwh);
     const rawStr = _kwhCellOrDash(r.eg4_today_kwh_raw);
     const actualStr = _kwhCellOrDash(r.actual_kwh);
     const ratioRaw = r.ratio_actual_to_eg4_raw;
@@ -1789,12 +1790,29 @@ function renderPredictionHistoryRows(rows) {
     }
     return `<tr class="${rowClass}"${rowTitleAttr}>
       <td>${dateStr}</td>
+      <td>${startStr}</td>
       <td>${rawStr}</td>
       <td>${actualStr}</td>
       <td class="${ratioClass}">${ratioStr}</td>
     </tr>`;
   }).join('');
   tbody.innerHTML = html;
+}
+
+// Render the Start SOC cell. The SOC column is the authoritative one; kWh
+// is parenthetical context. Three states:
+//   - SOC + kWh both present: "XX.X% (Y.YY kWh)"
+//   - SOC present, kWh blank (no battery capacity configured): "XX.X%"
+//   - SOC blank: em-dash
+function _startSocCell(socRaw, kwhRaw) {
+  if (socRaw === null || socRaw === undefined || socRaw === '') return '—';
+  const soc = parseFloat(socRaw);
+  if (Number.isNaN(soc)) return '—';
+  const socStr = soc.toFixed(1) + '%';
+  if (kwhRaw === null || kwhRaw === undefined || kwhRaw === '') return socStr;
+  const kwh = parseFloat(kwhRaw);
+  if (Number.isNaN(kwh)) return socStr;
+  return `${socStr} (${kwh.toFixed(2)} kWh)`;
 }
 
 function _kwhCellOrDash(raw) {

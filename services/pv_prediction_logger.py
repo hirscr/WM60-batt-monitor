@@ -43,9 +43,43 @@ from utils.log_config import log
 from utils.pv_integration import parse_battery_row, trapezoidal_kwh
 
 # Canonical column order for the prediction log. Schema reconcile compares
-# the on-disk header to this list; mismatch -> migrate-in-place (legacy 6-col
-# header) or archive + create fresh (any other mismatch).
+# the on-disk header to this list; mismatch -> migrate-in-place against one
+# of the known legacy schemas below, or archive + create fresh on unknown
+# mismatch.
 CSV_FIELDNAMES = [
+    "date",
+    "eg4_today_kwh_raw",
+    "multiplier_applied",
+    "expected_kwh_used",
+    "actual_kwh",
+    "ratio_actual_to_eg4_raw",
+    "decision_source",
+    "actual_end_reason",
+    "start_soc_pct",
+    "start_battery_kwh",
+]
+
+# Known legacy schemas. Each is the canonical column order at the historical
+# point when the schema was last canonical. _reconcile_csv_schema migrates
+# any of these in place to CSV_FIELDNAMES, preserving every existing row.
+# All new columns introduced by a migration default to blank for legacy rows.
+#
+# V1 (7 cols): pre-actual_end_reason. The original canonical schema.
+# V2 (8 cols): adds actual_end_reason. Was canonical until this change.
+# V3 (9 cols): intermediate state if someone runs a half-rolled-out build that
+#   adds start_soc_pct but not start_battery_kwh. Defensive — should not
+#   occur in practice, but listed so a mixed-version deploy migrates cleanly.
+_LEGACY_CSV_FIELDNAMES_V1 = [
+    "date",
+    "eg4_today_kwh_raw",
+    "multiplier_applied",
+    "expected_kwh_used",
+    "actual_kwh",
+    "ratio_actual_to_eg4_raw",
+    "decision_source",
+]
+
+_LEGACY_CSV_FIELDNAMES_V2 = [
     "date",
     "eg4_today_kwh_raw",
     "multiplier_applied",
@@ -56,10 +90,7 @@ CSV_FIELDNAMES = [
     "actual_end_reason",
 ]
 
-# Legacy 6-column header (no actual_end_reason). Used for in-place migration
-# of pre-existing CSV files when the column is added. Any other header
-# mismatch still triggers archive-and-recreate.
-_LEGACY_CSV_FIELDNAMES_V1 = [
+_LEGACY_CSV_FIELDNAMES_V3 = [
     "date",
     "eg4_today_kwh_raw",
     "multiplier_applied",
@@ -67,7 +98,18 @@ _LEGACY_CSV_FIELDNAMES_V1 = [
     "actual_kwh",
     "ratio_actual_to_eg4_raw",
     "decision_source",
+    "actual_end_reason",
+    "start_soc_pct",
 ]
+
+# Ordered registry of legacy schemas the reconcile path can migrate in place.
+# Newest-first because that's the most likely on-disk state during a rolling
+# upgrade.
+_KNOWN_LEGACY_SCHEMAS = (
+    _LEGACY_CSV_FIELDNAMES_V3,
+    _LEGACY_CSV_FIELDNAMES_V2,
+    _LEGACY_CSV_FIELDNAMES_V1,
+)
 
 # Columns owned by the morning (prediction-context) write. The sunset write
 # preserves these when they are already non-blank on disk.
@@ -104,6 +146,9 @@ class PVPredictionLogger:
         tick_seconds: int = 60,
         post_sunset_seconds: int = DEFAULT_POST_SUNSET_SEC,
         get_eg4_client: Optional[Callable[[], object]] = None,
+        get_battery_status: Optional[Callable[[], dict]] = None,
+        get_battery_is_fresh: Optional[Callable[[], bool]] = None,
+        get_battery_capacity_kwh: Optional[Callable[[], Optional[float]]] = None,
     ):
         """
         Args:
@@ -122,6 +167,24 @@ class PVPredictionLogger:
                 exists because BatteryService.refresh_session() replaces its
                 EG4Client, so capturing a direct reference would silently go
                 stale.
+            get_battery_status: optional zero-arg callable returning the
+                latest battery snapshot dict (BatteryService.get_status()).
+                Used at morning-write time to capture start_soc_pct. Callback
+                shape mirrors get_eg4_client — the underlying snapshot dict
+                is replaced on every poll, so capturing a direct reference
+                would silently go stale.
+            get_battery_is_fresh: optional zero-arg callable returning the
+                current battery-freshness gate (BatteryService.is_fresh()).
+                Morning write captures start_soc_pct only when this returns
+                True AND get_battery_status() yields a non-None soc_percent;
+                a stale or missing snapshot leaves both start columns blank
+                for that day rather than synthesizing a stale value.
+            get_battery_capacity_kwh: optional zero-arg callable returning the
+                rated battery capacity in kWh (or None if unknown). The
+                derivation of start_battery_kwh = start_soc_pct / 100 *
+                capacity uses this. When the callable returns None,
+                start_battery_kwh is written blank while start_soc_pct is
+                still captured.
         """
         self._state = state_manager
         self._weather = weather_service
@@ -131,6 +194,9 @@ class PVPredictionLogger:
         self._tick_seconds = int(tick_seconds)
         self._post_sunset_seconds = int(post_sunset_seconds)
         self._get_eg4_client = get_eg4_client
+        self._get_battery_status = get_battery_status
+        self._get_battery_is_fresh = get_battery_is_fresh
+        self._get_battery_capacity_kwh = get_battery_capacity_kwh
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -341,6 +407,13 @@ class PVPredictionLogger:
             "expected_kwh_used": _fmt_num(ctx.get("expected_kwh_used")),
             "decision_source": ctx.get("decision_source") or "",
         }
+        # Capture start-of-day battery state. Single atomic upsert with the
+        # prediction columns — the morning write site is one call, not two,
+        # per the schema-change spec. Blank when SOC is missing/stale or no
+        # capacity is configured (see _capture_start_of_day_energy).
+        start_soc_str, start_kwh_str = self._capture_start_of_day_energy()
+        updates["start_soc_pct"] = start_soc_str
+        updates["start_battery_kwh"] = start_kwh_str
         # If actual_kwh is already on disk (e.g. a backfill ran first),
         # recompute the ratio now using the new prediction value.
         if existing is not None:
@@ -356,8 +429,89 @@ class PVPredictionLogger:
                 "PV_LOG",
                 f"morning write date={today} source={ctx.get('decision_source')} "
                 f"raw={ctx.get('eg4_today_kwh_raw')} mult={ctx.get('multiplier_applied')} "
-                f"expected={ctx.get('expected_kwh_used')}",
+                f"expected={ctx.get('expected_kwh_used')} "
+                f"start_soc={start_soc_str or '-'} start_kwh={start_kwh_str or '-'}",
             )
+
+    def _capture_start_of_day_energy(self) -> tuple[str, str]:
+        """Return (start_soc_pct_str, start_battery_kwh_str) for the morning write.
+
+        Reads SOC from get_battery_status() at the moment of capture — the
+        weather gate's persisted snapshot is not used because the gate runs
+        once per day and the morning-write tick may be hours later. The
+        battery freshness gate (get_battery_is_fresh) is consulted: stale or
+        missing telemetry yields ("", "") so no synthesized value lands in
+        the log.
+
+        Capacity comes from get_battery_capacity_kwh(); when None or non-
+        positive, start_battery_kwh is left blank while start_soc_pct is
+        still captured. Capacity must remain a single source-of-truth read
+        per write so a config change during a tick can't produce a
+        mismatched (SOC, kWh) pair.
+        """
+        # No status callback configured (older tests, or a deploy that did
+        # not wire battery_service) -> both columns blank.
+        if self._get_battery_status is None:
+            return ("", "")
+
+        # Freshness gate, when supplied. A missing freshness callback
+        # defaults to "trust the snapshot" to keep legacy callers working,
+        # but production wiring should always supply both.
+        if self._get_battery_is_fresh is not None:
+            try:
+                fresh = bool(self._get_battery_is_fresh())
+            except Exception as exc:
+                if __debug__:
+                    log("PV_LOG", f"battery is_fresh callback raised: {exc}")
+                return ("", "")
+            if not fresh:
+                if __debug__:
+                    log("PV_LOG", "start-of-day capture skipped: battery stale")
+                return ("", "")
+
+        try:
+            status = self._get_battery_status() or {}
+        except Exception as exc:
+            if __debug__:
+                log("PV_LOG", f"battery status callback raised: {exc}")
+            return ("", "")
+
+        soc_raw = status.get("soc_percent") if isinstance(status, dict) else None
+        if soc_raw is None:
+            if __debug__:
+                log("PV_LOG", "start-of-day capture skipped: soc_percent is None")
+            return ("", "")
+        try:
+            soc_val = float(soc_raw)
+        except (TypeError, ValueError):
+            if __debug__:
+                log("PV_LOG", f"start-of-day capture skipped: soc non-numeric ({soc_raw!r})")
+            return ("", "")
+
+        soc_str = _fmt_num(soc_val)
+
+        # Capacity is optional — start_battery_kwh stays blank if missing.
+        capacity_kwh: Optional[float] = None
+        if self._get_battery_capacity_kwh is not None:
+            try:
+                cap_raw = self._get_battery_capacity_kwh()
+            except Exception as exc:
+                if __debug__:
+                    log("PV_LOG", f"battery capacity callback raised: {exc}")
+                cap_raw = None
+            if cap_raw is not None:
+                try:
+                    cap_val = float(cap_raw)
+                    if cap_val > 0:
+                        capacity_kwh = cap_val
+                except (TypeError, ValueError):
+                    capacity_kwh = None
+
+        if capacity_kwh is None:
+            return (soc_str, "")
+
+        start_kwh = soc_val / 100.0 * capacity_kwh
+        return (soc_str, _fmt_num(start_kwh))
 
     def _write_actual_columns(
         self,
@@ -562,9 +716,10 @@ class PVPredictionLogger:
         """Build a row dict from the gate-context inputs.
 
         Recomputes ratio_actual_to_eg4_raw whenever both actual_kwh and a
-        positive eg4_today_kwh_raw are present; blank otherwise. The
-        actual_end_reason column defaults to blank when not supplied via
-        ctx — _append_row callers (tests) need not provide it.
+        positive eg4_today_kwh_raw are present; blank otherwise. Columns
+        not present in `ctx` (actual_end_reason, start_soc_pct,
+        start_battery_kwh) default to blank — _append_row callers (tests)
+        need not provide them.
         """
         raw = ctx.get("eg4_today_kwh_raw")
         ratio: str = ""
@@ -580,6 +735,8 @@ class PVPredictionLogger:
             "ratio_actual_to_eg4_raw": ratio,
             "decision_source": ctx.get("decision_source") or "",
             "actual_end_reason": ctx.get("actual_end_reason") or "",
+            "start_soc_pct": _fmt_num(ctx.get("start_soc_pct")),
+            "start_battery_kwh": _fmt_num(ctx.get("start_battery_kwh")),
         }
 
     def _upsert_row_partial(self, day: date, updates: dict[str, str]) -> None:
@@ -793,17 +950,20 @@ class PVPredictionLogger:
     def _reconcile_csv_schema(self) -> None:
         """Ensure the prediction log uses CSV_FIELDNAMES.
 
-        Three cases:
+        Cases:
           - File missing or empty -> nothing to do; first write creates it.
           - Header matches CSV_FIELDNAMES -> keep using it.
-          - Header matches a known legacy schema -> migrate in place,
-            preserving every existing data row. New columns default blank.
+          - Header matches a known legacy schema (V1/V2/V3 in
+            _KNOWN_LEGACY_SCHEMAS) -> migrate in place, preserving every
+            existing data row. Columns added by the migration default
+            blank for legacy rows.
           - Any other header mismatch -> archive to a timestamped sibling
             and start a fresh canonical log.
 
-        The in-place migration path was added when actual_end_reason was
-        appended to the schema. It must be additive only — existing rows
-        keep every previous column unchanged.
+        Migration is additive only — existing rows keep every previous
+        column unchanged. New columns appear blank. _read_all_rows uses
+        DictReader so missing-column values arrive as None and are
+        normalised to "" by _upsert_row_partial / _atomic_rewrite.
         """
         path = self._prediction_log_path
         if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -819,17 +979,18 @@ class PVPredictionLogger:
         if header == CSV_FIELDNAMES:
             return
 
-        # Known legacy schemas: migrate in place by reading all rows and
-        # atomically rewriting under the new header. New columns blank.
-        if header == _LEGACY_CSV_FIELDNAMES_V1:
-            existing_rows = self._read_all_rows()
-            self._atomic_rewrite(existing_rows)
-            print(
-                f"[PVPredictionLogger] Migrated legacy CSV in place: "
-                f"added column 'actual_end_reason' (default blank) to "
-                f"{len(existing_rows)} existing rows."
-            )
-            return
+        for legacy in _KNOWN_LEGACY_SCHEMAS:
+            if header == legacy:
+                existing_rows = self._read_all_rows()
+                self._atomic_rewrite(existing_rows)
+                added_cols = [c for c in CSV_FIELDNAMES if c not in legacy]
+                added_str = ", ".join(repr(c) for c in added_cols) or "(none)"
+                print(
+                    f"[PVPredictionLogger] Migrated legacy CSV in place: "
+                    f"added columns [{added_str}] (default blank) to "
+                    f"{len(existing_rows)} existing rows."
+                )
+                return
 
         stem, ext = os.path.splitext(os.path.basename(path))
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
