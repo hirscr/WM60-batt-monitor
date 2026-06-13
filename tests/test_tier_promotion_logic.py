@@ -140,6 +140,34 @@ def test_promote_to_100_unconditional_when_battery_full_even_if_cloudy():
     )
     assert result.tier == 100
     assert result.tier_changed is True
+    # Internal state must also advance — the override is not advisory-only.
+    assert tp.tier == 100
+
+
+def test_full_battery_override_is_idempotent_across_ticks():
+    """Once the override promotes to 100, a second tick at SOC>=99 must report
+    no further change — self.tier must have advanced so the override stops
+    re-firing every tick."""
+    clock = FakeClock()
+    tp = _new_tp(clock=clock, tier=90, last_soc=98.0)
+    first = tp.evaluate(
+        soc_pct=99.5,
+        cloud_cover_remaining_pct=80.0,
+        forecast_fresh=True,
+        sunset_dt=_sunset(),
+        now_local=_now_local(13),
+    )
+    assert first.tier_changed is True
+    second = tp.evaluate(
+        soc_pct=99.5,
+        cloud_cover_remaining_pct=80.0,
+        forecast_fresh=True,
+        sunset_dt=_sunset(),
+        now_local=_now_local(13),
+    )
+    assert second.tier == 100
+    assert second.tier_changed is False
+    assert tp.tier == 100
 
 
 def test_promote_to_100_crossing_still_blocked_when_cloudy_and_soc_below_99():
@@ -370,6 +398,7 @@ def test_first_tick_at_100_soc_promotes_immediately():
     assert result.tier_changed is True
     assert result.is_first_tick is True
     assert tp.last_seen_soc == 100.0
+    assert tp.tier == 100
 
 
 def test_no_soc_returns_unchanged_without_clobbering_state():

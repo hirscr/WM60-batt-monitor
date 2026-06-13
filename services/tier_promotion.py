@@ -143,6 +143,7 @@ class TierPromotion:
         # subsequent ticks.
         if float(soc_pct) >= SOC_PROMOTE_100 and self.tier != 100:
             self.last_seen_soc = float(soc_pct)
+            self.tier = 100
             return TierEvaluation(
                 tier=100,
                 target_pct=100,
